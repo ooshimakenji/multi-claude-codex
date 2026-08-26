@@ -12,6 +12,8 @@
     ~/.claude-<Nome>/                 pasta do perfil
     ~/.claude-<Nome>/projects  -->    junction para ~/.claude/projects   (historico compartilhado)
     ~/.claude-<Nome>/plugins   -->    junction para ~/.claude/plugins    (plugins compartilhados)
+    ~/.claude-<Nome>/skills    -->    junction para ~/.claude/skills     (skills compartilhadas)
+    ~/.claude-<Nome>/CLAUDE.md -->    hardlink para ~/.claude/CLAUDE.md  (mesma regra em todos)
     ~/.claude-<Nome>/settings.json    copia do principal
     <ShimDir>/claude-<Nome>.ps1       atalho que seta CLAUDE_CONFIG_DIR e chama claude
 
@@ -55,11 +57,27 @@ if (Test-Path $Perfil) {
 
 New-Item -ItemType Directory -Path $Perfil | Out-Null
 
-foreach ($compartilhado in 'projects', 'plugins') {
+# skills entra aqui junto de projects/plugins: sem ela o perfil de fallback sobe
+# sem a regra de delegacao, que e justamente o que se quer preservar ao trocar.
+foreach ($compartilhado in 'projects', 'plugins', 'skills') {
     $alvo = Join-Path $Base $compartilhado
     if (Test-Path $alvo) {
         New-Item -ItemType Junction -Path (Join-Path $Perfil $compartilhado) -Target $alvo | Out-Null
         Write-Host "  junction $compartilhado -> $alvo"
+    }
+}
+
+# CLAUDE.md e arquivo, nao pasta: junction nao serve. Hardlink mantem os perfis
+# em sincronia sem exigir admin (mesmo volume); se falhar, copia e segue.
+$claudeMd = Join-Path $Base 'CLAUDE.md'
+if (Test-Path $claudeMd) {
+    $destino = Join-Path $Perfil 'CLAUDE.md'
+    try {
+        New-Item -ItemType HardLink -Path $destino -Target $claudeMd -ErrorAction Stop | Out-Null
+        Write-Host "  CLAUDE.md hardlink (compartilhado)"
+    } catch {
+        Copy-Item $claudeMd $destino
+        Write-Host "  CLAUDE.md copiado (hardlink indisponivel: copia nao acompanha edicoes)"
     }
 }
 
