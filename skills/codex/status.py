@@ -14,6 +14,7 @@ Fontes (tudo local, tudo read-only):
 
 Uso:  python status.py            imprime estado + delta
       python status.py --line      uma linha, para statusline (leve, read-only)
+      python status.py --json      snapshot para consumidores de maquina
       python status.py --reset     esquece o marco anterior
       python status.py --selftest  roda os asserts
 """
@@ -22,6 +23,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 HOME = os.path.expanduser("~")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
@@ -148,6 +150,88 @@ def codex_side():
         if "modelo" in out and "quotas" in out:
             break
     return out
+
+
+def _epoch(valor):
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    if isinstance(valor, str):
+        try:
+            return float(valor)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(valor.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+    return None
+
+
+def jobs_ativos():
+    """Lista rollouts que ainda estao escrevendo e nao terminaram."""
+    agora = time.time()
+    corte = agora - 90
+    encontrados = []
+    arqs = glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"),
+                     recursive=True)
+    recentes = []
+    for arq in arqs:
+        try:
+            mtime = os.path.getmtime(arq)
+        except OSError:
+            continue
+        if mtime < corte:
+            continue
+        recentes.append((mtime, arq))
+
+    # O filtro vem antes de abrir: rollouts antigos nao podem custar I/O aqui.
+    for mtime, arq in sorted(recentes, reverse=True):
+        try:
+            linhas = tail(arq, 65536)
+            primeiro = contexto = None
+            # O cabecalho basta para inicio e contexto; limita a leitura de casos
+            # quebrados que nunca gravaram turn_context.
+            for indice, evento in enumerate(_loads(arq)):
+                if not isinstance(evento, dict):
+                    continue
+                if primeiro is None:
+                    primeiro = evento
+                payload = evento.get("payload") or {}
+                if evento.get("type") == "turn_context" and isinstance(payload, dict):
+                    contexto = payload
+                if indice >= 127:
+                    break
+        except (OSError, ValueError):
+            continue
+
+        ultimo = None
+        for linha in reversed(linhas):
+            try:
+                evento = json.loads(linha)
+            except ValueError:
+                continue
+            if isinstance(evento, dict):
+                ultimo = evento
+                break
+        if not ultimo:
+            continue
+        payload = ultimo.get("payload") or {}
+        if ultimo.get("type") == "task_complete" or (
+                isinstance(payload, dict) and payload.get("type") == "task_complete"):
+            continue
+
+        uso = _ultimo_token_count(linhas)
+        total = uso.get("total_tokens", 0) if isinstance(uso, dict) else 0
+        cwd = contexto.get("cwd") if isinstance(contexto, dict) else None
+        inicio = _epoch(primeiro.get("timestamp")) if isinstance(primeiro, dict) else None
+        encontrados.append({
+            "modelo": contexto.get("model") if isinstance(contexto, dict) else None,
+            "cwd": cwd,
+            "projeto": os.path.basename(os.path.normpath(cwd)) if cwd else None,
+            "tokens": total,
+            "segundos": max(0, agora - (inicio if inicio is not None else mtime)),
+            "arquivo": os.path.basename(arq),
+        })
+    return encontrados
 
 
 def claude_side():
@@ -461,11 +545,65 @@ def selftest():
     uma = line({"transcript_path": transcript})
     assert "nvidia 37/40min" in uma and "gemini 1/15min" in uma, uma
 
+    # --- jobs ativos: janela, evento final e inicio sao criterios separados ---
+    agora = time.time()
+    ativo = os.path.join(roll, "rollout-active.jsonl")
+    concluido = os.path.join(roll, "rollout-done.jsonl")
+    antigo = os.path.join(roll, "rollout-old.jsonl")
+    for caminho, eventos in (
+        (ativo, [
+            {"timestamp": agora - 12, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+            {"timestamp": agora - 1, "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": 1234}}}},
+        ]),
+        (concluido, [
+            {"timestamp": agora - 8, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+            {"timestamp": agora - 1, "type": "event_msg", "payload": {
+                "type": "task_complete"}},
+        ]),
+        (antigo, [
+            {"timestamp": agora - 120, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+        ]),
+    ):
+        with open(caminho, "w", encoding="utf-8") as fh:
+            for evento in eventos:
+                fh.write(json.dumps(evento) + "\n")
+    os.utime(antigo, (agora - 100, agora - 100))
+    jobs = jobs_ativos()
+    por_arquivo = {job["arquivo"]: job for job in jobs}
+    assert "rollout-active.jsonl" in por_arquivo, jobs
+    assert "rollout-done.jsonl" not in por_arquivo, jobs
+    assert "rollout-old.jsonl" not in por_arquivo, jobs
+    job = por_arquivo["rollout-active.jsonl"]
+    assert job["modelo"] == "gpt-5.6-luna" and job["cwd"] == proj, job
+    assert job["projeto"] == "algum-projeto" and job["tokens"] == 1234, job
+    assert 10 <= job["segundos"] <= 20, job
+
     # o contrato que importa: --line NAO pode gravar o marco
     global MARK
     MARK = os.path.join(d, "mark.json")
     line({"transcript_path": transcript})
     assert not os.path.exists(MARK), "--line gravou o marco e zerou o delta"
+
+    # --json e leitura: um app consulta varias vezes sem mover o marco.
+    import subprocess
+    with open(MARK, "w", encoding="utf-8") as fh:
+        fh.write("marco original")
+    marca_antes = (open(MARK, "rb").read(), os.stat(MARK).st_mtime_ns)
+    ambiente = os.environ.copy()
+    ambiente["CODEX_HOME"] = d
+    ambiente["CLAUDE_CONFIG_DIR"] = d
+    processo = subprocess.run([sys.executable, __file__, "--json"],
+                              env=ambiente, capture_output=True, text=True,
+                              check=True)
+    json_saida = json.loads(processo.stdout)
+    assert set(json_saida) == {"codex", "claude", "free_tier", "jobs", "ts"}, json_saida
+    marca_depois = (open(MARK, "rb").read(), os.stat(MARK).st_mtime_ns)
+    assert marca_depois == marca_antes, "--json alterou o marco"
 
     assert humano(999) == "999" and humano(20455411) == "20.5M", humano(20455411)
     print("selftest ok")
@@ -485,6 +623,11 @@ if __name__ == "__main__":
             print(line(dados))
         except Exception:
             pass
+    elif "--json" in sys.argv:
+        now = snapshot()
+        now["jobs"] = jobs_ativos()
+        now["ts"] = time.time()
+        print(json.dumps(now))
     elif "--selftest" in sys.argv:
         selftest()
     elif "--reset" in sys.argv:
