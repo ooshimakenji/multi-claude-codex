@@ -161,6 +161,51 @@ Para rotação de conta do Claude, a recomendação é o
 compatível com Windows. `cswap auto` monitora a cota e troca de conta sozinho ao chegar
 em ~90%, com cooldown e histerese.
 
+### Fazer a rotação sobreviver ao reboot (Windows)
+
+`cswap auto` é um loop em primeiro plano, então morre quando o terminal fecha. No
+Windows, o jeito de manter é uma Tarefa Agendada disparada no logon.
+
+Duas armadilhas encontradas montando isso, as duas silenciosas:
+
+- Aspas aninhadas no campo Argument da tarefa **não sobrevivem**: a tarefa registra
+  sem erro e morre com exit 1 ao rodar. A saída é um wrapper `.cmd` de 4 linhas que a
+  tarefa chama; o `.cmd` precisa de CRLF (veja **O `.cmd` precisa de CRLF**, na seção
+  "Quatro armadilhas do Windows").
+- Não use `*>>` do PowerShell para o log (veja **`*>>` e `Out-File` do PowerShell 5.1
+  gravam UTF-16**, na mesma seção). O redirect fica dentro do `.cmd`.
+
+Wrapper:
+
+```bat
+@ECHO off
+"<CAMINHO-DO-CSWAP>\cswap.exe" auto --interval 60 >> "<PASTA-DE-LOG>\auto.log" 2>&1
+```
+
+Configure a tarefa assim:
+
+| Campo | Valor | Por que |
+|---|---|---|
+| Gatilho | logon, delay PT1M | não briga com o boot |
+| MultipleInstances | IgnoreNew | evita dois loops ao mesmo tempo |
+| ExecutionTimeLimit | PT0S | sem limite: o loop é infinito |
+| RestartCount | 3, a cada 2 min | o Windows religa se o processo morrer |
+| LogonType | Interactive | precisa de rede e do perfil do usuário |
+| Bateria | não parar nem bloquear | funciona em notebook desconectado |
+
+A tarefa deve chamar o wrapper por `powershell.exe -NoProfile -WindowStyle Hidden -Command
+"& '<wrapper>'"`, para o console não ficar visível no desktop enquanto o loop roda.
+
+Depois do boot, confira:
+
+```powershell
+Get-ScheduledTask cswap-auto | Select State
+Get-Content <PASTA-DE-LOG>\auto.log -Tail 3
+```
+
+`--once` existe e é "cron-friendly", mas usado a cada minuto abriria um console 1.440
+vezes por dia. O loop sobe uma vez por logon, então é preferível no desktop.
+
 ### Importar uma conta sem logout
 
 Não rode `/logout` antes: o próprio README do claude-swap alerta que o Claude Code
@@ -215,9 +260,11 @@ fixada quando o processo sobe. Para logar outro perfil, abra um terminal novo e 
 o atalho dele. Quem erra isso acaba trocando a conta do perfil principal sem
 perceber.
 
-### Três armadilhas do atalho no Windows
+### Quatro armadilhas do Windows
 
-Todas silenciosas: o atalho roda, não dá erro, e usa a conta errada.
+Todas silenciosas: não há erro, a coisa parece funcionar, e o estrago aparece depois
+— nos itens 1 a 3, o atalho usa a conta errada; no item 4, o arquivo de log fica
+corrompido.
 
 1. **Não use `.ps1`.** Falha duas vezes: o Git Bash não executa `.ps1`, e a
    ExecutionPolicy padrão do Windows recusa script não assinado. Use `.cmd`
@@ -227,6 +274,10 @@ Todas silenciosas: o atalho roda, não dá erro, e usa a conta errada.
 3. **Use `CALL`.** `SETLOCAL` + `<cli> %*` encadeia para o shim npm do CLI em vez
    de chamá-lo: o batch atual termina, o `ENDLOCAL` implícito dispara e a variável
    some **antes** do CLI subir. `CALL <cli> %*` preserva.
+4. **`*>>` e `Out-File` do PowerShell 5.1 gravam UTF-16.** Redirecionar a saída de
+   um programa com `*>>` num arquivo que era ASCII produz arquivo de encoding MISTO,
+   e nada reclama. Para log de processo longo, redirecione por `cmd` (`>> arquivo 2>&1`),
+   que escreve bytes crus.
 
 ```bat
 @ECHO off
