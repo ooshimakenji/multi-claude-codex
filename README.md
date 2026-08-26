@@ -147,23 +147,78 @@ motivos que valem para qualquer script de statusline:
 - **Ele não grava o marco.** Se gravasse, cada render viraria o novo ponto zero e
   o delta nunca sairia de ~0.
 
-## Vários perfis do Claude
+## Várias contas, qualquer provedor
 
-Um processo do Claude Code = uma credencial. Subagentes herdam a auth e não existe
-switcher nativo. A separação é por `CLAUDE_CONFIG_DIR`:
+Um processo = uma credencial. Subagentes herdam a autenticação de quem os criou, e
+nenhum desses CLIs tem um switcher de conta embutido.
+
+A saída é a mesma nos três: cada um guarda a credencial numa pasta de configuração e
+aceita uma variável de ambiente que aponta para outra pasta. Multi-conta não exige
+ferramenta — exige um atalho que define a variável antes de chamar o CLI.
+
+| Provedor | Variável | Pasta padrão | O que fica separado |
+|---|---|---|---|
+| Claude Code | `CLAUDE_CONFIG_DIR` | `~/.claude` | `.credentials.json` |
+| Codex CLI | `CODEX_HOME` | `~/.codex` | `auth.json` |
+| Gemini CLI | `GEMINI_CLI_HOME` | `~/.gemini` | settings + chave |
+
+Nota honesta: `CLAUDE_CONFIG_DIR` e `CODEX_HOME` estão verificados em uso nesta
+máquina. `CODEX_HOME` foi provado assim: `codex login status` diz "Logged in using
+ChatGPT", mas `CODEX_HOME=<pasta vazia> codex login status` diz "Not logged in".
+`GEMINI_CLI_HOME` aparece no bundle do CLI, mas não foi testado — sonde antes de
+confiar.
+
+Uso:
 
 ```powershell
-.\profiles\new-profile.ps1 -Nome b
+.\profiles\new-profile.ps1 -Provider claude -Nome b
 claude-b              # /login com a outra conta
 claude-b --continue   # retoma a conversa da pasta atual
+
+.\profiles\new-profile.ps1 -Provider codex -Nome b
+codex-b login
 ```
 
-Cada perfil tem `.credentials.json` própria, mas compartilha `projects` e `plugins`
-por junction — trocar de perfil não perde histórico.
+Cada perfil tem sua própria credencial, mas compartilha histórico, skills e plugins
+por junction — trocar de conta não perde contexto nem a configuração de delegação.
+No Codex, `sessions/` é compartilhado de propósito porque o `status.py` soma os
+rollouts de `$CODEX_HOME/sessions`; perfis separados fragmentariam essa medição.
 
-⚠️ **Nunca rode dois perfis ao mesmo tempo no mesmo projeto**: pelas junctions os
-dois escrevem no mesmo `<uuid>.jsonl` e a conversa corrompe. E o primeiro turno do
-perfil novo reenvia a conversa inteira (caro) — troque em ponto natural.
+⚠️ **Não retome a mesma conversa em dois perfis ao mesmo tempo.** Abrir uma sessão
+nova em outro perfil é seguro — cada sessão cria o próprio `<uuid>.jsonl`. O que
+corrompe é `--continue` em dois perfis sobre a mesma conversa: pelas junctions os
+dois retomam o mesmo arquivo. E o primeiro turno do perfil novo reenvia a conversa
+inteira (caro), então troque em ponto natural.
+
+`/login` dentro de uma sessão só afeta o perfil daquela sessão, porque a variável é
+fixada quando o processo sobe. Para logar outro perfil, abra um terminal novo e use
+o atalho dele. Quem erra isso acaba trocando a conta do perfil principal sem
+perceber.
+
+### Três armadilhas do atalho no Windows
+
+Todas silenciosas: o atalho roda, não dá erro, e usa a conta errada.
+
+1. **Não use `.ps1`.** Falha duas vezes: o Git Bash não executa `.ps1`, e a
+   ExecutionPolicy padrão do Windows recusa script não assinado. Use `.cmd`
+   (serve para PowerShell, cmd e Git Bash) mais um shim `sh` sem extensão.
+2. **O `.cmd` precisa de CRLF.** Com quebras LF o `cmd.exe` ignora a linha do
+   `SET` — sem reclamar — e o CLI sobe no perfil principal.
+3. **Use `CALL`.** `SETLOCAL` + `<cli> %*` encadeia para o shim npm do CLI em vez
+   de chamá-lo: o batch atual termina, o `ENDLOCAL` implícito dispara e a variável
+   some **antes** do CLI subir. `CALL <cli> %*` preserva.
+
+```bat
+@ECHO off
+SETLOCAL
+SET "CLAUDE_CONFIG_DIR=%USERPROFILE%\.claude-b"
+CALL claude %*
+```
+
+Como conferir que o atalho isola de verdade: rode o mesmo comando pelo atalho e sem
+ele, com o outro perfil **já logado**. Respostas diferentes (contas, ou limites de
+cota distintos) provam o isolamento. Com o perfil novo ainda sem credencial o teste
+é inútil — "não logado" sai de qualquer jeito, mesmo com o atalho quebrado.
 
 Isto é para quem tem contas legitimamente separadas (trabalho e pessoal, seats
 distintos) e quer alternar sem reconfigurar a máquina. Não é para multiplicar
