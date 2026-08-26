@@ -113,6 +113,10 @@ chamada de rede, nenhuma estimativa.
 
 `python status.py --selftest` roda os asserts.
 
+Nota honesta: para medição de uso geral, existe alternativa pronta: TokenTracker (MIT,
+31 ferramentas). Este repo mede outra coisa: a razão de delegação entre Claude e Codex,
+que é o que decide quando delegar.
+
 ### Na statusline
 
 Para ver os números sem digitar nada, o Claude Code tem statusline nativa — uma
@@ -150,11 +154,35 @@ motivos que valem para qualquer script de statusline:
 ## Várias contas, qualquer provedor
 
 Um processo = uma credencial. Subagentes herdam a autenticação de quem os criou, e
-nenhum desses CLIs tem um switcher de conta embutido.
+os CLIs não fazem rotação automática de conta por padrão.
 
-A saída é a mesma nos três: cada um guarda a credencial numa pasta de configuração e
-aceita uma variável de ambiente que aponta para outra pasta. Multi-conta não exige
-ferramenta — exige um atalho que define a variável antes de chamar o CLI.
+Para rotação de conta do Claude, a recomendação é o
+[claude-swap](https://github.com/realiti4/claude-swap): ferramenta em Python, MIT e
+compatível com Windows. `cswap auto` monitora a cota e troca de conta sozinho ao chegar
+em ~90%, com cooldown e histerese.
+
+### Importar uma conta sem logout
+
+Não rode `/logout` antes: o próprio README do claude-swap alerta que o Claude Code
+atual pode revogar o refresh token. Perfis por `CLAUDE_CONFIG_DIR` também são a fonte
+segura para importar contas no claude-swap, sem tocar na credencial principal:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-b cswap add
+```
+
+O `cswap` lê a credencial do perfil indicado e a importa sem logout. Neste fluxo
+testado, `~/.claude/.credentials.json` permaneceu byte a byte idêntico (mesmo SHA-256).
+
+Ressalvas: há 85 issues abertas; o backup de credencial é feito em JSON texto puro por
+padrão (criptografia opcional); e a ferramenta não cobre o Codex.
+
+O lado Codex continua sendo separado por variável de ambiente (`CODEX_HOME`), que é o
+único equivalente aqui. Se preferir fazer a rotação do Claude à mão,
+`CLAUDE_CONFIG_DIR` faz o mesmo para o Claude.
+
+Cada CLI guarda a credencial numa pasta de configuração e aceita uma variável de
+ambiente que aponta para outra pasta.
 
 | Provedor | Variável | Pasta padrão | O que fica separado |
 |---|---|---|---|
@@ -168,16 +196,8 @@ ChatGPT", mas `CODEX_HOME=<pasta vazia> codex login status` diz "Not logged in".
 `GEMINI_CLI_HOME` aparece no bundle do CLI, mas não foi testado — sonde antes de
 confiar.
 
-Uso:
-
-```powershell
-.\profiles\new-profile.ps1 -Provider claude -Nome b
-claude-b              # /login com a outra conta
-claude-b --continue   # retoma a conversa da pasta atual
-
-.\profiles\new-profile.ps1 -Provider codex -Nome b
-codex-b login
-```
+As notas abaixo são apenas técnicas, para quem decidir montar o wrapper manualmente;
+`claude-swap` é o caminho recomendado para a rotação do Claude.
 
 Cada perfil tem sua própria credencial, mas compartilha histórico, skills e plugins
 por junction — trocar de conta não perde contexto nem a configuração de delegação.

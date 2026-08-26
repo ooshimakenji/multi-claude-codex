@@ -17,9 +17,13 @@ Catálogo vivo em `$CODEX_HOME/models_cache.json` (`~/.codex` por padrão).
 
 | Apelido | Modelo | Quando |
 |---|---|---|
+| `trivial` | NVIDIA nemotron / Gemini flash-lite (free tier), via `ask.py` | texto curto e mecânico: mensagem de commit, resumo de diff, rename |
 | `rapido` | `gpt-5.6-luna` | mecânico, repetitivo, leitura de volume (resumir arquivo grande, varrer repo) |
 | `normal` | `gpt-5.6-terra` | default geral |
 | `pesado` | `gpt-5.6-sol` | difícil ou ambíguo; aceita `model_reasoning_effort` até `ultra` |
+
+`git push` e `git pull` não precisam de modelo nenhum — são Bash direto. A camada
+`trivial` serve para tarefa de texto, não para operação de shell.
 
 Se a lista parecer curta ou velha, é catálogo em cache: `codex update`.
 

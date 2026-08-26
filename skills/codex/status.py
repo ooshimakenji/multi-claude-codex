@@ -28,6 +28,13 @@ CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 MARK = os.path.join(CLAUDE_HOME, "codex-status-mark.json")
 
+# Limite de free tier muda; numero velho SEM DATA vira mentira silenciosa.
+# Por isso a data anda junto do numero e precisa ser atualizada quando conferido.
+LIMITES = {
+    "nvidia": (40, "conferido em 2026-08-26"),
+    "gemini": (15, "conferido em 2026-08-26"),
+}
+
 
 def _loads(path):
     """Cada linha e um JSON independente; linha corrompida nao derruba a leitura."""
@@ -157,8 +164,52 @@ def claude_side():
     return out
 
 
+def free_tier_side():
+    """Conta chamadas recentes e preserva a ultima leitura do servidor."""
+    out = {provedor: {"usadas": 0, "limite": limite,
+                      "restante_servidor": None}
+           for provedor, (limite, _data) in LIMITES.items()}
+    caminho = os.path.join(CLAUDE_HOME, "free-tier.jsonl")
+    try:
+        linhas = tail(caminho)
+    except OSError:
+        return out
+    agora = time.time()
+    corte = agora - 60
+    for linha in linhas:
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        provedor = evento.get("provedor")
+        if provedor not in out:
+            continue
+        try:
+            ts = float(evento.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if corte <= ts <= agora:
+            out[provedor]["usadas"] += 1
+    # O servidor conhece chamadas feitas fora deste processo; sua leitura vale mais
+    # que a contagem local, mesmo que os dois numeros discordem.
+    encontrados = set()
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        provedor = evento.get("provedor")
+        if provedor in out and provedor not in encontrados:
+            out[provedor]["restante_servidor"] = evento.get("restante")
+            encontrados.add(provedor)
+            if len(encontrados) == len(out):
+                break
+    return out
+
+
 def snapshot():
-    return {"codex": codex_side(), "claude": claude_side()}
+    return {"codex": codex_side(), "claude": claude_side(),
+            "free_tier": free_tier_side()}
 
 
 def previous():
@@ -201,6 +252,15 @@ def report(now, before):
         lines.append("        na janela de {j}: {t} tokens".format(
             j=janela(curta), t=fmt(cx["janela_tokens"])))
     lines.append("CLAUDE  tokens={t} (sessao inteira)".format(t=fmt(cl["tokens"])))
+    free = now.get("free_tier", {})
+    if free:
+        itens = []
+        for provedor, dados in free.items():
+            usado = (dados.get("restante_servidor")
+                     if dados.get("restante_servidor") is not None
+                     else dados.get("usadas", 0))
+            itens.append("{}={}/{}min".format(provedor, usado, dados.get("limite", "?")))
+        lines.append("FREE    " + " ".join(itens))
 
     if before:
         d_cx = cx.get("tokens", 0) - before["codex"].get("tokens", 0)
@@ -294,6 +354,15 @@ def line(stdin_json=None):
             partes.append("ctx " + humano(contexto_atual(path)))
     except OSError:
         pass
+    try:
+        for provedor, dados in free_tier_side().items():
+            if dados.get("usadas", 0):
+                usado = (dados.get("restante_servidor")
+                         if dados.get("restante_servidor") is not None
+                         else dados["usadas"])
+                partes.append("{} {}/{}min".format(provedor, usado, dados["limite"]))
+    except OSError:
+        pass
     return " | ".join(partes)
 
 
@@ -371,6 +440,26 @@ def selftest():
     uma = line({"transcript_path": transcript})
     assert "codex luna" in uma, uma        # prefixo gpt-5.6- some
     assert uma == "codex luna 90.5k 5h3.0% 7d8.0% | ctx 2.0k", uma
+
+    # --- free tier: janela local e leitura do limite do servidor ---
+    free_log = os.path.join(d, "free-tier.jsonl")
+    agora = time.time()
+    with open(free_log, "w", encoding="utf-8") as fh:
+        for evento in (
+            {"ts": agora - 61, "provedor": "nvidia", "restante": "39"},
+            {"ts": agora - 10, "provedor": "nvidia", "restante": None},
+            {"ts": agora - 5, "provedor": "nvidia", "restante": "37"},
+            {"ts": agora - 5, "provedor": "gemini", "restante": None},
+        ):
+            fh.write(json.dumps(evento) + "\n")
+    free = free_tier_side()
+    assert free["nvidia"]["usadas"] == 2, free
+    assert free["gemini"]["usadas"] == 1, free
+    assert free["nvidia"]["restante_servidor"] == "37", free
+    snap = snapshot()
+    assert "nvidia=37/40min" in report(snap, None), report(snap, None)
+    uma = line({"transcript_path": transcript})
+    assert "nvidia 37/40min" in uma and "gemini 1/15min" in uma, uma
 
     # o contrato que importa: --line NAO pode gravar o marco
     global MARK
