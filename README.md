@@ -82,7 +82,7 @@ lista parecer curta, é cache velho: `codex update`.
 codex review --uncommitted -c review_model="gpt-5.6-terra"
 
 # leitura pesada, em background, gravando a resposta em arquivo
-codex exec -m gpt-5.6-luna -s read-only -o /tmp/out.md "<prompt>"
+codex exec -m gpt-5.6-luna -s read-only -o codex-out.md "<prompt>"
 ```
 
 ## Medir
@@ -108,6 +108,33 @@ arquivo local (`$CODEX_HOME/sessions/`, `$CLAUDE_CONFIG_DIR/projects/`) — nenh
 chamada de rede, nenhuma estimativa.
 
 `python status.py --selftest` roda os asserts.
+
+### Na statusline
+
+Para ver os números sem digitar nada, o Claude Code tem statusline nativa — uma
+linha no rodapé de todo prompt, alimentada por um comando à sua escolha. Em
+`~/.claude/settings.json`:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "python \"/caminho/para/status.py\" --line",
+  "padding": 0
+}
+```
+
+```
+codex luna 5h0.0% 7d0.0% | ctx 211.8k
+```
+
+O modo `--line` existe porque o modo completo não serve para isso, por dois
+motivos que valem para qualquer script de statusline:
+
+- **Ele roda a cada render do prompt.** O modo completo varre o transcript
+  inteiro, que aqui passa de 30 MB. O `--line` lê só o rabo do arquivo e mostra o
+  contexto vivo (tokens da última requisição), não o acumulado. ~0,19 s.
+- **Ele não grava o marco.** Se gravasse, cada render viraria o novo ponto zero e
+  o delta nunca sairia de ~0.
 
 ## Vários perfis do Claude
 

@@ -38,7 +38,7 @@ codex review --base main   -c review_model="gpt-5.6-terra"
 
 # leitura pesada / investigação, em background
 codex exec -m gpt-5.6-luna -s read-only --skip-git-repo-check \
-  -o "$SCRATCH/codex-out.md" "<prompt>"
+  -o codex-out.md "<prompt>"
 ```
 
 `codex exec` sempre com `run_in_background`: o harness notifica no fim e cancela
@@ -62,6 +62,9 @@ Claude revisa o diff depois.
 ```bash
 python skills/codex/status.py    # estado dos dois lados + delta desde a última rodada
 ```
+
+`status.py --line` é a versão leve e read-only, para a statusline do Claude Code
+(não grava o marco, então não zera o delta).
 
 Rode **antes e depois** de delegar. O total do transcript é o custo da sessão
 inteira; só o delta responde "quanto essa delegação economizou".
