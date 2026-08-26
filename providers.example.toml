@@ -1,0 +1,41 @@
+# Backends extras para o Codex CLI. Cole em ~/.codex/config.toml (ou $CODEX_HOME).
+#
+# O ponto: NÃO se escreve uma ponte nova por provedor. O Codex já aceita qualquer
+# endpoint compatível com OpenAI, então um runtime só (`codex exec`) atende N backends.
+#
+#     codex exec -c model_provider=nvidia -m <model-id> -s read-only "<prompt>"
+#
+# Antes de ligar qualquer um destes, saiba o que muda:
+#
+#   1. Você troca OAuth por API key no disco. O login do ChatGPT não expõe chave;
+#      isto expõe. Free tier não cobra, mas passou do free, cobra.
+#   2. `wire_api = "chat"` não é o caminho feliz do Codex. O loop de agente dele foi
+#      feito para a Responses API e para o tool-calling da OpenAI. Modelo de terceiro
+#      pode executar mal o protocolo de ferramentas e o loop travar ou rodar em
+#      círculo. Faça um smoke test antes de confiar, e prefira one-shot de
+#      leitura/resumo a agente que edita arquivo.
+#   3. Só ligue quando a quota do provedor principal apertar de verdade. Backend novo
+#      para pressão que não existe é config para dar manutenção de graça.
+
+# NVIDIA build (build.nvidia.com) — catálogo de modelos abertos, sem cartão.
+# Teto de prototipagem: ~40 req/min e créditos limitados. Não é produção.
+[model_providers.nvidia]
+name = "NVIDIA NIM"
+base_url = "https://integrate.api.nvidia.com/v1"
+env_key = "NVIDIA_API_KEY"
+wire_api = "chat"
+
+# Gemini pela camada de compatibilidade OpenAI.
+# Os limites do free tier mudam e divergem do que os blogs dizem: sonde com a SUA
+# chave (um modelo responde, outro dá 429 duro, outro 404) em vez de confiar em tabela.
+[model_providers.gemini]
+name = "Gemini (compat OpenAI)"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+env_key = "GEMINI_API_KEY"
+wire_api = "chat"
+
+# Local, sem chave nenhuma. O Codex já tem atalho pra isto: `codex exec --oss`.
+[model_providers.ollama]
+name = "Ollama"
+base_url = "http://localhost:11434/v1"
+wire_api = "chat"
