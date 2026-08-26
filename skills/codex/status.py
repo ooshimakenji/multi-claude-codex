@@ -21,6 +21,7 @@ import glob
 import json
 import os
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
@@ -77,33 +78,66 @@ def codex_tokens_total():
     return total
 
 
+def codex_janela(minutos):
+    """Tokens gastos no Codex dentro da janela viva.
+
+    E este numero que prova que a delegacao aconteceu: `used_percent` so vem em
+    inteiro (conferido em ~1900 amostras: 0.0, 1.0, ... 100.0, nunca fracionario),
+    entao um job de 90k fica em 0% e parece que nada rodou.
+    """
+    if not minutos:
+        return 0
+    corte = time.time() - minutos * 60
+    total = 0
+    for arq in glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"), recursive=True):
+        try:
+            if os.path.getmtime(arq) < corte:
+                continue
+            uso = _ultimo_token_count(tail(arq, 65536))
+        except OSError:
+            continue
+        if uso:
+            total += uso.get("total_tokens", 0)
+    return total
+
+
 def codex_side():
-    """Tokens = soma de todos os rollouts. Modelo/quota = rollout mais recente
-    que os tenha: um job curto pode nao gravar turn_context, e ficar sem modelo
-    no display so porque foi o ultimo a rodar seria pior que olhar um pouco atras."""
+    """Tokens = soma de todos os rollouts. Modelo/quota = rollout mais recente que
+    os tenha: um job curto pode nao gravar turn_context, e ficar sem modelo no
+    display so porque foi o ultimo a rodar seria pior que olhar um pouco atras."""
     arqs = sorted(glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"),
                             recursive=True), key=os.path.getmtime, reverse=True)
     out = {"arquivo": os.path.basename(arqs[0]) if arqs else None,
            "tokens": codex_tokens_total()}
+    if arqs:
+        out["idade_s"] = max(0, time.time() - os.path.getmtime(arqs[0]))
     for arq in arqs[:10]:
+        modelo = quotas = None
         for ev in _loads(arq):
             payload = ev.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
-            if ev.get("type") == "turn_context" and payload.get("model") and "modelo" not in out:
-                out["modelo"] = payload["model"]
-                out["effort"] = payload.get("effort") or payload.get("reasoning_effort")
+            # dentro de um rollout, vale sempre a ULTIMA leitura: a primeira e o
+            # estado ANTES da sessao gastar qualquer coisa.
+            if ev.get("type") == "turn_context" and payload.get("model"):
                 sandbox = payload.get("sandbox_policy") or {}
-                out["sandbox"] = sandbox.get("type") if isinstance(sandbox, dict) else sandbox
-            if payload.get("type") == "token_count" and "quotas" not in out:
+                modelo = (payload["model"],
+                          payload.get("effort") or payload.get("reasoning_effort"),
+                          sandbox.get("type") if isinstance(sandbox, dict) else sandbox)
+            if payload.get("type") == "token_count":
                 rl = payload.get("rate_limits") or {}
                 # a API devolve primary (5h) e secondary (semanal); as vezes so uma
                 janelas = [(j.get("window_minutes"), j.get("used_percent"))
                            for j in (rl.get("primary"), rl.get("secondary"))
                            if isinstance(j, dict) and "used_percent" in j]
                 if janelas:
-                    out["quotas"] = janelas
-                    out["quota_pct"] = janelas[0][1]   # delta acompanha a mais curta
+                    quotas = janelas
+        if modelo and "modelo" not in out:
+            out["modelo"], out["effort"], out["sandbox"] = modelo
+        if quotas and "quotas" not in out:
+            out["quotas"] = quotas
+            out["quota_pct"] = quotas[0][1]          # delta acompanha a mais curta
+            out["janela_tokens"] = codex_janela(quotas[0][0])
         if "modelo" in out and "quotas" in out:
             break
     return out
@@ -135,6 +169,12 @@ def previous():
         return None
 
 
+def idade_curta(segundos):
+    if segundos < 86400:
+        return "·{}h".format(int(segundos // 3600))
+    return "·{}d".format(int(segundos // 86400))
+
+
 def janela(minutos):
     if not minutos:
         return "?"
@@ -156,6 +196,10 @@ def report(now, before):
         m=cx.get("modelo", "?"), e=cx.get("effort", "?"), s=cx.get("sandbox", "?")))
     quotas = " ".join("{}={}%".format(janela(w), p) for w, p in cx.get("quotas", [])) or "?"
     lines.append("        tokens={t}  quota {q}".format(t=fmt(cx.get("tokens", 0)), q=quotas))
+    if cx.get("janela_tokens"):
+        curta = cx.get("quotas", [(None, None)])[0][0]
+        lines.append("        na janela de {j}: {t} tokens".format(
+            j=janela(curta), t=fmt(cx["janela_tokens"])))
     lines.append("CLAUDE  tokens={t} (sessao inteira)".format(t=fmt(cl["tokens"])))
 
     if before:
@@ -232,8 +276,15 @@ def line(stdin_json=None):
     try:
         cx = codex_side()
         if cx.get("modelo"):
-            q = " ".join("{}{}%".format(janela(w), p) for w, p in cx.get("quotas", []))
-            partes.append(("codex " + cx["modelo"].replace("gpt-5.6-", "") + " " + q).strip())
+            nome = cx["modelo"].replace("gpt-5.6-", "")
+            idade = cx.get("idade_s") or 0
+            if idade > 7200:   # nao deixar "codex luna" parecer que roda agora
+                nome += idade_curta(idade)
+            campos = [nome]
+            if cx.get("janela_tokens"):
+                campos.append(humano(cx["janela_tokens"]))
+            campos += ["{}{}%".format(janela(w), p) for w, p in cx.get("quotas", [])]
+            partes.append("codex " + " ".join(campos))
     except OSError:
         pass
     try:
@@ -258,6 +309,12 @@ def selftest():
         fh.write(json.dumps({"type": "turn_context", "payload": {
             "model": "gpt-5.6-luna", "sandbox_policy": {"type": "read-only"}}}) + "\n")
         fh.write("{ linha corrompida\n")
+        # duas leituras no mesmo rollout: a 1a e o estado ANTES de gastar.
+        fh.write(json.dumps({"type": "event_msg", "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": {"total_tokens": 10}},
+            "rate_limits": {"primary": {"used_percent": 0.0, "window_minutes": 300},
+                            "secondary": {"used_percent": 0.0, "window_minutes": 10080}}}}) + "\n")
         fh.write(json.dumps({"type": "event_msg", "payload": {
             "type": "token_count",
             "info": {"total_token_usage": {"total_tokens": 90000}},
@@ -273,7 +330,11 @@ def selftest():
     assert snap["codex"]["modelo"] == "gpt-5.6-luna", snap
     assert snap["codex"]["sandbox"] == "read-only", snap
     assert snap["codex"]["tokens"] == 90000, snap
+    # REGRESSAO: ler a 1a amostra daria 0.0 e a statusline ficaria travada em zero
     assert snap["codex"]["quota_pct"] == 3.0, snap
+    assert snap["codex"]["quotas"] == [(300, 3.0), (10080, 8.0)], snap
+    # o numero que prova que rodou
+    assert snap["codex"]["janela_tokens"] == 90000, snap
     # 'service_tier' e str: nao pode entrar na soma
     assert snap["claude"]["tokens"] == 150, snap
 
@@ -309,7 +370,7 @@ def selftest():
 
     uma = line({"transcript_path": transcript})
     assert "codex luna" in uma, uma        # prefixo gpt-5.6- some
-    assert uma == "codex luna 5h3.0% 7d8.0% | ctx 2.0k", uma
+    assert uma == "codex luna 90.5k 5h3.0% 7d8.0% | ctx 2.0k", uma
 
     # o contrato que importa: --line NAO pode gravar o marco
     global MARK

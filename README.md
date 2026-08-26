@@ -21,6 +21,10 @@ Na máquina onde isto foi montado, no mesmo período: Claude bateu **100% da jan
 de 5h**, o Codex estava em **1% da janela semanal**. Toda leitura pesada que sai de
 um e entra no outro é ganho direto — e o `status.py` mede isso em vez de estimar.
 
+A cota do Codex **não é infinita**: nessa mesma máquina ela já chegou a 100% num dia
+de sessões paralelas pesadas. O ponto do padrão não é que um lado seja de graça, é
+que os dois esgotam em ritmos diferentes e vale gastar o que está sobrando.
+
 ## O padrão
 
 **Claude planeja, orquestra e revisa. Codex lê e executa.**
@@ -124,8 +128,15 @@ linha no rodapé de todo prompt, alimentada por um comando à sua escolha. Em
 ```
 
 ```
-codex luna 5h0.0% 7d0.0% | ctx 211.8k
+codex luna 495.6k 5h0.0% 7d0.0% | ctx 215.5k
 ```
+
+- `495.6k` — tokens gastos no Codex dentro da janela viva. **É o número que se mexe:**
+  rode uma delegação e ele sobe na hora.
+- `5h0.0% 7d0.0%` — as duas janelas de quota. **`used_percent` só vem em inteiro** —
+  conferido em ~1.900 amostras: `0.0, 1.0, … 100.0`, nunca fracionário. Um job de 90k
+  fica em `0.0%` e parece que nada rodou; por isso a contagem de tokens ao lado.
+- `ctx` — contexto vivo da sessão do Claude.
 
 O modo `--line` existe porque o modo completo não serve para isso, por dois
 motivos que valem para qualquer script de statusline:

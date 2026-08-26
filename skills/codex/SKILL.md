@@ -66,6 +66,9 @@ python skills/codex/status.py    # estado dos dois lados + delta desde a última
 `status.py --line` é a versão leve e read-only, para a statusline do Claude Code
 (não grava o marco, então não zera o delta).
 
+Na statusline, acompanhe **os tokens**, não o `%`: `used_percent` só vem em inteiro,
+então uma delegação normal fica em `0.0%` mesmo tendo rodado.
+
 Rode **antes e depois** de delegar. O total do transcript é o custo da sessão
 inteira; só o delta responde "quanto essa delegação economizou".
 
