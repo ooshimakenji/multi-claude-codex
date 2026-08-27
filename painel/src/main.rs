@@ -42,7 +42,15 @@ const CLAUDE_QUOTA_WIDTH: f32 = 300.0;
 const CLAUDE_GRID_GAPS: f32 = 20.0;
 const CLAUDE_CONTENT_WIDTH: f32 =
     CLAUDE_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + CLAUDE_QUOTA_WIDTH * 2.0;
-const INITIAL_INNER_WIDTH: f32 = SECTION_HORIZONTAL_OVERHEAD + CLAUDE_CONTENT_WIDTH + 8.0;
+const CODEX_ACCOUNT_WIDTH: f32 = 300.0;
+const CODEX_PLAN_WIDTH: f32 = 150.0;
+const CODEX_CONTENT_WIDTH: f32 = CODEX_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + CODEX_PLAN_WIDTH;
+const INITIAL_CONTENT_WIDTH: f32 = if CLAUDE_CONTENT_WIDTH > CODEX_CONTENT_WIDTH {
+    CLAUDE_CONTENT_WIDTH
+} else {
+    CODEX_CONTENT_WIDTH
+};
+const INITIAL_INNER_WIDTH: f32 = SECTION_HORIZONTAL_OVERHEAD + INITIAL_CONTENT_WIDTH + 8.0;
 const INITIAL_INNER_HEIGHT: f32 = 618.0;
 const MIN_INNER_WIDTH: f32 = 520.0;
 const MIN_INNER_HEIGHT: f32 = 320.0;
@@ -93,6 +101,92 @@ fn hp_low() -> egui::Color32 {
     egui::Color32::from_rgb(0xD4, 0x5D, 0x5D)
 }
 
+fn set_icon_block(rgba: &mut [u8], x: usize, y: usize, color: egui::Color32) {
+    for pixel_y in y * 2..y * 2 + 2 {
+        for pixel_x in x * 2..x * 2 + 2 {
+            let offset = (pixel_y * 32 + pixel_x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&color.to_array());
+        }
+    }
+}
+
+fn icone() -> egui::IconData {
+    const PIXEL_ART: [&str; 16] = [
+        ".....KKKKKK.....",
+        "...KKRRRRRRKK...",
+        "..KKRRRRRRRRKK..",
+        ".KKRRRRRRRRRRKK.",
+        ".KKRRRRRRRRRRKK.",
+        ".KKRRRRRRRRRRKK.",
+        ".KKRRRRRRRRRRKK.",
+        ".KKKKKKKKKKKKKK.",
+        ".KKKKKKKKKKKKKK.",
+        ".KKWWWWWWWWWWKK.",
+        ".KKWWWWWWWWWWKK.",
+        ".KKWWWWWWWWWWKK.",
+        ".KKWWWWWWWWWWKK.",
+        "..KKWWWWWWWWKK..",
+        "...KKWWWWWWKK...",
+        ".....KKKKKK.....",
+    ];
+    let mut rgba = vec![0; 32 * 32 * 4];
+
+    for (y, row) in PIXEL_ART.iter().enumerate() {
+        for (x, pixel) in row.bytes().enumerate() {
+            let color = match pixel {
+                b'K' => ground(),
+                b'R' => hp_low(),
+                b'W' => text_color(),
+                _ => continue,
+            };
+            set_icon_block(&mut rgba, x, y, color);
+        }
+    }
+
+    for &(x, y) in &[
+        (6, 5),
+        (7, 5),
+        (8, 5),
+        (9, 5),
+        (5, 6),
+        (10, 6),
+        (5, 7),
+        (10, 7),
+        (5, 8),
+        (10, 8),
+        (5, 9),
+        (10, 9),
+        (6, 10),
+        (7, 10),
+        (8, 10),
+        (9, 10),
+    ] {
+        set_icon_block(&mut rgba, x, y, ground());
+    }
+    for &(x, y) in &[
+        (7, 6),
+        (8, 6),
+        (6, 7),
+        (7, 7),
+        (8, 7),
+        (9, 7),
+        (6, 8),
+        (7, 8),
+        (8, 8),
+        (9, 8),
+        (7, 9),
+        (8, 9),
+    ] {
+        set_icon_block(&mut rgba, x, y, text_color());
+    }
+
+    egui::IconData {
+        rgba,
+        width: 32,
+        height: 32,
+    }
+}
+
 struct Snapshot {
     status: Result<Value, String>,
     cswap: Result<Value, String>,
@@ -109,8 +203,11 @@ struct PanelApp {
 
 #[derive(Clone)]
 struct PokemonInfo {
+    email: String,
     number: u16,
     name: String,
+    provider: String,
+    plan: Option<String>,
 }
 
 struct PokemonCache {
@@ -135,11 +232,28 @@ impl PokemonCache {
                         .filter(|number| (1..=1025).contains(number));
                     let name = entry.get("nome").and_then(Value::as_str);
                     if let (Some(number), Some(name)) = (number, name) {
+                        let display_email = entry
+                            .get("email")
+                            .and_then(Value::as_str)
+                            .unwrap_or(email.as_str())
+                            .to_owned();
+                        let provider = entry
+                            .get("provedor")
+                            .and_then(Value::as_str)
+                            .unwrap_or("claude")
+                            .to_owned();
+                        let plan = entry
+                            .get("plano")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
                         map.insert(
                             email,
                             PokemonInfo {
+                                email: display_email,
                                 number: number as u16,
                                 name: name.to_owned(),
+                                provider,
+                                plan,
                             },
                         );
                     }
@@ -154,25 +268,32 @@ impl PokemonCache {
         }
     }
 
-    fn info(&self, email: &str) -> Option<PokemonInfo> {
+    fn info(&self, provider: &str, email: &str) -> Option<PokemonInfo> {
         self.map
-            .get(email)
-            .or_else(|| {
-                self.map
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(email))
-                    .map(|(_, info)| info)
-            })
+            .values()
+            .find(|info| info.provider == provider && info.email.eq_ignore_ascii_case(email))
             .cloned()
+    }
+
+    fn accounts(&self, provider: &str) -> Vec<(String, PokemonInfo)> {
+        let mut accounts = self
+            .map
+            .iter()
+            .filter(|(_, info)| info.provider == provider)
+            .map(|(_, info)| (info.email.clone(), info.clone()))
+            .collect::<Vec<_>>();
+        accounts.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+        accounts
     }
 
     fn texture(
         &mut self,
         context: &egui::Context,
+        provider: &str,
         email: &str,
         back: bool,
     ) -> Option<&egui::TextureHandle> {
-        let info = self.info(email)?;
+        let info = self.info(provider, email)?;
         let key = (info.number, back);
         if !self.attempted.insert(key) {
             return self.textures.get(&key);
@@ -291,7 +412,13 @@ impl eframe::App for PanelApp {
                     );
                     ui.add_space(12.0);
 
-                    show_codex(ui, self.status.as_ref());
+                    show_codex(
+                        ui,
+                        self.status.as_ref(),
+                        &mut self.pokemon,
+                        context,
+                        self.poke_mode,
+                    );
                     ui.add_space(8.0);
                     show_free_tier(ui, self.status.as_ref());
                     ui.add_space(8.0);
@@ -733,10 +860,10 @@ fn show_claude(
                         .any(|percent| percent >= 100.0);
                     let has_quota = five_hour.is_some() || seven_day.is_some();
                     let texture = (poke_mode && has_quota)
-                        .then(|| pokemon.texture(context, email, fainted).cloned())
+                        .then(|| pokemon.texture(context, "claude", email, fainted).cloned())
                         .flatten();
                     let species = poke_mode
-                        .then(|| pokemon.info(email).map(|info| info.name))
+                        .then(|| pokemon.info("claude", email).map(|info| info.name))
                         .flatten();
                     ui.allocate_ui_with_layout(
                         egui::vec2(account_width, 40.0),
@@ -802,30 +929,116 @@ fn claude_column_widths(available_width: f32) -> (f32, f32) {
     )
 }
 
-fn show_codex(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
-    section_frame(ui, "CODEX", |ui| match status {
-        None => dim_label(ui, "carregando…"),
-        Some(Err(error)) => error_label(ui, error),
-        Some(Ok(value)) => {
-            let codex = value.get("codex");
-            let slot_width = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(0.0);
-            ui.horizontal(|ui| {
-                for (label, minutes) in [("5h", "300"), ("7d", "10080")] {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(slot_width, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(pixel_text(label, 10.0));
-                            usage_bar(
-                                ui,
-                                quota_percent(codex, minutes),
-                                quota_countdown(codex, minutes),
-                                quota_clock(codex, minutes),
+fn render_codex_accounts(
+    ui: &mut egui::Ui,
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
+) {
+    let accounts = pokemon.accounts("codex");
+    if accounts.is_empty() {
+        dim_label(ui, "contas Codex ausentes");
+        return;
+    }
+
+    egui::Grid::new("codex_accounts")
+        .num_columns(2)
+        .min_col_width(0.0)
+        .min_row_height(20.0)
+        .spacing(egui::vec2(10.0, 8.0))
+        .show(ui, |ui| {
+            ui.add_sized(
+                [CODEX_ACCOUNT_WIDTH, 20.0],
+                egui::Label::new(pixel_text("conta", 10.0)),
+            );
+            ui.add_sized(
+                [CODEX_PLAN_WIDTH, 20.0],
+                egui::Label::new(pixel_text("plano", 10.0)),
+            );
+            ui.end_row();
+
+            for (email, info) in accounts {
+                let texture = poke_mode
+                    .then(|| pokemon.texture(context, "codex", &email, false).cloned())
+                    .flatten();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(CODEX_ACCOUNT_WIDTH, 40.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        if let Some(texture) = texture.as_ref() {
+                            ui.add(
+                                egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
+                                    .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                                    .texture_options(egui::TextureOptions::NEAREST),
                             );
-                        },
-                    );
-                }
-            });
+                        }
+                        ui.label(egui::RichText::new(" ").font(egui::FontId::monospace(13.0)));
+                        let info_width = (CODEX_ACCOUNT_WIDTH
+                            - ACCOUNT_SPRITE_SIZE
+                            - ACCOUNT_CURSOR_WIDTH
+                            - ui.spacing().item_spacing.x * 2.0)
+                            .max(0.0);
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.vertical(|ui| {
+                                ui.add_sized(
+                                    [info_width, 20.0],
+                                    egui::Label::new(data_text(&email)).truncate(true),
+                                );
+                                ui.add_sized(
+                                    [info_width, 20.0],
+                                    egui::Label::new(pixel_text(&info.name, 10.0)).truncate(true),
+                                );
+                            });
+                        });
+                    },
+                );
+                ui.add_sized(
+                    [CODEX_PLAN_WIDTH, 40.0],
+                    egui::Label::new(data_text(info.plan.as_deref().unwrap_or("ausente")))
+                        .truncate(true),
+                );
+                ui.end_row();
+            }
+        });
+}
+
+fn show_codex(
+    ui: &mut egui::Ui,
+    status: Option<&Result<Value, String>>,
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
+) {
+    section_frame(ui, "CODEX", |ui| {
+        render_codex_accounts(ui, pokemon, context, poke_mode);
+        ui.add_space(8.0);
+        ui.label(pixel_text("cota compartilhada", 10.0));
+        match status {
+            None => dim_label(ui, "carregando…"),
+            Some(Err(error)) => error_label(ui, error),
+            Some(Ok(value)) => {
+                let codex = value.get("codex");
+                let slot_width =
+                    ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    for (label, minutes) in [("5h", "300"), ("7d", "10080")] {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(slot_width, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(pixel_text(label, 10.0));
+                                usage_bar(
+                                    ui,
+                                    quota_percent(codex, minutes),
+                                    quota_countdown(codex, minutes),
+                                    quota_clock(codex, minutes),
+                                );
+                            },
+                        );
+                    }
+                });
+            }
         }
     });
 }
@@ -1372,7 +1585,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([INITIAL_INNER_WIDTH, INITIAL_INNER_HEIGHT])
             .with_min_inner_size([MIN_INNER_WIDTH, MIN_INNER_HEIGHT])
             .with_resizable(true)
-            .with_decorations(false),
+            .with_decorations(false)
+            .with_icon(icone()),
         ..Default::default()
     };
     eframe::run_native(
