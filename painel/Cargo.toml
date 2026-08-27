@@ -1,0 +1,20 @@
+[package]
+name = "painel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.24.1", default-features = false, features = ["default_fonts", "glow"] }
+image = { version = "0.24.9", default-features = false, features = ["png"] }
+raw-window-handle = "0.5"
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["minwinbase", "timezoneapi", "windef", "winuser"] }
+
+[patch.crates-io]
+# eframe 0.24.1 enables egui-winit's `links` feature unconditionally. That
+# feature requires webbrowser, whose upstream Windows implementation depends
+# on shlwapi and does not compile with the GNU toolchain. This app never opens
+# URLs, so the local minimal implementation avoids the shlwapi dependency.
+webbrowser = { path = "vendor/webbrowser" }

@@ -136,7 +136,9 @@ def codex_side():
             if payload.get("type") == "token_count":
                 rl = payload.get("rate_limits") or {}
                 # a API devolve primary (5h) e secondary (semanal); as vezes so uma
-                janelas = [(j.get("window_minutes"), j.get("used_percent"))
+                janelas = [{"janela": j.get("window_minutes"),
+                            "pct": j.get("used_percent"),
+                            "reseta_em": j.get("resets_at")}
                            for j in (rl.get("primary"), rl.get("secondary"))
                            if isinstance(j, dict) and "used_percent" in j]
                 if janelas:
@@ -145,8 +147,8 @@ def codex_side():
             out["modelo"], out["effort"], out["sandbox"] = modelo
         if quotas and "quotas" not in out:
             out["quotas"] = quotas
-            out["quota_pct"] = quotas[0][1]          # delta acompanha a mais curta
-            out["janela_tokens"] = codex_janela(quotas[0][0])
+            out["quota_pct"] = quotas[0]["pct"]  # delta acompanha a mais curta
+            out["janela_tokens"] = codex_janela(quotas[0]["janela"])
         if "modelo" in out and "quotas" in out:
             break
     return out
@@ -329,10 +331,11 @@ def report(now, before):
     cx, cl = now["codex"], now["claude"]
     lines.append("CODEX   modelo={m} effort={e} sandbox={s}".format(
         m=cx.get("modelo", "?"), e=cx.get("effort", "?"), s=cx.get("sandbox", "?")))
-    quotas = " ".join("{}={}%".format(janela(w), p) for w, p in cx.get("quotas", [])) or "?"
+    quotas = " ".join("{}={}%".format(janela(q["janela"]), q["pct"])
+                       for q in cx.get("quotas", [])) or "?"
     lines.append("        tokens={t}  quota {q}".format(t=fmt(cx.get("tokens", 0)), q=quotas))
     if cx.get("janela_tokens"):
-        curta = cx.get("quotas", [(None, None)])[0][0]
+        curta = (cx.get("quotas") or [{"janela": None}])[0]["janela"]
         lines.append("        na janela de {j}: {t} tokens".format(
             j=janela(curta), t=fmt(cx["janela_tokens"])))
     lines.append("CLAUDE  tokens={t} (sessao inteira)".format(t=fmt(cl["tokens"])))
@@ -427,7 +430,8 @@ def line(stdin_json=None):
             campos = [nome]
             if cx.get("janela_tokens"):
                 campos.append(humano(cx["janela_tokens"]))
-            campos += ["{}{}%".format(janela(w), p) for w, p in cx.get("quotas", [])]
+            campos += ["{}{}%".format(janela(q["janela"]), q["pct"])
+                       for q in cx.get("quotas", [])]
             partes.append("codex " + " ".join(campos))
     except OSError:
         pass
@@ -466,13 +470,17 @@ def selftest():
         fh.write(json.dumps({"type": "event_msg", "payload": {
             "type": "token_count",
             "info": {"total_token_usage": {"total_tokens": 10}},
-            "rate_limits": {"primary": {"used_percent": 0.0, "window_minutes": 300},
-                            "secondary": {"used_percent": 0.0, "window_minutes": 10080}}}}) + "\n")
+            "rate_limits": {"primary": {"used_percent": 0.0, "window_minutes": 300,
+                                          "resets_at": 1787759175},
+                            "secondary": {"used_percent": 0.0, "window_minutes": 10080,
+                                           "resets_at": 1788345975}}}}) + "\n")
         fh.write(json.dumps({"type": "event_msg", "payload": {
             "type": "token_count",
             "info": {"total_token_usage": {"total_tokens": 90000}},
-            "rate_limits": {"primary": {"used_percent": 3.0, "window_minutes": 300},
-                            "secondary": {"used_percent": 8.0, "window_minutes": 10080}}}}) + "\n")
+            "rate_limits": {"primary": {"used_percent": 3.0, "window_minutes": 300,
+                                          "resets_at": 1787759175},
+                            "secondary": {"used_percent": 8.0, "window_minutes": 10080,
+                                           "resets_at": 1788345975}}}}) + "\n")
     with open(os.path.join(proj, "s.jsonl"), "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"message": {"usage": {
             "input_tokens": 100, "output_tokens": 50, "service_tier": "x"}}}) + "\n")
@@ -485,7 +493,10 @@ def selftest():
     assert snap["codex"]["tokens"] == 90000, snap
     # REGRESSAO: ler a 1a amostra daria 0.0 e a statusline ficaria travada em zero
     assert snap["codex"]["quota_pct"] == 3.0, snap
-    assert snap["codex"]["quotas"] == [(300, 3.0), (10080, 8.0)], snap
+    assert snap["codex"]["quotas"] == [
+        {"janela": 300, "pct": 3.0, "reseta_em": 1787759175},
+        {"janela": 10080, "pct": 8.0, "reseta_em": 1788345975},
+    ], snap
     # o numero que prova que rodou
     assert snap["codex"]["janela_tokens"] == 90000, snap
     # 'service_tier' e str: nao pode entrar na soma
