@@ -52,7 +52,10 @@ $Provedores = @{
         EnvVar    = 'CODEX_HOME'
         Base      = '.codex'
         Cli       = 'codex'
-        Junctions = @('sessions', 'skills', 'plugins')
+        # sessions fica separado: o rollout so grava plan_type, nao qual conta
+        # rodou; compartilhar o historico torna a cota impossivel de atribuir.
+        # skills e plugins continuam compartilhados.
+        Junctions = @('skills', 'plugins')
         Links     = @('config.toml')
         Copias    = @()
     }
@@ -78,8 +81,9 @@ if (Test-Path $Perfil) {
 
 New-Item -ItemType Directory -Path $Perfil | Out-Null
 
-# No Codex, sessions/ e junction porque o status.py soma os rollouts de
-# $CODEX_HOME/sessions/; perfis separados fragmentariam a medicao.
+# No Codex, sessions/ fica proprio de cada perfil: o rollout nao grava qual
+# conta rodou (so plan_type), entao compartilhar sessions torna a cota
+# impossivel de atribuir. skills e plugins continuam compartilhados.
 # Os sqlite state_*, logs_*, queue_* e os arquivos -wal/-shm nao entram em
 # junction nenhuma: banco com journal nao deve ser compartilhado entre processos.
 foreach ($compartilhado in $Config.Junctions) {

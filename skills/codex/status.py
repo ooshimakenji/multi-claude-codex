@@ -18,6 +18,8 @@ Uso:  python status.py            imprime estado + delta
       python status.py --reset     esquece o marco anterior
       python status.py --selftest  roda os asserts
 """
+import base64
+import binascii
 import glob
 import json
 import os
@@ -68,7 +70,39 @@ def _ultimo_token_count(linhas):
     return None
 
 
-def codex_tokens_total():
+def codex_profile_homes():
+    """Diretorios dos perfis Codex que devem entrar na medicao.
+
+    CODEX_HOME continua aceito para testes e instalacoes fora do padrao. Para
+    os perfis normais, porem, um comando iniciado com CODEX_HOME apontando para
+    qualquer perfil ainda precisa enxergar a familia inteira.
+    """
+    configurado = os.path.abspath(CODEX_HOME)
+    diretorio_home = os.path.abspath(HOME)
+    padrao = os.path.join(diretorio_home, ".codex")
+    if os.path.dirname(configurado) == diretorio_home and (
+            configurado == padrao or os.path.basename(configurado).startswith(".codex-")):
+        candidatos = [padrao] + glob.glob(os.path.join(diretorio_home, ".codex-*"))
+    else:
+        candidatos = [configurado]
+
+    vistos = set()
+    perfis = []
+    for caminho in candidatos:
+        caminho = os.path.abspath(caminho)
+        chave = os.path.normcase(caminho)
+        if chave in vistos or not os.path.isdir(caminho):
+            continue
+        vistos.add(chave)
+        perfis.append(caminho)
+    return perfis
+
+
+def _rollouts(home):
+    return glob.glob(os.path.join(home, "sessions", "**", "*.jsonl"), recursive=True)
+
+
+def codex_tokens_total(home=None):
     """Soma dos acumulados de TODOS os rollouts.
 
     Ler so o rollout mais novo quebra o delta: a rodada seguinte pode cair em
@@ -77,7 +111,7 @@ def codex_tokens_total():
     Rollout antigo nao muda mais, e le-se so o rabo de cada um.
     """
     total = 0
-    for arq in glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"), recursive=True):
+    for arq in _rollouts(home or CODEX_HOME):
         try:
             uso = _ultimo_token_count(tail(arq, 65536))
         except OSError:
@@ -87,7 +121,7 @@ def codex_tokens_total():
     return total
 
 
-def codex_janela(minutos):
+def codex_janela(minutos, home=None):
     """Tokens gastos no Codex dentro da janela viva.
 
     E este numero que prova que a delegacao aconteceu: `used_percent` so vem em
@@ -98,7 +132,7 @@ def codex_janela(minutos):
         return 0
     corte = time.time() - minutos * 60
     total = 0
-    for arq in glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"), recursive=True):
+    for arq in _rollouts(home or CODEX_HOME):
         try:
             if os.path.getmtime(arq) < corte:
                 continue
@@ -110,19 +144,24 @@ def codex_janela(minutos):
     return total
 
 
-def codex_side():
+def _codex_side_profile(home):
     """Tokens = soma de todos os rollouts. Modelo/quota = rollout mais recente que
     os tenha: um job curto pode nao gravar turn_context, e ficar sem modelo no
     display so porque foi o ultimo a rodar seria pior que olhar um pouco atras."""
-    arqs = sorted(glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"),
-                            recursive=True), key=os.path.getmtime, reverse=True)
+    arqs = sorted(_rollouts(home), key=os.path.getmtime, reverse=True)
     out = {"arquivo": os.path.basename(arqs[0]) if arqs else None,
-           "tokens": codex_tokens_total()}
+           "tokens": codex_tokens_total(home)}
     if arqs:
         out["idade_s"] = max(0, time.time() - os.path.getmtime(arqs[0]))
     for arq in arqs[:10]:
         modelo = quotas = None
-        for ev in _loads(arq):
+        # O statusline nao pode varrer rollouts inteiros; o rabo contem as
+        # leituras mais recentes de modelo e quota.
+        for linha in tail(arq):
+            try:
+                ev = json.loads(linha)
+            except ValueError:
+                continue
             payload = ev.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
@@ -148,9 +187,79 @@ def codex_side():
         if quotas and "quotas" not in out:
             out["quotas"] = quotas
             out["quota_pct"] = quotas[0]["pct"]  # delta acompanha a mais curta
-            out["janela_tokens"] = codex_janela(quotas[0]["janela"])
+            out["janela_tokens"] = codex_janela(quotas[0]["janela"], home)
         if "modelo" in out and "quotas" in out:
             break
+    return out
+
+
+def _codex_auth(home):
+    """Extrai somente identidade e plano; nunca retorna nem registra tokens."""
+    caminho = os.path.join(home, "auth.json")
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            auth = json.load(fh)
+        token = ((auth.get("tokens") or {}).get("id_token"))
+        partes = token.split(".") if isinstance(token, str) else []
+        if len(partes) != 3:
+            raise ValueError("JWT sem tres segmentos")
+        segmento = partes[1] + ("=" * (-len(partes[1]) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(segmento))
+        if not isinstance(payload, dict):
+            raise ValueError("payload JWT invalido")
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError):
+            return {"email": None, "plano": None}
+        print("aviso: nao foi possivel decodificar auth do perfil {} ({})".format(
+            os.path.basename(home), type(exc).__name__), file=sys.stderr)
+        return {"email": None, "plano": None}
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeError,
+            binascii.Error) as exc:
+        # O aviso identifica apenas o perfil e o tipo do erro, nunca o JWT.
+        print("aviso: nao foi possivel decodificar auth do perfil {} ({})".format(
+            os.path.basename(home), type(exc).__name__), file=sys.stderr)
+        return {"email": None, "plano": None}
+
+    claim = payload.get("https://api.openai.com/auth") or {}
+    return {
+        "email": payload.get("email"),
+        "plano": claim.get("chatgpt_plan_type") if isinstance(claim, dict) else None,
+    }
+
+
+def codex_side(contas=True):
+    """Mantem o resumo antigo e acrescenta a medicao isolada por perfil."""
+    # --line so precisa do resumo compativel; evita I/O de auth.json e dos
+    # demais perfis a cada render do prompt.
+    if not contas:
+        return _codex_side_profile(CODEX_HOME)
+    homes = codex_profile_homes()
+    perfis = []
+    sides = []
+    for home in homes:
+        side = _codex_side_profile(home)
+        sides.append(side)
+        identidade = _codex_auth(home)
+        perfis.append({
+            "perfil": os.path.basename(home),
+            "email": identidade["email"],
+            "plano": identidade["plano"],
+            "tokens": side.get("tokens", 0),
+            "quotas": side.get("quotas", []),
+            "quota_pct": side.get("quota_pct"),
+            "janela_tokens": side.get("janela_tokens", 0),
+        })
+
+    if not perfis:
+        out = _codex_side_profile(CODEX_HOME)
+        out["contas"] = []
+        return out
+
+    configurado = os.path.normcase(os.path.abspath(CODEX_HOME))
+    indice = next((i for i, home in enumerate(homes)
+                   if os.path.normcase(os.path.abspath(home)) == configurado), 0)
+    out = dict(sides[indice])
+    out["contas"] = perfis
     return out
 
 
@@ -421,7 +530,7 @@ def line(stdin_json=None):
     zeraria o delta e o numero nunca sairia de ~0."""
     partes = []
     try:
-        cx = codex_side()
+        cx = codex_side(contas=False)
         if cx.get("modelo"):
             nome = cx["modelo"].replace("gpt-5.6-", "")
             idade = cx.get("idade_s") or 0
