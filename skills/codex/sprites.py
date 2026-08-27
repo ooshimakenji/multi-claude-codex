@@ -4,9 +4,9 @@
 import argparse
 import base64
 import binascii
-import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -16,24 +16,15 @@ from urllib.request import Request, urlopen
 
 POKE_API = "https://pokeapi.co/api/v2/pokemon/{number}"
 SPRITE_URL = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{path}.png"
-STARTERS = (
-    (1, "bulbasaur"),
-    (4, "charmander"),
-    (7, "squirtle"),
-    (152, "chikorita"),
-    (155, "cyndaquil"),
-    (158, "totodile"),
-    (252, "treecko"),
-    (255, "torchic"),
-    (258, "mudkip"),
-)
-STARTER_NUMBERS = {number for number, _ in STARTERS}
-STARTER_NAMES = dict(STARTERS)
+MIN_SPECIES = 1
+MAX_SPECIES = 1025
+SPECIES_NUMBERS = tuple(range(MIN_SPECIES, MAX_SPECIES + 1))
 
 
-def species_number(email):
-    digest = hashlib.sha256(email.lower().encode("utf-8")).digest()
-    return STARTERS[int.from_bytes(digest, "big") % len(STARTERS)][0]
+def random_species(available):
+    """Choose a species with system randomness, independently of the e-mail."""
+    choices = tuple(sorted(available))
+    return choices[secrets.randbelow(len(choices))]
 
 
 def cache_dir():
@@ -183,18 +174,19 @@ def map_identity(map_key, item):
     return provider, email.strip().lower()
 
 
-def assign_numbers(accounts, mapping):
-    """Migrate keys, retain valid assignments, then allocate new e-mails."""
+def assign_numbers(accounts, mapping, reset=False):
+    """Migrate keys, retain assignments, then allocate new e-mails randomly."""
     retained = {}
     owners = {}
     identity_keys = {}
     candidates = []
-    for source_key in sorted(mapping, key=lambda value: str(value).lower()):
-        item = mapping[source_key]
+    source_mapping = {} if reset else mapping
+    for source_key in sorted(source_mapping, key=lambda value: str(value).lower()):
+        item = source_mapping[source_key]
         if not isinstance(item, dict):
             continue
         number = item.get("numero")
-        if number not in STARTER_NUMBERS:
+        if not isinstance(number, int) or not MIN_SPECIES <= number <= MAX_SPECIES:
             continue
 
         normalized = dict(item)
@@ -227,6 +219,7 @@ def assign_numbers(accounts, mapping):
         account["email"] = email
         by_identity[(provider, email)] = account
 
+    available = set(SPECIES_NUMBERS) - set(owners)
     reuse = []
     for identity in sorted(by_identity):
         provider, email = identity
@@ -234,20 +227,14 @@ def assign_numbers(accounts, mapping):
         map_key = identity_keys.get(identity)
         item = retained.get(map_key) if map_key is not None else None
         if item is None:
-            starter_number = species_number(email)
-            start = next(index for index, (number, _name) in enumerate(STARTERS)
-                         if number == starter_number)
-            number = next(
-                (STARTERS[(start + offset) % len(STARTERS)][0]
-                 for offset in range(len(STARTERS))
-                 if STARTERS[(start + offset) % len(STARTERS)][0] not in owners),
-                None,
-            )
-            if number is None:
-                number = STARTERS[start][0]
+            if available:
+                number = random_species(available)
+                available.remove(number)
+            else:
+                number = random_species(SPECIES_NUMBERS)
                 reuse.append((email, number))
             map_key = qualified_key(provider, email)
-            item = {"numero": number, "nome": STARTER_NAMES[number], "email": email}
+            item = {"numero": number, "email": email}
             retained[map_key] = item
             identity_keys[identity] = map_key
             owners.setdefault(number, identity)
@@ -261,17 +248,23 @@ def assign_numbers(accounts, mapping):
     return retained, reuse
 
 
-def populate():
+def populate(reset=False):
     accounts = claude_accounts() + codex_accounts()
     target = cache_dir()
     mapping, map_ok = read_map(target / "mapa.json")
-    mapping, reuse = assign_numbers(accounts, mapping)
+    mapping, reuse = assign_numbers(accounts, mapping, reset=reset)
     if reuse:
         for email, number in reuse:
-            print(f"aviso: reuso do inicial {STARTER_NAMES[number]} para {email}", file=sys.stderr)
+            print(f"aviso: reuso do Pokemon {number} para {email}", file=sys.stderr)
 
-    numbers = {account["map_key"]: mapping[account["map_key"]]["numero"] for account in accounts}
-    for number in sorted(set(numbers.values())):
+    numbers = {
+        item["numero"]
+        for item in mapping.values()
+        if isinstance(item, dict)
+        and isinstance(item.get("numero"), int)
+        and MIN_SPECIES <= item["numero"] <= MAX_SPECIES
+    }
+    for number in sorted(numbers):
         for side, path in (("frente", str(number)), ("costas", f"back/{number}")):
             destination = target / f"{number}-{side}.png"
             if destination.is_file():
@@ -281,13 +274,14 @@ def populate():
             except Exception as error:
                 print(f"aviso: sprite {number} {side}: {error}", file=sys.stderr)
         for item in mapping.values():
-            if isinstance(item, dict) and item.get("numero") == number:
-                item["nome"] = STARTER_NAMES[number]
+            if not isinstance(item, dict) or item.get("numero") != number or item.get("nome"):
+                continue
+            try:
+                item["nome"] = pokemon_name(number)
+            except Exception as error:
+                print(f"aviso: nome Pokemon {number}: {error}", file=sys.stderr)
 
-    if map_ok:
-        for map_key, number in numbers.items():
-            mapping[map_key]["numero"] = number
-            mapping[map_key]["nome"] = STARTER_NAMES[number]
+    if map_ok or reset:
         try:
             map_path = target / "mapa.json"
             map_data = json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
@@ -296,6 +290,9 @@ def populate():
         except OSError as error:
             print(f"aviso: mapa.json: {error}", file=sys.stderr)
 
+    if reset:
+        clean_orphans()
+
     print("mapa final:")
     for map_key in sorted(mapping, key=str.lower):
         item = mapping[map_key]
@@ -303,18 +300,13 @@ def populate():
 
 
 def selftest():
-    email = "Trainer@Example.COM"
-    assert species_number(email) == species_number(email)
-    assert species_number(email) == species_number(email.lower())
-    number = species_number(email)
-    assert number in STARTER_NUMBERS
-    mapping = {email: {"numero": number, "nome": "pikachu"}}
-    assert mapping[email]["numero"] == number and mapping[email]["nome"] == "pikachu"
     old = {"old@example.com": {"numero": 503, "nome": "samurott"}}
     allocated, reuse = assign_numbers(
         [{"email": "old@example.com", "provedor": "claude"},
          {"email": "new@example.com", "provedor": "codex", "plano": "plus"}], old)
-    assert allocated["claude:old@example.com"]["numero"] == species_number("old@example.com")
+    assert allocated["claude:old@example.com"]["numero"] == 503
+    assert 1 <= allocated["codex:new@example.com"]["numero"] <= MAX_SPECIES
+    assert allocated["codex:new@example.com"]["numero"] != 503
     assert allocated["codex:new@example.com"]["provedor"] == "codex"
     assert not reuse
     allocated_again, reuse_again = assign_numbers(
@@ -322,6 +314,12 @@ def selftest():
          {"email": "new@example.com", "provedor": "codex", "plano": "plus"}], allocated)
     assert allocated_again == allocated
     assert not reuse_again
+    reset, reset_reuse = assign_numbers(
+        [{"email": "old@example.com", "provedor": "claude"},
+         {"email": "new@example.com", "provedor": "codex", "plano": "plus"}], old, reset=True)
+    assert set(reset) == {"claude:old@example.com", "codex:new@example.com"}
+    assert len({item["numero"] for item in reset.values()}) == 2
+    assert not reset_reuse
     print("sprites.py selftest: ok")
 
 
@@ -337,7 +335,7 @@ def clean_orphans():
         if not isinstance(item, dict):
             continue
         number = item.get("numero")
-        if isinstance(number, int) and 1 <= number <= 1025:
+        if isinstance(number, int) and MIN_SPECIES <= number <= MAX_SPECIES:
             referenced.update((f"{number}-frente.png", f"{number}-costas.png"))
 
     removed = 0
@@ -357,9 +355,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--limpar", action="store_true")
+    parser.add_argument("--resetar", action="store_true")
     args = parser.parse_args()
     try:
-        selftest() if args.selftest else clean_orphans() if args.limpar else populate()
+        selftest() if args.selftest else clean_orphans() if args.limpar else populate(reset=args.resetar)
     except Exception as error:
         print(f"erro: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -33,8 +33,9 @@ static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 // Claude grid needs 260 px for sprite + active marker + the 186 px email
 // sample (a 29-character address, truncated), and 300 px for each quota cell:
 // 84 px bar + 42 px percentage + 10 px gap + 4 px separator + the measured
-// countdown and exact reset clock.  The section frame adds 32 px (2 px
-// borders and 14 px horizontal inner margins on both sides).
+// countdown and exact reset clock.  Codex uses the same quota cells plus a
+// 150 px plan column.  The section frame adds 32 px (2 px borders and 14 px
+// horizontal inner margins on both sides).
 const TITLE_BAR_HEIGHT: f32 = 36.0;
 const SECTION_HORIZONTAL_OVERHEAD: f32 = 32.0;
 const CLAUDE_ACCOUNT_WIDTH: f32 = 260.0;
@@ -44,7 +45,10 @@ const CLAUDE_CONTENT_WIDTH: f32 =
     CLAUDE_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + CLAUDE_QUOTA_WIDTH * 2.0;
 const CODEX_ACCOUNT_WIDTH: f32 = 300.0;
 const CODEX_PLAN_WIDTH: f32 = 150.0;
-const CODEX_CONTENT_WIDTH: f32 = CODEX_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + CODEX_PLAN_WIDTH;
+const CODEX_QUOTA_WIDTH: f32 = 300.0;
+const CODEX_GRID_GAPS: f32 = 30.0;
+const CODEX_CONTENT_WIDTH: f32 =
+    CODEX_ACCOUNT_WIDTH + CODEX_PLAN_WIDTH + CODEX_GRID_GAPS + CODEX_QUOTA_WIDTH * 2.0;
 const INITIAL_CONTENT_WIDTH: f32 = if CLAUDE_CONTENT_WIDTH > CODEX_CONTENT_WIDTH {
     CLAUDE_CONTENT_WIDTH
 } else {
@@ -273,17 +277,6 @@ impl PokemonCache {
             .values()
             .find(|info| info.provider == provider && info.email.eq_ignore_ascii_case(email))
             .cloned()
-    }
-
-    fn accounts(&self, provider: &str) -> Vec<(String, PokemonInfo)> {
-        let mut accounts = self
-            .map
-            .iter()
-            .filter(|(_, info)| info.provider == provider)
-            .map(|(_, info)| (info.email.clone(), info.clone()))
-            .collect::<Vec<_>>();
-        accounts.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
-        accounts
     }
 
     fn texture(
@@ -853,6 +846,10 @@ fn show_claude(
                         .get("active")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let disabled = account
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     let email = account.get("email").and_then(Value::as_str).unwrap_or("");
                     let fainted = [five_hour, seven_day]
                         .into_iter()
@@ -893,13 +890,27 @@ fn show_claude(
                                         egui::Label::new(data_text(email)).truncate(true),
                                     )
                                     .on_hover_text(string_field(account, "usageStatus"));
-                                    if let Some(species) = species {
-                                        ui.add_sized(
-                                            [info_width, 20.0],
-                                            egui::Label::new(pixel_text(species, 10.0))
-                                                .truncate(true),
-                                        );
-                                    }
+                                    ui.horizontal(|ui| {
+                                        let disabled_width = if disabled {
+                                            text_width("desabilitada") + ui.spacing().item_spacing.x
+                                        } else {
+                                            0.0
+                                        };
+                                        if let Some(species) = species.as_deref() {
+                                            ui.add_sized(
+                                                [(info_width - disabled_width).max(0.0), 20.0],
+                                                egui::Label::new(pixel_text(species, 10.0))
+                                                    .truncate(true),
+                                            );
+                                        }
+                                        if disabled {
+                                            ui.add_sized(
+                                                [text_width("desabilitada"), 20.0],
+                                                egui::Label::new(dim_text("desabilitada"))
+                                                    .truncate(true),
+                                            );
+                                        }
+                                    });
                                 });
                             });
                         },
@@ -931,18 +942,18 @@ fn claude_column_widths(available_width: f32) -> (f32, f32) {
 
 fn render_codex_accounts(
     ui: &mut egui::Ui,
+    accounts: &[Value],
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
 ) {
-    let accounts = pokemon.accounts("codex");
     if accounts.is_empty() {
         dim_label(ui, "contas Codex ausentes");
         return;
     }
 
     egui::Grid::new("codex_accounts")
-        .num_columns(2)
+        .num_columns(4)
         .min_col_width(0.0)
         .min_row_height(20.0)
         .spacing(egui::vec2(10.0, 8.0))
@@ -955,12 +966,36 @@ fn render_codex_accounts(
                 [CODEX_PLAN_WIDTH, 20.0],
                 egui::Label::new(pixel_text("plano", 10.0)),
             );
+            ui.add_sized(
+                [CODEX_QUOTA_WIDTH, 20.0],
+                egui::Label::new(pixel_text("5h", 10.0)),
+            );
+            ui.add_sized(
+                [CODEX_QUOTA_WIDTH, 20.0],
+                egui::Label::new(pixel_text("7d", 10.0)),
+            );
             ui.end_row();
 
-            for (email, info) in accounts {
+            for account in accounts {
+                let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+                let info = pokemon.info("codex", email);
                 let texture = poke_mode
-                    .then(|| pokemon.texture(context, "codex", &email, false).cloned())
+                    .then(|| pokemon.texture(context, "codex", email, false).cloned())
                     .flatten();
+                let species = poke_mode
+                    .then(|| info.as_ref().map(|info| info.name.clone()))
+                    .flatten();
+                let five_hour = quota_percent(Some(account), "300");
+                let seven_day = quota_percent(Some(account), "10080");
+                let five_hour_countdown = quota_countdown(Some(account), "300");
+                let seven_day_countdown = quota_countdown(Some(account), "10080");
+                let five_hour_clock = quota_clock(Some(account), "300");
+                let seven_day_clock = quota_clock(Some(account), "10080");
+                let plan = account
+                    .get("plano")
+                    .and_then(Value::as_str)
+                    .or_else(|| info.as_ref().and_then(|info| info.plan.as_deref()))
+                    .unwrap_or("ausente");
                 ui.allocate_ui_with_layout(
                     egui::vec2(CODEX_ACCOUNT_WIDTH, 40.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -983,20 +1018,31 @@ fn render_codex_accounts(
                             ui.vertical(|ui| {
                                 ui.add_sized(
                                     [info_width, 20.0],
-                                    egui::Label::new(data_text(&email)).truncate(true),
+                                    egui::Label::new(data_text(email)).truncate(true),
                                 );
-                                ui.add_sized(
-                                    [info_width, 20.0],
-                                    egui::Label::new(pixel_text(&info.name, 10.0)).truncate(true),
-                                );
+                                if let Some(species) = species.as_deref() {
+                                    ui.add_sized(
+                                        [info_width, 20.0],
+                                        egui::Label::new(pixel_text(species, 10.0)).truncate(true),
+                                    );
+                                }
                             });
                         });
                     },
                 );
                 ui.add_sized(
                     [CODEX_PLAN_WIDTH, 40.0],
-                    egui::Label::new(data_text(info.plan.as_deref().unwrap_or("ausente")))
-                        .truncate(true),
+                    egui::Label::new(data_text(plan)).truncate(true),
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| usage_bar(ui, five_hour, five_hour_countdown, five_hour_clock),
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| usage_bar(ui, seven_day, seven_day_countdown, seven_day_clock),
                 );
                 ui.end_row();
             }
@@ -1011,35 +1057,26 @@ fn show_codex(
     poke_mode: bool,
 ) {
     section_frame(ui, "CODEX", |ui| {
-        render_codex_accounts(ui, pokemon, context, poke_mode);
-        ui.add_space(8.0);
-        ui.label(pixel_text("cota compartilhada", 10.0));
-        match status {
-            None => dim_label(ui, "carregando…"),
-            Some(Err(error)) => error_label(ui, error),
-            Some(Ok(value)) => {
-                let codex = value.get("codex");
-                let slot_width =
-                    ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(0.0);
-                ui.horizontal(|ui| {
-                    for (label, minutes) in [("5h", "300"), ("7d", "10080")] {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(slot_width, 20.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(pixel_text(label, 10.0));
-                                usage_bar(
-                                    ui,
-                                    quota_percent(codex, minutes),
-                                    quota_countdown(codex, minutes),
-                                    quota_clock(codex, minutes),
-                                );
-                            },
-                        );
-                    }
-                });
+        let value = match status {
+            None => {
+                dim_label(ui, "carregando…");
+                return;
             }
-        }
+            Some(Err(error)) => {
+                error_label(ui, error);
+                return;
+            }
+            Some(Ok(value)) => value,
+        };
+        let Some(codex) = value.get("codex") else {
+            error_label(ui, "status.py: JSON sem codex");
+            return;
+        };
+        let Some(accounts) = codex.get("contas").and_then(Value::as_array) else {
+            error_label(ui, "status.py: JSON sem codex.contas[]");
+            return;
+        };
+        render_codex_accounts(ui, accounts, pokemon, context, poke_mode);
     });
 }
 
