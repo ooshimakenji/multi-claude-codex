@@ -3,6 +3,8 @@ use std::{
     env,
     ffi::c_void,
     fs,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -36,6 +38,8 @@ static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 // countdown and exact reset clock.  Codex uses the same quota cells plus a
 // 150 px plan column.  The section frame adds 32 px (2 px borders and 14 px
 // horizontal inner margins on both sides).
+// OpenCodex uses 340 px for the account id and marker plus the same two quota
+// cells; its 960 px content width is included in the widest-section calculation.
 const TITLE_BAR_HEIGHT: f32 = 36.0;
 const SECTION_HORIZONTAL_OVERHEAD: f32 = 32.0;
 const CLAUDE_ACCOUNT_WIDTH: f32 = 260.0;
@@ -49,10 +53,21 @@ const CODEX_QUOTA_WIDTH: f32 = 300.0;
 const CODEX_GRID_GAPS: f32 = 30.0;
 const CODEX_CONTENT_WIDTH: f32 =
     CODEX_ACCOUNT_WIDTH + CODEX_PLAN_WIDTH + CODEX_GRID_GAPS + CODEX_QUOTA_WIDTH * 2.0;
+const OPENCODEX_ACCOUNT_WIDTH: f32 = 340.0;
+const OPENCODEX_QUOTA_WIDTH: f32 = 300.0;
+const OPENCODEX_GRID_GAPS: f32 = 20.0;
+const OPENCODEX_CONTENT_WIDTH: f32 =
+    OPENCODEX_ACCOUNT_WIDTH + OPENCODEX_GRID_GAPS + OPENCODEX_QUOTA_WIDTH * 2.0;
 const INITIAL_CONTENT_WIDTH: f32 = if CLAUDE_CONTENT_WIDTH > CODEX_CONTENT_WIDTH {
-    CLAUDE_CONTENT_WIDTH
-} else {
+    if CLAUDE_CONTENT_WIDTH > OPENCODEX_CONTENT_WIDTH {
+        CLAUDE_CONTENT_WIDTH
+    } else {
+        OPENCODEX_CONTENT_WIDTH
+    }
+} else if CODEX_CONTENT_WIDTH > OPENCODEX_CONTENT_WIDTH {
     CODEX_CONTENT_WIDTH
+} else {
+    OPENCODEX_CONTENT_WIDTH
 };
 const INITIAL_INNER_WIDTH: f32 = SECTION_HORIZONTAL_OVERHEAD + INITIAL_CONTENT_WIDTH + 8.0;
 const INITIAL_INNER_HEIGHT: f32 = 618.0;
@@ -194,12 +209,32 @@ fn icone() -> egui::IconData {
 struct Snapshot {
     status: Result<Value, String>,
     cswap: Result<Value, String>,
+    codex_last_used_profile: Option<String>,
+    opencodex: Option<OpenCodexSnapshot>,
+}
+
+struct OpenCodexSnapshot {
+    default_provider: Option<String>,
+    mode: Option<String>,
+    default_model: Option<String>,
+    accounts: Vec<OpenCodexAccount>,
+}
+
+struct OpenCodexAccount {
+    id: String,
+    weekly_percent: Option<f64>,
+    short_percent: Option<f64>,
+    weekly_reset_at: Option<f64>,
+    short_reset_at: Option<f64>,
+    active: bool,
 }
 
 struct PanelApp {
     receiver: Receiver<Snapshot>,
     status: Option<Result<Value, String>>,
     cswap: Option<Result<Value, String>>,
+    codex_last_used_profile: Option<String>,
+    opencodex: Option<OpenCodexSnapshot>,
     pokemon: PokemonCache,
     poke_mode: bool,
     hwnd: Option<*mut c_void>,
@@ -318,6 +353,8 @@ impl PanelApp {
             receiver,
             status: None,
             cswap: None,
+            codex_last_used_profile: None,
+            opencodex: None,
             pokemon: PokemonCache::new(),
             poke_mode: load_poke_mode(),
             hwnd: native_window_handle(creation_context),
@@ -328,6 +365,8 @@ impl PanelApp {
         while let Ok(snapshot) = self.receiver.try_recv() {
             self.status = Some(snapshot.status);
             self.cswap = Some(snapshot.cswap);
+            self.codex_last_used_profile = snapshot.codex_last_used_profile;
+            self.opencodex = snapshot.opencodex;
         }
     }
 }
@@ -393,6 +432,8 @@ impl eframe::App for PanelApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    show_command_line(ui, self.cswap.as_ref());
+                    ui.add_space(12.0);
                     show_running_jobs(ui, self.status.as_ref());
                     ui.add_space(12.0);
 
@@ -408,11 +449,16 @@ impl eframe::App for PanelApp {
                     show_codex(
                         ui,
                         self.status.as_ref(),
+                        self.codex_last_used_profile.as_deref(),
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
                     );
                     ui.add_space(8.0);
+                    if let Some(opencodex) = self.opencodex.as_ref() {
+                        show_opencodex(ui, opencodex);
+                        ui.add_space(8.0);
+                    }
                     show_free_tier(ui, self.status.as_ref());
                     ui.add_space(8.0);
                     show_context(ui, self.status.as_ref());
@@ -618,7 +664,17 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
     loop {
         let status = read_status(&repo);
         let cswap = read_cswap();
-        if sender.send(Snapshot { status, cswap }).is_err() {
+        let codex_last_used_profile = read_latest_codex_profile();
+        let opencodex = read_opencodex();
+        if sender
+            .send(Snapshot {
+                status,
+                cswap,
+                codex_last_used_profile,
+                opencodex,
+            })
+            .is_err()
+        {
             break;
         }
         thread::sleep(Duration::from_secs(2));
@@ -680,15 +736,261 @@ fn read_cswap() -> Result<Value, String> {
     serde_json::from_str(&stdout).map_err(|error| format!("cswap retornou JSON inválido: {error}"))
 }
 
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 fn claude_config_dir() -> Option<PathBuf> {
     env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .or_else(|| env::var_os("USERPROFILE"))
-                .map(PathBuf::from)
-                .map(|path| path.join(".claude"))
+        .or_else(|| home_directory().map(|path| path.join(".claude")))
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let mut response = Vec::new();
+    let header_end;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut buffer).ok()?;
+        if read == 0 {
+            return None;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if let Some(end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = end;
+            break;
+        }
+        if response.len() > MAX_HEADER_BYTES {
+            return None;
+        }
+    }
+
+    let headers = String::from_utf8(response[..header_end].to_vec()).ok()?;
+    let body_start = header_end + 4;
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    if let Some(content_length) = content_length {
+        let body_end = body_start.checked_add(content_length)?;
+        while response.len() < body_end {
+            let read = stream.read(&mut buffer).ok()?;
+            if read == 0 {
+                return None;
+            }
+            response.extend_from_slice(&buffer[..read]);
+        }
+        return Some((headers, response[body_start..body_end].to_vec()));
+    }
+
+    stream.read_to_end(&mut response).ok()?;
+    Some((headers, response[body_start..].to_vec()))
+}
+
+fn opencodex_health_ok() -> bool {
+    let address: SocketAddr = match "127.0.0.1:10100".parse() {
+        Ok(address) => address,
+        Err(_) => return false,
+    };
+    let timeout = Duration::from_millis(300);
+    let mut stream = match TcpStream::connect_timeout(&address, timeout) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+    if stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:10100\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+
+    let Some((headers, body)) = read_http_response(&mut stream) else {
+        return false;
+    };
+    let status_ok = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        == Some("200");
+    if !status_ok {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|health| {
+            health
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         })
+        .as_deref()
+        == Some("ok")
+}
+
+fn read_opencodex() -> Option<OpenCodexSnapshot> {
+    if !opencodex_health_ok() {
+        return None;
+    }
+    let directory = home_directory()?.join(".opencodex");
+    let config = read_json_file(&directory.join("config.json"))?;
+    let quota_cache = read_json_file(&directory.join("codex-quota-cache.json"))?;
+    let active_account_id = config
+        .get("activeCodexAccountId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let default_provider = config
+        .get("defaultProvider")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mode = config
+        .get("providers")
+        .and_then(|providers| providers.get("openai"))
+        .and_then(|openai| openai.get("codexAccountMode"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let default_model = config
+        .get("defaultModel")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            config
+                .get("subagentModels")
+                .and_then(Value::as_array)
+                .and_then(|models| {
+                    models
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .find(|value| !value.is_empty())
+                })
+                .map(str::to_owned)
+        });
+    let quotas = quota_cache.get("quotas")?.as_object()?;
+    let mut accounts = quotas
+        .iter()
+        .filter_map(|(id, quota)| {
+            let quota = quota.as_object()?;
+            Some(OpenCodexAccount {
+                id: id.to_owned(),
+                weekly_percent: quota.get("weeklyPercent").and_then(as_number),
+                short_percent: quota.get("shortPercent").and_then(as_number),
+                weekly_reset_at: quota.get("weeklyResetAt").and_then(as_number),
+                short_reset_at: quota.get("shortResetAt").and_then(as_number),
+                active: active_account_id.as_deref() == Some(id),
+            })
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| left.id.cmp(&right.id));
+    Some(OpenCodexSnapshot {
+        default_provider,
+        mode,
+        default_model,
+        accounts,
+    })
+}
+
+fn codex_profile_directories() -> Vec<PathBuf> {
+    let Some(home) = home_directory() else {
+        return Vec::new();
+    };
+    let configured = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let configured = if configured.is_absolute() {
+        configured
+    } else {
+        env::current_dir()
+            .map(|current| current.join(&configured))
+            .unwrap_or(configured)
+    };
+    let configured_name = configured.file_name().and_then(|name| name.to_str());
+    let is_standard_family = configured.parent() == Some(home.as_path())
+        && configured_name.is_some_and(|name| name == ".codex" || name.starts_with(".codex-"));
+    let mut candidates = if is_standard_family {
+        let mut candidates = vec![home.join(".codex")];
+        if let Ok(entries) = fs::read_dir(&home) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|name| name.to_str());
+                if name.is_some_and(|name| name.starts_with(".codex-")) {
+                    candidates.push(path);
+                }
+            }
+        }
+        candidates
+    } else {
+        vec![configured]
+    };
+    candidates.retain(|path| path.is_dir());
+    candidates
+}
+
+fn newest_rollout_mtime(directory: &Path) -> Option<SystemTime> {
+    let mut newest = None;
+    let entries = fs::read_dir(directory).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            if let Some(mtime) = newest_rollout_mtime(&path) {
+                if newest.map_or(true, |known| mtime > known) {
+                    newest = Some(mtime);
+                }
+            }
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            if let Ok(mtime) = metadata.modified() {
+                if newest.map_or(true, |known| mtime > known) {
+                    newest = Some(mtime);
+                }
+            }
+        }
+    }
+    newest
+}
+
+fn read_latest_codex_profile() -> Option<String> {
+    let mut latest = None;
+    for directory in codex_profile_directories() {
+        let Some(mtime) = newest_rollout_mtime(&directory.join("sessions")) else {
+            continue;
+        };
+        let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .map_or(true, |(known, _): &(SystemTime, String)| mtime > *known)
+        {
+            latest = Some((mtime, name.to_owned()));
+        }
+    }
+    latest.map(|(_, profile)| profile)
 }
 
 fn process_output_message(output: &std::process::Output) -> String {
@@ -744,6 +1046,42 @@ fn find_repo() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+fn show_command_line(ui: &mut egui::Ui, cswap: Option<&Result<Value, String>>) {
+    section_frame(ui, "NO COMANDO", |ui| {
+        let value = match cswap {
+            None => {
+                dim_label(ui, "carregando…");
+                return;
+            }
+            Some(Err(error)) => {
+                error_label(ui, error);
+                return;
+            }
+            Some(Ok(value)) => value,
+        };
+        let account = value
+            .get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|accounts| {
+                accounts.iter().find_map(|account| {
+                    let active = account
+                        .get("active")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    active
+                        .then(|| account.get("email").and_then(Value::as_str))
+                        .flatten()
+                        .filter(|email| !email.is_empty())
+                })
+            })
+            .unwrap_or("conta não identificada");
+        data_label(
+            ui,
+            format!("Claude Code · {account} · modelo não disponível"),
+        );
+    });
 }
 
 fn show_running_jobs(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
@@ -943,6 +1281,7 @@ fn claude_column_widths(available_width: f32) -> (f32, f32) {
 fn render_codex_accounts(
     ui: &mut egui::Ui,
     accounts: &[Value],
+    last_used_profile: Option<&str>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -978,6 +1317,9 @@ fn render_codex_accounts(
 
             for account in accounts {
                 let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+                let last_used = last_used_profile.is_some_and(|profile| {
+                    account.get("perfil").and_then(Value::as_str) == Some(profile)
+                });
                 let info = pokemon.info("codex", email);
                 let texture = poke_mode
                     .then(|| pokemon.texture(context, "codex", email, false).cloned())
@@ -1020,12 +1362,27 @@ fn render_codex_accounts(
                                     [info_width, 20.0],
                                     egui::Label::new(data_text(email)).truncate(true),
                                 );
-                                if let Some(species) = species.as_deref() {
-                                    ui.add_sized(
-                                        [info_width, 20.0],
-                                        egui::Label::new(pixel_text(species, 10.0)).truncate(true),
-                                    );
-                                }
+                                ui.horizontal(|ui| {
+                                    let last_used_width = if last_used {
+                                        text_width("· última usada") + ui.spacing().item_spacing.x
+                                    } else {
+                                        0.0
+                                    };
+                                    if let Some(species) = species.as_deref() {
+                                        ui.add_sized(
+                                            [(info_width - last_used_width).max(0.0), 20.0],
+                                            egui::Label::new(pixel_text(species, 10.0))
+                                                .truncate(true),
+                                        );
+                                    }
+                                    if last_used {
+                                        ui.add_sized(
+                                            [text_width("· última usada"), 20.0],
+                                            egui::Label::new(dim_text("· última usada"))
+                                                .truncate(true),
+                                        );
+                                    }
+                                });
                             });
                         });
                     },
@@ -1052,6 +1409,7 @@ fn render_codex_accounts(
 fn show_codex(
     ui: &mut egui::Ui,
     status: Option<&Result<Value, String>>,
+    last_used_profile: Option<&str>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -1076,7 +1434,92 @@ fn show_codex(
             error_label(ui, "status.py: JSON sem codex.contas[]");
             return;
         };
-        render_codex_accounts(ui, accounts, pokemon, context, poke_mode);
+        render_codex_accounts(ui, accounts, last_used_profile, pokemon, context, poke_mode);
+    });
+}
+
+fn show_opencodex(ui: &mut egui::Ui, snapshot: &OpenCodexSnapshot) {
+    section_frame(ui, "OPENCODEX", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(pixel_text("provedor", 10.0));
+            ui.label(data_text(
+                snapshot.default_provider.as_deref().unwrap_or("—"),
+            ));
+            ui.add_space(12.0);
+            ui.label(pixel_text("modo", 10.0));
+            ui.label(data_text(snapshot.mode.as_deref().unwrap_or("—")));
+            ui.add_space(12.0);
+            ui.label(pixel_text("modelo padrão", 10.0));
+            ui.label(data_text(
+                snapshot
+                    .default_model
+                    .as_deref()
+                    .unwrap_or("modelo não disponível"),
+            ));
+        });
+        ui.add_space(10.0);
+        if snapshot.accounts.is_empty() {
+            dim_label(ui, "contas de cota ausentes");
+            return;
+        }
+
+        egui::Grid::new("opencodex_accounts")
+            .num_columns(3)
+            .min_col_width(0.0)
+            .min_row_height(20.0)
+            .spacing(egui::vec2(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.add_sized(
+                    [OPENCODEX_ACCOUNT_WIDTH, 20.0],
+                    egui::Label::new(pixel_text("conta", 10.0)),
+                );
+                ui.add_sized(
+                    [OPENCODEX_QUOTA_WIDTH, 20.0],
+                    egui::Label::new(pixel_text("5h", 10.0)),
+                );
+                ui.add_sized(
+                    [OPENCODEX_QUOTA_WIDTH, 20.0],
+                    egui::Label::new(pixel_text("7d", 10.0)),
+                );
+                ui.end_row();
+
+                for account in &snapshot.accounts {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(OPENCODEX_ACCOUNT_WIDTH, 40.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let marker = if account.active { "▶" } else { " " };
+                            let marker_response = ui.label(data_text(marker));
+                            if account.active {
+                                marker_response.on_hover_text("conta no comando");
+                            }
+                            let info_width = (OPENCODEX_ACCOUNT_WIDTH
+                                - ACCOUNT_CURSOR_WIDTH
+                                - ui.spacing().item_spacing.x)
+                                .max(0.0);
+                            ui.add_sized(
+                                [info_width, 20.0],
+                                egui::Label::new(data_text(&account.id)).truncate(true),
+                            );
+                        },
+                    );
+                    let short_countdown = account.short_reset_at.and_then(format_reset_countdown);
+                    let short_clock = account.short_reset_at.and_then(format_reset_clock);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| usage_bar(ui, account.short_percent, short_countdown, short_clock),
+                    );
+                    let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
+                    let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| usage_bar(ui, account.weekly_percent, weekly_countdown, weekly_clock),
+                    );
+                    ui.end_row();
+                }
+            });
     });
 }
 
