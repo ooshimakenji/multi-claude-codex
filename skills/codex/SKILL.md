@@ -17,7 +17,17 @@ Catálogo vivo em `$CODEX_HOME/models_cache.json` (`~/.codex` por padrão).
 
 | Apelido | Modelo | Quando |
 |---|---|---|
-| `trivial` | NVIDIA nemotron / Gemini flash-lite (free tier), via `ask.py` | texto curto e mecânico: mensagem de commit, resumo de diff, rename |
+| `trivial` | free tier via `ask.py` — cadeia ordenada por latência medida (ver abaixo) | texto curto e mecânico: mensagem de commit, resumo de diff, rename |
+
+**Cadeia do `ask.py --provedor nvidia`** (medida 2026-09-01 com `auditoria_fotos/bench_codigo.py`,
+que **executa** o código gerado contra 4 asserts): `gpt-oss-120b` 3,8s → `minimax-m3` 6,6s →
+`kimi-k3` 18,8s → `nemotron-3.5-lightning` 66–104s → `nemotron-3-nano-omni` →
+**`gemini:gemini-flash-lite-latest`** 2,2s.
+
+Um item pode ser `provedor:modelo`. O tail é de **outro fornecedor de propósito**: a cadeia
+só avança em 404/410, e o 404 da NVIDIA é `"Not found for account"` — mata todos os modelos
+NVIDIA juntos, então mais um deles no fim da fila não seria fallback nenhum.
+⚠️ O tail divide cota com o pipeline de fotos (mesmo modelo, mesma chave), por isso fica por último.
 | `rapido` | `gpt-5.6-luna` | mecânico, repetitivo, leitura de volume (resumir arquivo grande, varrer repo) |
 | `normal` | `gpt-5.6-terra` | default geral |
 | `pesado` | `gpt-5.6-sol` | difícil ou ambíguo; aceita `model_reasoning_effort` até `ultra` |

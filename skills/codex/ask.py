@@ -16,9 +16,22 @@ import urllib.request
 PROVEDORES = {
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        # Ordem medida em 2026-09-01 (auditoria_fotos/bench_codigo.py: escreve a funcao,
+        # o codigo e EXECUTADO contra 4 asserts). Os quatro passam; o que os separa e
+        # latencia. O antigo default (nemotron-3.5-lightning) levava 66-104s no mesmo
+        # prompt porque despeja o chain-of-thought inteiro no content - fica no fim.
         "modelos": [
-            "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "openai/gpt-oss-120b",                    # 3,8s  - passou 4/4
+            "minimaxai/minimax-m3",                   # 6,6s  - passou 4/4, e ve imagem
+            "moonshotai/kimi-k3",                     # 18,8s - passou 4/4
+            "nvidia/nemotron-3.5-lightning-30b-a3b",  # 66-104s
             "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            # ULTIMO FALLBACK, de proposito em outro fornecedor e outra chave: o 404 da
+            # NVIDIA e "Not found for account" e mata todos os itens acima juntos.
+            # Passou 4/4 em 2,2s (medido 2026-09-01).
+            # ⚠️ Divide cota com o pipeline de fotos (auditoria_fotos usa o MESMO modelo
+            # e a MESMA chave). Por isso fica no fim: so e chamado se a NVIDIA inteira cair.
+            "gemini:gemini-flash-lite-latest",
         ],
         "env": "NVIDIA_API_KEY",
     },
@@ -116,12 +129,26 @@ def _call(provedor, modelo, chave, pergunta):
 
 
 def _call_modelos(provedor, modelos, chave, pergunta):
-    """Tenta o proximo modelo so quando o anterior esta morto ou ausente."""
+    """Tenta o proximo modelo so quando o anterior esta morto ou ausente.
+
+    Um item da cadeia e "modelo" (usa o provedor da chamada) ou "provedor:modelo".
+    O prefixo existe para o ULTIMO fallback poder cruzar de provedor: o 404 da NVIDIA
+    e "Not found for account", que tira a conta inteira de uma vez - nesse caso mais um
+    modelo NVIDIA no fim da fila nao salva nada, so um fornecedor e uma chave diferentes.
+    Id de modelo tem "/", nunca ":", entao o rpartition nao ambiguiza.
+    """
     ultimo = (None, None, None, "nenhum modelo configurado")
     modelo_usado = None
-    for modelo in modelos:
-        modelo_usado = modelo
-        ultimo = _call(provedor, modelo, chave, pergunta)
+    for item in modelos:
+        prov, _, modelo = item.rpartition(":")
+        prov = prov or provedor
+        if prov not in PROVEDORES:
+            continue
+        modelo_usado = item
+        chave_item = chave if prov == provedor else resolve_key(prov)
+        if not chave_item:
+            continue          # sem chave daquele provedor: pula, nao derruba a cadeia
+        ultimo = _call(prov, modelo, chave_item, pergunta)
         if ultimo[3] is None or ultimo[1] not in {404, 410}:
             return (*ultimo, modelo_usado)
     return (*ultimo, modelo_usado)
@@ -156,6 +183,8 @@ def selftest():
     assert rate_limit_remaining({"Retry-After": "3"}) == "3"
     assert rate_limit_remaining({"content-type": "application/json"}) is None
     chamadas = []
+    urls = []
+    autorizacoes = []
     urlopen_original = urllib.request.urlopen
 
     class Resposta:
@@ -174,6 +203,8 @@ def selftest():
     def urlopen_falso(req, timeout):
         modelo = json.loads(req.data.decode("utf-8"))["model"]
         chamadas.append(modelo)
+        urls.append(req.full_url)
+        autorizacoes.append(req.get_header("Authorization"))
         if modelo == "modelo-morto":
             raise urllib.error.HTTPError(req.full_url, 410, "Gone", {}, None)
         return Resposta()
@@ -184,6 +215,31 @@ def selftest():
                                   "chave-falsa", "teste")
         assert resultado == ("fallback ok", 200, None, None, "modelo-vivo")
         assert chamadas == ["modelo-morto", "modelo-vivo"]
+
+        # A NVIDIA inteira morre (404 "Not found for account") e a cadeia tem que
+        # atravessar para o tail em outro provedor, com a CHAVE daquele provedor.
+        chamadas.clear()
+        urls.clear()
+        autorizacoes.clear()
+        os.environ["GEMINI_API_KEY"] = "chave-gemini-do-selftest"
+        try:
+            resultado = _call_modelos(
+                "nvidia", ["modelo-morto", "gemini:modelo-do-gemini"],
+                "chave-falsa", "teste")
+        finally:
+            os.environ.pop("GEMINI_API_KEY", None)
+        assert resultado[0] == "fallback ok", resultado
+        assert resultado[4] == "gemini:modelo-do-gemini", resultado
+        assert chamadas == ["modelo-morto", "modelo-do-gemini"], chamadas
+        assert PROVEDORES["gemini"]["url"] in urls[-1], urls
+        # o que mais importa: foi a chave DO GEMINI, nao a da NVIDIA que veio no argumento
+        assert "chave-gemini-do-selftest" in autorizacoes[-1], autorizacoes
+        assert "chave-falsa" in autorizacoes[0], autorizacoes
+        # provedor desconhecido no meio da cadeia nao pode explodir, so ser pulado
+        chamadas.clear()
+        assert _call_modelos("nvidia", ["nao-existe:x", "modelo-vivo"],
+                             "chave-falsa", "teste")[0] == "fallback ok"
+        assert chamadas == ["modelo-vivo"], chamadas
     finally:
         urllib.request.urlopen = urlopen_original
     print("selftest ok")
