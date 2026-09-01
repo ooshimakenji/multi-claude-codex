@@ -28,7 +28,9 @@ use winapi::{
     },
 };
 
-const PANEL_TITLE: &str = "PAINEL // CLAUDE + CODEX";
+const PANEL_TITLE: &str = "CENTRO DE COMANDO // HERMES";
+const HERMES_PROFILE: &str = "ambiental-operacoes";
+const HERMES_MODEL: &str = "gpt-5.6-terra";
 static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 
 // These are layout measurements, not arbitrary viewport defaults.  The
@@ -211,6 +213,7 @@ struct Snapshot {
     cswap: Result<Value, String>,
     codex_last_used_profile: Option<String>,
     opencodex: Option<OpenCodexSnapshot>,
+    hermes_activity: Option<Value>,
 }
 
 struct OpenCodexSnapshot {
@@ -235,6 +238,8 @@ struct PanelApp {
     cswap: Option<Result<Value, String>>,
     codex_last_used_profile: Option<String>,
     opencodex: Option<OpenCodexSnapshot>,
+    hermes_activity: Option<Value>,
+    workspace: String,
     pokemon: PokemonCache,
     poke_mode: bool,
     hwnd: Option<*mut c_void>,
@@ -347,6 +352,11 @@ impl PanelApp {
         configure_context(&creation_context.egui_ctx);
         let (sender, receiver) = mpsc::channel();
         let repo = find_repo();
+        let workspace = repo
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace não identificado")
+            .to_owned();
         thread::spawn(move || refresh_loop(sender, repo));
 
         Self {
@@ -355,6 +365,8 @@ impl PanelApp {
             cswap: None,
             codex_last_used_profile: None,
             opencodex: None,
+            hermes_activity: None,
+            workspace,
             pokemon: PokemonCache::new(),
             poke_mode: load_poke_mode(),
             hwnd: native_window_handle(creation_context),
@@ -367,6 +379,7 @@ impl PanelApp {
             self.cswap = Some(snapshot.cswap);
             self.codex_last_used_profile = snapshot.codex_last_used_profile;
             self.opencodex = snapshot.opencodex;
+            self.hermes_activity = snapshot.hermes_activity;
         }
     }
 }
@@ -432,6 +445,13 @@ impl eframe::App for PanelApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    show_command_center(
+                        ui,
+                        self.status.as_ref(),
+                        self.hermes_activity.as_ref(),
+                        &self.workspace,
+                    );
+                    ui.add_space(12.0);
                     show_command_line(ui, self.cswap.as_ref());
                     ui.add_space(12.0);
                     show_running_jobs(ui, self.status.as_ref());
@@ -666,12 +686,14 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
         let cswap = read_cswap();
         let codex_last_used_profile = read_latest_codex_profile();
         let opencodex = read_opencodex();
+        let hermes_activity = read_hermes_activity();
         if sender
             .send(Snapshot {
                 status,
                 cswap,
                 codex_last_used_profile,
                 opencodex,
+                hermes_activity,
             })
             .is_err()
         {
@@ -706,6 +728,21 @@ fn read_status(repo: &Path) -> Result<Value, String> {
     };
     serde_json::from_str(&stdout)
         .map_err(|error| format!("status.py retornou JSON inválido: {error}"))
+}
+
+fn read_hermes_activity() -> Option<Value> {
+    let local_app_data = env::var_os("LOCALAPPDATA")?;
+    let path = PathBuf::from(local_app_data)
+        .join("hermes")
+        .join("profiles")
+        .join(HERMES_PROFILE)
+        .join("shared")
+        .join("visualizer-activity.json");
+    let modified = fs::metadata(&path).ok()?.modified().ok()?;
+    if SystemTime::now().duration_since(modified).ok()? > Duration::from_secs(300) {
+        return None;
+    }
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 fn read_cswap() -> Result<Value, String> {
@@ -1048,6 +1085,101 @@ fn find_repo() -> PathBuf {
     PathBuf::from(".")
 }
 
+fn show_command_center(
+    ui: &mut egui::Ui,
+    status: Option<&Result<Value, String>>,
+    hermes_activity: Option<&Value>,
+    workspace: &str,
+) {
+    let hermes_state = hermes_activity
+        .and_then(|activity| activity.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("PRONTO");
+    let hermes_detail = hermes_activity
+        .map(hermes_activity_detail)
+        .unwrap_or_else(|| format!("{HERMES_PROFILE} · {HERMES_MODEL}"));
+    let (codex_state, codex_detail) = match status {
+        None => ("CARREGANDO", "aguardando status local".to_owned()),
+        Some(Err(_)) => ("SEM STATUS", "status.py indisponível".to_owned()),
+        Some(Ok(value)) => match value.get("jobs").and_then(Value::as_array) {
+            Some(jobs) if !jobs.is_empty() => {
+                let job = &jobs[0];
+                (
+                    "EXECUTANDO",
+                    format!(
+                        "{} · {}",
+                        string_field(job, "projeto"),
+                        format_duration(number_field(job, "segundos")),
+                    ),
+                )
+            }
+            _ => ("DISPONÍVEL", "delegação por critério".to_owned()),
+        },
+    };
+
+    section_frame(ui, "AGORA // CENTRO DE COMANDO", |ui| {
+        let card_width = ((ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0)
+            .max(130.0);
+        ui.horizontal(|ui| {
+            agent_card(
+                ui,
+                card_width,
+                "HERMES",
+                hermes_state,
+                &hermes_detail,
+            );
+            agent_card(
+                ui,
+                card_width,
+                "CLAUDE",
+                "DISPONÍVEL",
+                "planeja e revisa quando agrega valor",
+            );
+            agent_card(ui, card_width, "CODEX", codex_state, &codex_detail);
+        });
+        ui.add_space(8.0);
+        dim_label(
+            ui,
+            format!("workspace · {workspace}  //  delegação por critério  //  jobs e cotas são dados locais"),
+        );
+    });
+}
+
+fn hermes_activity_detail(activity: &Value) -> String {
+    let cwd = activity
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace não identificado");
+    match activity.get("tool").and_then(Value::as_str) {
+        Some(tool) if !tool.is_empty() => format!("{tool} · {cwd}"),
+        _ => cwd.to_owned(),
+    }
+}
+
+fn agent_card(ui: &mut egui::Ui, width: f32, name: &str, state: &str, detail: &str) {
+    egui::Frame::none()
+        .fill(ground())
+        .stroke(egui::Stroke::new(1.0_f32, border()))
+        .inner_margin(egui::Margin::symmetric(8.0, 7.0))
+        .show(ui, |ui| {
+            ui.set_width(width - 16.0);
+            ui.add_sized(
+                [ui.available_width(), 16.0],
+                egui::Label::new(pixel_text(name, 11.0)),
+            );
+            ui.add_sized(
+                [ui.available_width(), 20.0],
+                egui::Label::new(data_text(state)).truncate(true),
+            );
+            ui.add_sized(
+                [ui.available_width(), 18.0],
+                egui::Label::new(dim_text(detail)).truncate(true),
+            );
+        });
+}
+
 fn show_command_line(ui: &mut egui::Ui, cswap: Option<&Result<Value, String>>) {
     section_frame(ui, "NO COMANDO", |ui| {
         let value = match cswap {
@@ -1174,8 +1306,9 @@ fn show_claude(
                 ui.end_row();
 
                 for account in accounts {
-                    let five_hour = nested_number(account, &["usage", "fiveHour", "pct"]);
-                    let seven_day = nested_number(account, &["usage", "sevenDay", "pct"]);
+                    let five_hour = usage_percent(account, "fiveHour");
+                    let seven_day = usage_percent(account, "sevenDay");
+                    let cache_age = usage_age(account);
                     let five_hour_countdown = usage_text(account, "fiveHour", "countdown");
                     let seven_day_countdown = usage_text(account, "sevenDay", "countdown");
                     let five_hour_clock = usage_clock(account, "fiveHour");
@@ -1188,13 +1321,19 @@ fn show_claude(
                         .get("disabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let precisa_relogin = account
+                        .get("usageStatus")
+                        .and_then(Value::as_str)
+                        .is_some_and(|status| status == "relogin_required");
                     let email = account.get("email").and_then(Value::as_str).unwrap_or("");
                     let fainted = [five_hour, seven_day]
                         .into_iter()
                         .flatten()
                         .any(|percent| percent >= 100.0);
-                    let has_quota = five_hour.is_some() || seven_day.is_some();
-                    let texture = (poke_mode && has_quota)
+                    // O sprite e a identidade da conta, nao indicador de cota: conta em
+                    // relogin_required tem usage=null e antes perdia o bichinho junto com o
+                    // numero. A secao CODEX abaixo sempre fez assim.
+                    let texture = poke_mode
                         .then(|| pokemon.texture(context, "claude", email, fainted).cloned())
                         .flatten();
                     let species = poke_mode
@@ -1210,6 +1349,11 @@ fn show_claude(
                                         .fit_to_exact_size(egui::vec2(40.0, 40.0))
                                         .texture_options(egui::TextureOptions::NEAREST),
                                 );
+                            } else {
+                                // Sem sprite o espaco continua reservado: a largura ja desconta
+                                // ACCOUNT_SPRITE_SIZE, e sem isto o email truncava e a linha
+                                // deslizava para a esquerda em relacao as outras.
+                                ui.add_space(ACCOUNT_SPRITE_SIZE);
                             }
                             let cursor = if active { "▶" } else { " " };
                             ui.label(
@@ -1229,11 +1373,20 @@ fn show_claude(
                                     )
                                     .on_hover_text(string_field(account, "usageStatus"));
                                     ui.horizontal(|ui| {
-                                        let disabled_width = if disabled {
-                                            text_width("desabilitada") + ui.spacing().item_spacing.x
+                                        // relogin_required so existia como tooltip do email:
+                                        // a conta aparecia sem numero e sem motivo visivel.
+                                        let marca = if precisa_relogin {
+                                            Some("relogar")
+                                        } else if disabled {
+                                            Some("desabilitada")
                                         } else {
-                                            0.0
+                                            None
                                         };
+                                        let disabled_width = marca
+                                            .map(|texto| {
+                                                text_width(texto) + ui.spacing().item_spacing.x
+                                            })
+                                            .unwrap_or(0.0);
                                         if let Some(species) = species.as_deref() {
                                             ui.add_sized(
                                                 [(info_width - disabled_width).max(0.0), 20.0],
@@ -1241,11 +1394,10 @@ fn show_claude(
                                                     .truncate(true),
                                             );
                                         }
-                                        if disabled {
+                                        if let Some(texto) = marca {
                                             ui.add_sized(
-                                                [text_width("desabilitada"), 20.0],
-                                                egui::Label::new(dim_text("desabilitada"))
-                                                    .truncate(true),
+                                                [text_width(texto), 20.0],
+                                                egui::Label::new(dim_text(texto)).truncate(true),
                                             );
                                         }
                                     });
@@ -1256,12 +1408,28 @@ fn show_claude(
                     ui.allocate_ui_with_layout(
                         egui::vec2(quota_width, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| usage_bar(ui, five_hour, five_hour_countdown, five_hour_clock),
+                        |ui| {
+                            usage_bar_aged(
+                                ui,
+                                five_hour,
+                                five_hour_countdown,
+                                five_hour_clock,
+                                cache_age.as_deref(),
+                            )
+                        },
                     );
                     ui.allocate_ui_with_layout(
                         egui::vec2(quota_width, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| usage_bar(ui, seven_day, seven_day_countdown, seven_day_clock),
+                        |ui| {
+                            usage_bar_aged(
+                                ui,
+                                seven_day,
+                                seven_day_countdown,
+                                seven_day_clock,
+                                cache_age.as_deref(),
+                            )
+                        },
                     );
                     ui.end_row();
                 }
@@ -1348,6 +1516,8 @@ fn render_codex_accounts(
                                     .fit_to_exact_size(egui::vec2(40.0, 40.0))
                                     .texture_options(egui::TextureOptions::NEAREST),
                             );
+                        } else {
+                            ui.add_space(ACCOUNT_SPRITE_SIZE);
                         }
                         ui.label(egui::RichText::new(" ").font(egui::FontId::monospace(13.0)));
                         let info_width = (CODEX_ACCOUNT_WIDTH
@@ -1632,11 +1802,35 @@ fn error_label(ui: &mut egui::Ui, error: &str) {
     dim_label(ui, error);
 }
 
+/// Igual a usage_bar, mas anexa a idade quando o valor veio de lastGoodUsage.
+///
+/// Dado velho nao pode parecer fresco: uma conta em relogin_required tem cache de dias, e
+/// mostrar "26%" limpo levaria a decisao errada. Com marca fica "26% 3d".
+fn usage_bar_aged(
+    ui: &mut egui::Ui,
+    value: Option<f64>,
+    countdown: Option<String>,
+    clock: Option<String>,
+    age: Option<&str>,
+) {
+    usage_bar_inner(ui, value, countdown, clock, age);
+}
+
 fn usage_bar(
     ui: &mut egui::Ui,
     value: Option<f64>,
     countdown: Option<String>,
     clock: Option<String>,
+) {
+    usage_bar_inner(ui, value, countdown, clock, None);
+}
+
+fn usage_bar_inner(
+    ui: &mut egui::Ui,
+    value: Option<f64>,
+    countdown: Option<String>,
+    clock: Option<String>,
+    age: Option<&str>,
 ) {
     let gap = ui.spacing().item_spacing.x;
     ui.horizontal(|ui| {
@@ -1652,11 +1846,14 @@ fn usage_bar(
             value.map(normalized_percent),
             value.map(hp_color),
         );
-        let label = value
-            .map(|value| format!("{value:.0}%"))
-            .unwrap_or_else(|| "—".to_owned());
+        let label = match (value, age) {
+            (Some(value), Some(age)) => format!("{value:.0}% {age}"),
+            (Some(value), None) => format!("{value:.0}%"),
+            (None, _) => "—".to_owned(),
+        };
+        let label_width = PERCENT_WIDTH.max(text_width(&label));
         ui.add_space(gap);
-        ui.add_sized([PERCENT_WIDTH, 20.0], egui::Label::new(data_text(label)));
+        ui.add_sized([label_width, 20.0], egui::Label::new(data_text(label)));
         if reset_width > 0.0 {
             add_reset_details(ui, countdown.as_deref(), clock.as_deref(), reset_width);
         }
@@ -1717,7 +1914,10 @@ fn add_reset_details(
     }
     if let Some(clock) = clock.as_deref() {
         let used = if countdown.is_some() {
-            countdown_width + 4.0
+            // O +4 tem que casar com o add_space abaixo, senao o relogio cola no countdown
+            // ("5d 22h06/09 07:59" era o sintoma).
+            ui.add_space(4.0);
+            countdown_width + 8.0
         } else {
             0.0
         };
@@ -1863,8 +2063,46 @@ fn nested_string<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     current.as_str()
 }
 
+/// Qual bloco de consumo usar, e se ele veio do cache.
+///
+/// O cswap devolve `usage: null` quando a conta esta em relogin_required, mas guarda o ultimo
+/// valor bom em `lastGoodUsage` (mesma estrutura interna: fiveHour/sevenDay com pct, countdown,
+/// clock). Antes o painel lia so `usage` e mostrava "—" nessas contas.
+fn usage_source(account: &Value) -> (Option<&Value>, bool) {
+    match account.get("usage") {
+        Some(usage) if !usage.is_null() => (Some(usage), false),
+        _ => match account.get("lastGoodUsage") {
+            Some(cache) if !cache.is_null() => (Some(cache), true),
+            _ => (None, false),
+        },
+    }
+}
+
+/// Idade do dado de cache, compacta. Vazio quando o valor e fresco.
+fn usage_age(account: &Value) -> Option<String> {
+    let (_, from_cache) = usage_source(account);
+    if !from_cache {
+        return None;
+    }
+    let seconds = account.get("lastGoodAgeSeconds").and_then(Value::as_f64)?;
+    let minutes = seconds / 60.0;
+    Some(if minutes < 60.0 {
+        format!("{}m", minutes.max(1.0) as i64)
+    } else if minutes < 1440.0 {
+        format!("{}h", (minutes / 60.0) as i64)
+    } else {
+        format!("{}d", (minutes / 1440.0) as i64)
+    })
+}
+
+fn usage_percent(account: &Value, window: &str) -> Option<f64> {
+    let (source, _) = usage_source(account);
+    nested_number_opt(source, &[window, "pct"])
+}
+
 fn usage_text(account: &Value, window: &str, field: &str) -> Option<String> {
-    nested_string(account, &["usage", window, field])
+    let (source, _) = usage_source(account);
+    nested_string(source?, &[window, field])
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
 }
