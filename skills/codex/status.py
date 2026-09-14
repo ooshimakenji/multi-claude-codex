@@ -221,13 +221,39 @@ def _codex_auth(home):
         return {"email": None, "plano": None, "status": "erro"}
 
     claim = payload.get("https://api.openai.com/auth") or {}
-    exp = payload.get("exp")
-    if not isinstance(exp, int) or isinstance(exp, bool):
-        status = "erro"
-    elif exp > time.time():
-        status = "ok"
+    tokens = auth.get("tokens") or {}
+    if "access_token" in tokens:
+        try:
+            access_token = tokens.get("access_token")
+            partes = access_token.split(".") if isinstance(access_token, str) else []
+            if len(partes) != 3:
+                raise ValueError("JWT sem tres segmentos")
+            segmento = partes[1] + ("=" * (-len(partes[1]) % 4))
+            access_payload = json.loads(base64.urlsafe_b64decode(segmento))
+            if not isinstance(access_payload, dict):
+                raise ValueError("payload JWT invalido")
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeError,
+                binascii.Error) as exc:
+            # O aviso identifica apenas o perfil e o tipo do erro, nunca o JWT.
+            print("aviso: nao foi possivel decodificar auth do perfil {} ({})".format(
+                os.path.basename(home), type(exc).__name__), file=sys.stderr)
+            status = "erro"
+        else:
+            exp = access_payload.get("exp")
+            if not isinstance(exp, int) or isinstance(exp, bool):
+                status = "erro"
+            elif exp > time.time():
+                status = "ok"
+            else:
+                status = "expirado"
     else:
-        status = "expirado"
+        exp = payload.get("exp")
+        if not isinstance(exp, int) or isinstance(exp, bool):
+            status = "erro"
+        elif exp > time.time():
+            status = "ok"
+        else:
+            status = "expirado"
     return {
         "email": payload.get("email"),
         "plano": claim.get("chatgpt_plan_type") if isinstance(claim, dict) else None,
@@ -577,11 +603,17 @@ def line(stdin_json=None):
 def selftest():
     import tempfile
 
-    def grava_auth(home, dados):
+    def grava_auth(home, dados, access_dados=None):
+        access_dados = dados if access_dados is None else access_dados
         segmento = base64.urlsafe_b64encode(
             json.dumps(dados).encode("utf-8")).decode("ascii").rstrip("=")
+        access_segmento = base64.urlsafe_b64encode(
+            json.dumps(access_dados).encode("utf-8")).decode("ascii").rstrip("=")
         with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as fh:
-            json.dump({"tokens": {"id_token": "header." + segmento + ".sig"}}, fh)
+            json.dump({"tokens": {
+                "id_token": "header." + segmento + ".sig",
+                "access_token": "header." + access_segmento + ".sig",
+            }}, fh)
 
     d = tempfile.mkdtemp()
     roll = os.path.join(d, "sessions", "2026", "01", "01")
@@ -597,6 +629,9 @@ def selftest():
     assert _codex_auth(auth_teste)["status"] == "ok"
     grava_auth(auth_teste, {"email": "x@y.com"})
     assert _codex_auth(auth_teste)["status"] == "erro"
+    grava_auth(auth_teste, {"exp": 1, "email": "x@y.com"},
+               {"exp": int(time.time()) + 3600})
+    assert _codex_auth(auth_teste)["status"] == "ok"
 
     with open(os.path.join(roll, "rollout-x.jsonl"), "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"type": "turn_context", "payload": {
