@@ -24,7 +24,7 @@ use winapi::{
     um::{
         minwinbase::SYSTEMTIME,
         timezoneapi::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
-        winuser::{ReleaseCapture, SendMessageW, WM_NCLBUTTONDOWN},
+        winuser::{CreateIcon, ReleaseCapture, SendMessageW, ICON_BIG, ICON_SMALL, WM_NCLBUTTONDOWN, WM_SETICON},
     },
 };
 
@@ -358,6 +358,8 @@ impl PanelApp {
             .unwrap_or("workspace não identificado")
             .to_owned();
         thread::spawn(move || refresh_loop(sender, repo));
+        let hwnd = native_window_handle(creation_context);
+        set_taskbar_icon(hwnd);
 
         Self {
             receiver,
@@ -369,7 +371,7 @@ impl PanelApp {
             workspace,
             pokemon: PokemonCache::new(),
             poke_mode: load_poke_mode(),
-            hwnd: native_window_handle(creation_context),
+            hwnd,
         }
     }
 
@@ -501,6 +503,53 @@ fn native_window_handle(creation_context: &eframe::CreationContext<'_>) -> Optio
 fn native_window_handle(_creation_context: &eframe::CreationContext<'_>) -> Option<*mut c_void> {
     None
 }
+
+#[cfg(windows)]
+fn set_taskbar_icon(hwnd: Option<*mut c_void>) {
+    let Some(hwnd) = hwnd.filter(|hwnd| !hwnd.is_null()) else {
+        return;
+    };
+    let icon = icone();
+    let width = icon.width as usize;
+    let height = icon.height as usize;
+    let mut xor = vec![0_u8; icon.rgba.len()];
+    // CreateIcon espera BGRA bottom-up; egui armazena RGBA top-down.
+    for y in 0..height {
+        for x in 0..width {
+            let from = (y * width + x) * 4;
+            let to = ((height - y - 1) * width + x) * 4;
+            xor[to..to + 4].copy_from_slice(&[
+                icon.rgba[from + 2],
+                icon.rgba[from + 1],
+                icon.rgba[from],
+                icon.rgba[from + 3],
+            ]);
+        }
+    }
+    let and_stride = ((width + 15) / 16) * 2;
+    let and = vec![0_u8; and_stride * height];
+    let handle = unsafe {
+        CreateIcon(
+            std::ptr::null_mut(),
+            width as i32,
+            height as i32,
+            1,
+            32,
+            and.as_ptr(),
+            xor.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        SendMessageW(hwnd as HWND, WM_SETICON, ICON_SMALL as usize, handle as isize);
+        SendMessageW(hwnd as HWND, WM_SETICON, ICON_BIG as usize, handle as isize);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_taskbar_icon(_hwnd: Option<*mut c_void>) {}
 
 #[cfg(windows)]
 fn begin_native_resize(hwnd: Option<*mut c_void>, hit_test: usize) {
