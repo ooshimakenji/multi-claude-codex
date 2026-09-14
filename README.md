@@ -304,6 +304,18 @@ Exemplos prontos (NVIDIA NIM, Gemini, Ollama) em
 OAuth por API key no disco, e `wire_api = "chat"` não é o caminho feliz do loop de
 agente do Codex — trate como one-shot de leitura, não como agente que edita.
 
+## Login do Codex
+
+Às vezes o Codex parece "pedir login do nada": o token OAuth expira, e o refresh nem
+sempre se propaga quando mais de um processo mexe no mesmo `auth.json`. É uma
+fragilidade conhecida do próprio Codex CLI, não deste repo.
+
+Agora o `status.py` expõe um campo `status` por perfil e o `--line` acrescenta
+`[relogar]` à parte `codex ...` quando o perfil ativo não está saudável. O pré-voo
+de delegação em `CLAUDE.md` e `AGENTS.md` checa `codex login status` além de
+`codex --version`, evitando que um `codex exec` em background fique preso esperando
+um login que nunca vai vir.
+
 ## O que este repo deliberadamente não é
 
 Não é um wrapper do Codex, e não instala o plugin oficial

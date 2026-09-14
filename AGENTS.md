@@ -9,7 +9,7 @@ Este repositório implementa uma colaboração entre CLIs. Preserve o papel de c
 ## Regras operacionais
 
 1. Comece por `README.md` e consulte `HERMES.md` para os comandos deste projeto.
-2. Não presuma que o Codex CLI está disponível. Antes de delegar, execute `codex --version`. Se falhar, siga com Hermes e registre o bloqueio, sem tentar contornar o sandbox nem acessar credenciais.
+2. Não presuma que o Codex CLI está disponível. Antes de delegar, execute `codex --version` e `codex login status`; os dois precisam passar. Se qualquer um falhar, ou se `python skills/codex/status.py --line` mostrar `[relogar]` para o perfil ativo, siga com Hermes e registre o bloqueio, sem tentar contornar o sandbox nem acessar credenciais. Para falha de sessão, registre `Codex sem login` ou `sessão do Codex expirada`, em vez de `Codex indisponível`.
 3. Para uma delegação ao Codex, declare antes: modelo, effort e sandbox. Prefira leitura com `-s read-only`; somente o dono da máquina pode autorizar execução sem sandbox.
 4. Não altere arquivos de credenciais, `.env`, `auth.json`, nem os diretórios de configuração de Claude/Codex.
 5. Depois de qualquer alteração de código, execute a verificação pertinente. Para a medição, use `python skills/codex/status.py --selftest`.

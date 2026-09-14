@@ -21,10 +21,11 @@ C:\Users\vinicius.oshima\Downloads\github\multi-claude-codex
 ```bash
 claude --version
 codex --version
+codex login status
 python skills/codex/status.py --selftest
 ```
 
-O Codex CLI desta máquina está indisponível enquanto `codex --version` reportar a dependência Windows ausente. Não configure MCP nem tente delegar até esse pré-voo passar.
+O Codex CLI desta máquina está indisponível enquanto `codex --version` reportar a dependência Windows ausente, `codex login status` falhar ou `python skills/codex/status.py --line` mostrar `[relogar]` para o perfil ativo. Não configure MCP nem tente delegar até os pré-voos passarem; para falha de sessão, registre `Codex sem login` ou `sessão do Codex expirada`.
 
 ## Delegação segura ao Codex
 

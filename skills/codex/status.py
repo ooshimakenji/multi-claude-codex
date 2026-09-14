@@ -194,7 +194,7 @@ def _codex_side_profile(home):
 
 
 def _codex_auth(home):
-    """Extrai somente identidade e plano; nunca retorna nem registra tokens."""
+    """Extrai identidade, plano e validade; nunca retorna nem registra tokens."""
     caminho = os.path.join(home, "auth.json")
     try:
         with open(caminho, encoding="utf-8") as fh:
@@ -209,21 +209,29 @@ def _codex_auth(home):
             raise ValueError("payload JWT invalido")
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
-            return {"email": None, "plano": None}
+            return {"email": None, "plano": None, "status": "sem_login"}
         print("aviso: nao foi possivel decodificar auth do perfil {} ({})".format(
             os.path.basename(home), type(exc).__name__), file=sys.stderr)
-        return {"email": None, "plano": None}
+        return {"email": None, "plano": None, "status": "erro"}
     except (ValueError, TypeError, json.JSONDecodeError, UnicodeError,
             binascii.Error) as exc:
         # O aviso identifica apenas o perfil e o tipo do erro, nunca o JWT.
         print("aviso: nao foi possivel decodificar auth do perfil {} ({})".format(
             os.path.basename(home), type(exc).__name__), file=sys.stderr)
-        return {"email": None, "plano": None}
+        return {"email": None, "plano": None, "status": "erro"}
 
     claim = payload.get("https://api.openai.com/auth") or {}
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or isinstance(exp, bool):
+        status = "erro"
+    elif exp > time.time():
+        status = "ok"
+    else:
+        status = "expirado"
     return {
         "email": payload.get("email"),
         "plano": claim.get("chatgpt_plan_type") if isinstance(claim, dict) else None,
+        "status": status,
     }
 
 
@@ -244,6 +252,7 @@ def codex_side(contas=True):
             "perfil": os.path.basename(home),
             "email": identidade["email"],
             "plano": identidade["plano"],
+            "status": identidade["status"],
             "tokens": side.get("tokens", 0),
             "quotas": side.get("quotas", []),
             "quota_pct": side.get("quota_pct"),
@@ -541,7 +550,9 @@ def line(stdin_json=None):
                 campos.append(humano(cx["janela_tokens"]))
             campos += ["{}{}%".format(janela(q["janela"]), q["pct"])
                        for q in cx.get("quotas", [])]
-            partes.append("codex " + " ".join(campos))
+            identidade = _codex_auth(CODEX_HOME)
+            marcador = " [relogar]" if identidade.get("status") != "ok" else ""
+            partes.append("codex " + " ".join(campos) + marcador)
     except OSError:
         pass
     try:
@@ -566,11 +577,27 @@ def line(stdin_json=None):
 def selftest():
     import tempfile
 
+    def grava_auth(home, dados):
+        segmento = base64.urlsafe_b64encode(
+            json.dumps(dados).encode("utf-8")).decode("ascii").rstrip("=")
+        with open(os.path.join(home, "auth.json"), "w", encoding="utf-8") as fh:
+            json.dump({"tokens": {"id_token": "header." + segmento + ".sig"}}, fh)
+
     d = tempfile.mkdtemp()
     roll = os.path.join(d, "sessions", "2026", "01", "01")
     proj = os.path.join(d, "projects", "algum-projeto")
     os.makedirs(roll)
     os.makedirs(proj)
+
+    assert _codex_auth(d)["status"] == "sem_login"
+    auth_teste = tempfile.mkdtemp()
+    grava_auth(auth_teste, {"exp": 1, "email": "x@y.com"})
+    assert _codex_auth(auth_teste)["status"] == "expirado"
+    grava_auth(auth_teste, {"exp": int(time.time()) + 3600, "email": "x@y.com"})
+    assert _codex_auth(auth_teste)["status"] == "ok"
+    grava_auth(auth_teste, {"email": "x@y.com"})
+    assert _codex_auth(auth_teste)["status"] == "erro"
+
     with open(os.path.join(roll, "rollout-x.jsonl"), "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"type": "turn_context", "payload": {
             "model": "gpt-5.6-luna", "sandbox_policy": {"type": "read-only"}}}) + "\n")
@@ -599,6 +626,7 @@ def selftest():
     snap = snapshot()
     assert snap["codex"]["modelo"] == "gpt-5.6-luna", snap
     assert snap["codex"]["sandbox"] == "read-only", snap
+    assert snap["codex"]["contas"][0]["status"] == "sem_login", snap
     assert snap["codex"]["tokens"] == 90000, snap
     # REGRESSAO: ler a 1a amostra daria 0.0 e a statusline ficaria travada em zero
     assert snap["codex"]["quota_pct"] == 3.0, snap
@@ -641,9 +669,14 @@ def selftest():
             "input_tokens": 7, "cache_read_input_tokens": 2000, "output_tokens": 999}}}) + "\n")
     assert contexto_atual(transcript) == 2007, contexto_atual(transcript)  # output nao conta
 
+    grava_auth(d, {"exp": int(time.time()) + 3600, "email": "x@y.com"})
     uma = line({"transcript_path": transcript})
     assert "codex luna" in uma, uma        # prefixo gpt-5.6- some
     assert uma == "codex luna 90.5k 5h3.0% 7d8.0% | ctx 2.0k", uma
+
+    grava_auth(d, {"exp": 1, "email": "x@y.com"})
+    uma = line({"transcript_path": transcript})
+    assert "[relogar]" in uma, uma
 
     # --- free tier: janela local e leitura do limite do servidor ---
     free_log = os.path.join(d, "free-tier.jsonl")

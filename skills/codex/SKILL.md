@@ -55,6 +55,10 @@ codex exec -m gpt-5.6-luna -s read-only --skip-git-repo-check \
   -o codex-out.md "<prompt>"
 ```
 
+Antes de disparar, `codex login status` deve sair com exit 0. Depois que o job terminar,
+sucesso é o arquivo passado em `-o` existir e ter conteúdo substancial; não confie no exit
+code do `codex exec`, pois já houve exit 0 com zero trabalho feito.
+
 `codex exec` sempre com `run_in_background`: o harness notifica no fim e cancela
 por `TaskStop`. É isso que substitui um gestor de jobs.
 
@@ -79,6 +83,10 @@ python skills/codex/status.py    # estado dos dois lados + delta desde a última
 
 `status.py --line` é a versão leve e read-only, para a statusline do Claude Code
 (não grava o marco, então não zera o delta).
+
+Quando a sessão do perfil ativo estiver expirada ou ausente, `status.py --line`
+acrescenta `[relogar]` à parte `codex ...` da linha: rode `codex login` de novo antes
+de insistir numa delegação.
 
 Na statusline, acompanhe **os tokens**, não o `%`: `used_percent` só vem em inteiro,
 então uma delegação normal fica em `0.0%` mesmo tendo rodado.

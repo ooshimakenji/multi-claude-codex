@@ -1534,6 +1534,10 @@ fn render_codex_accounts(
 
             for account in accounts {
                 let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+                let precisa_relogin = account
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status != "ok");
                 let last_used = last_used_profile.is_some_and(|profile| {
                     account.get("perfil").and_then(Value::as_str) == Some(profile)
                 });
@@ -1587,9 +1591,14 @@ fn render_codex_accounts(
                                     } else {
                                         0.0
                                     };
+                                    let relogin_width = if precisa_relogin {
+                                        text_width("relogar") + ui.spacing().item_spacing.x
+                                    } else {
+                                        0.0
+                                    };
                                     if let Some(species) = species.as_deref() {
                                         ui.add_sized(
-                                            [(info_width - last_used_width).max(0.0), 20.0],
+                                            [(info_width - last_used_width - relogin_width).max(0.0), 20.0],
                                             egui::Label::new(pixel_text(species, 10.0))
                                                 .truncate(true),
                                         );
@@ -1599,6 +1608,12 @@ fn render_codex_accounts(
                                             [text_width("· última usada"), 20.0],
                                             egui::Label::new(dim_text("· última usada"))
                                                 .truncate(true),
+                                            );
+                                    }
+                                    if precisa_relogin {
+                                        ui.add_sized(
+                                            [text_width("relogar"), 20.0],
+                                            egui::Label::new(dim_text("relogar")).truncate(true),
                                         );
                                     }
                                 });
