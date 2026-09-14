@@ -24,7 +24,10 @@ use winapi::{
     um::{
         minwinbase::SYSTEMTIME,
         timezoneapi::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
-        winuser::{CreateIcon, ReleaseCapture, SendMessageW, ICON_BIG, ICON_SMALL, WM_NCLBUTTONDOWN, WM_SETICON},
+        winuser::{
+            CreateIcon, ReleaseCapture, SendMessageW, ICON_BIG, ICON_SMALL, WM_NCLBUTTONDOWN,
+            WM_SETICON,
+        },
     },
 };
 
@@ -51,10 +54,16 @@ const CLAUDE_CONTENT_WIDTH: f32 =
     CLAUDE_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + CLAUDE_QUOTA_WIDTH * 2.0;
 const CODEX_ACCOUNT_WIDTH: f32 = 300.0;
 const CODEX_PLAN_WIDTH: f32 = 150.0;
+const CODEX_MODEL_WIDTH: f32 = 140.0;
+const CODEX_EFFORT_WIDTH: f32 = 90.0;
 const CODEX_QUOTA_WIDTH: f32 = 300.0;
-const CODEX_GRID_GAPS: f32 = 30.0;
-const CODEX_CONTENT_WIDTH: f32 =
-    CODEX_ACCOUNT_WIDTH + CODEX_PLAN_WIDTH + CODEX_GRID_GAPS + CODEX_QUOTA_WIDTH * 2.0;
+const CODEX_GRID_GAPS: f32 = 50.0;
+const CODEX_CONTENT_WIDTH: f32 = CODEX_ACCOUNT_WIDTH
+    + CODEX_PLAN_WIDTH
+    + CODEX_MODEL_WIDTH
+    + CODEX_EFFORT_WIDTH
+    + CODEX_GRID_GAPS
+    + CODEX_QUOTA_WIDTH * 2.0;
 const OPENCODEX_ACCOUNT_WIDTH: f32 = 340.0;
 const OPENCODEX_QUOTA_WIDTH: f32 = 300.0;
 const OPENCODEX_GRID_GAPS: f32 = 20.0;
@@ -212,6 +221,8 @@ struct Snapshot {
     status: Result<Value, String>,
     cswap: Result<Value, String>,
     codex_last_used_profile: Option<String>,
+    codex_active_profile: Option<String>,
+    codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
     hermes_activity: Option<Value>,
 }
@@ -237,6 +248,8 @@ struct PanelApp {
     status: Option<Result<Value, String>>,
     cswap: Option<Result<Value, String>>,
     codex_last_used_profile: Option<String>,
+    codex_active_profile: Option<String>,
+    codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
     hermes_activity: Option<Value>,
     workspace: String,
@@ -366,6 +379,8 @@ impl PanelApp {
             status: None,
             cswap: None,
             codex_last_used_profile: None,
+            codex_active_profile: None,
+            codex_profile_settings: Vec::new(),
             opencodex: None,
             hermes_activity: None,
             workspace,
@@ -380,6 +395,8 @@ impl PanelApp {
             self.status = Some(snapshot.status);
             self.cswap = Some(snapshot.cswap);
             self.codex_last_used_profile = snapshot.codex_last_used_profile;
+            self.codex_active_profile = snapshot.codex_active_profile;
+            self.codex_profile_settings = snapshot.codex_profile_settings;
             self.opencodex = snapshot.opencodex;
             self.hermes_activity = snapshot.hermes_activity;
         }
@@ -472,6 +489,8 @@ impl eframe::App for PanelApp {
                         ui,
                         self.status.as_ref(),
                         self.codex_last_used_profile.as_deref(),
+                        self.codex_active_profile.as_deref(),
+                        &self.codex_profile_settings,
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
@@ -543,7 +562,12 @@ fn set_taskbar_icon(hwnd: Option<*mut c_void>) {
         return;
     }
     unsafe {
-        SendMessageW(hwnd as HWND, WM_SETICON, ICON_SMALL as usize, handle as isize);
+        SendMessageW(
+            hwnd as HWND,
+            WM_SETICON,
+            ICON_SMALL as usize,
+            handle as isize,
+        );
         SendMessageW(hwnd as HWND, WM_SETICON, ICON_BIG as usize, handle as isize);
     }
 }
@@ -734,6 +758,19 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
         let status = read_status(&repo);
         let cswap = read_cswap();
         let codex_last_used_profile = read_latest_codex_profile();
+        let codex_active_profile = read_codex_active_profile();
+        let codex_profile_settings = codex_profile_directories()
+            .into_iter()
+            .filter_map(|directory| {
+                let profile = directory.file_name()?.to_str()?.to_owned();
+                let config = fs::read_to_string(directory.join("config.toml")).ok()?;
+                Some((
+                    profile,
+                    read_config_scalar(&config, "model"),
+                    read_config_scalar(&config, "model_reasoning_effort"),
+                ))
+            })
+            .collect();
         let opencodex = read_opencodex();
         let hermes_activity = read_hermes_activity();
         if sender
@@ -741,6 +778,8 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
                 status,
                 cswap,
                 codex_last_used_profile,
+                codex_active_profile,
+                codex_profile_settings,
                 opencodex,
                 hermes_activity,
             })
@@ -1032,6 +1071,112 @@ fn codex_profile_directories() -> Vec<PathBuf> {
     candidates
 }
 
+fn read_config_scalar(config: &str, key: &str) -> Option<String> {
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some((found_key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if found_key.trim() != key {
+            continue;
+        }
+        let value = raw_value.trim();
+        return value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_owned);
+    }
+    None
+}
+
+fn set_config_scalar(config: &str, key: &str, value: &str) -> String {
+    let mut result = String::with_capacity(config.len() + key.len() + value.len() + 8);
+    let mut before_section = true;
+    let mut replaced = false;
+    let newline = if config.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    for line in config.split_inclusive(['\n']) {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let (content, ending) = content
+            .strip_suffix('\r')
+            .map_or((content, ""), |content| (content, "\r"));
+        if before_section && content.trim().starts_with('[') {
+            before_section = false;
+        }
+        if before_section
+            && !replaced
+            && content
+                .trim()
+                .split_once('=')
+                .is_some_and(|(found_key, _)| found_key.trim() == key)
+        {
+            result.push_str(key);
+            result.push_str(" = \"");
+            result.push_str(value);
+            result.push_str("\"");
+            result.push_str(ending);
+            if line.ends_with('\n') {
+                result.push('\n');
+            }
+            replaced = true;
+        } else {
+            result.push_str(line);
+        }
+    }
+    if !replaced {
+        let line = format!("{key} = \"{value}\"{newline}");
+        result.insert_str(0, &line);
+    }
+    result
+}
+
+fn next_model(value: &str) -> &'static str {
+    match value {
+        "gpt-5.6-luna" => "gpt-5.6-terra",
+        "gpt-5.6-terra" => "gpt-5.6-sol",
+        "gpt-5.6-sol" => "gpt-5.6-luna",
+        _ => "gpt-5.6-luna",
+    }
+}
+
+fn next_effort(value: &str, model: &str) -> &'static str {
+    match (value, model) {
+        ("low", _) => "medium",
+        ("medium", _) => "high",
+        ("high", "gpt-5.6-sol") => "ultra",
+        ("high", _) => "low",
+        ("ultra", _) => "low",
+        _ => "low",
+    }
+}
+
+fn write_config_scalars(profile: String, model: Option<String>, effort: Option<String>) {
+    thread::spawn(move || {
+        let Some(home) = home_directory() else { return };
+        let path = home.join(profile).join("config.toml");
+        let Ok(mut config) = fs::read_to_string(&path) else {
+            return;
+        };
+        if let Some(model) = model.as_deref() {
+            config = set_config_scalar(&config, "model", model);
+        }
+        if let Some(effort) = effort.as_deref() {
+            config = set_config_scalar(&config, "model_reasoning_effort", effort);
+        }
+        let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        // Use arquivo temporario para nao truncar o config em caso de crash.
+        if fs::write(&temporary, config).is_ok() {
+            let _ = fs::rename(&temporary, &path);
+        }
+    });
+}
+
 fn newest_rollout_mtime(directory: &Path) -> Option<SystemTime> {
     let mut newest = None;
     let entries = fs::read_dir(directory).ok()?;
@@ -1169,16 +1314,10 @@ fn show_command_center(
     };
 
     section_frame(ui, "AGORA // CENTRO DE COMANDO", |ui| {
-        let card_width = ((ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0)
-            .max(130.0);
+        let card_width =
+            ((ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0).max(130.0);
         ui.horizontal(|ui| {
-            agent_card(
-                ui,
-                card_width,
-                "HERMES",
-                hermes_state,
-                &hermes_detail,
-            );
+            agent_card(ui, card_width, "HERMES", hermes_state, &hermes_detail);
             agent_card(
                 ui,
                 card_width,
@@ -1539,6 +1678,8 @@ fn render_codex_accounts(
     ui: &mut egui::Ui,
     accounts: &[Value],
     last_used_profile: Option<&str>,
+    active_profile: Option<&str>,
+    profile_settings: &[(String, Option<String>, Option<String>)],
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -1549,7 +1690,7 @@ fn render_codex_accounts(
     }
 
     egui::Grid::new("codex_accounts")
-        .num_columns(4)
+        .num_columns(6)
         .min_col_width(0.0)
         .min_row_height(20.0)
         .spacing(egui::vec2(10.0, 8.0))
@@ -1563,12 +1704,20 @@ fn render_codex_accounts(
                 egui::Label::new(pixel_text("plano", 10.0)),
             );
             ui.add_sized(
-                [CODEX_QUOTA_WIDTH, 20.0],
-                egui::Label::new(pixel_text("5h", 10.0)),
+                [CODEX_MODEL_WIDTH, 20.0],
+                egui::Label::new(pixel_text("modelo", 10.0)),
+            );
+            ui.add_sized(
+                [CODEX_EFFORT_WIDTH, 20.0],
+                egui::Label::new(pixel_text("effort", 10.0)),
             );
             ui.add_sized(
                 [CODEX_QUOTA_WIDTH, 20.0],
-                egui::Label::new(pixel_text("7d", 10.0)),
+                egui::Label::new(pixel_text("cota", 10.0)),
+            );
+            ui.add_sized(
+                [CODEX_QUOTA_WIDTH, 20.0],
+                egui::Label::new(pixel_text("cota", 10.0)),
             );
             ui.end_row();
 
@@ -1581,6 +1730,11 @@ fn render_codex_accounts(
                 let last_used = last_used_profile.is_some_and(|profile| {
                     account.get("perfil").and_then(Value::as_str) == Some(profile)
                 });
+                let ativa = active_profile.is_some_and(|profile| {
+                    account.get("perfil").and_then(Value::as_str) == Some(profile)
+                });
+                let pode_usar = !ativa
+                    && account.get("status").and_then(Value::as_str) == Some("ok");
                 let info = pokemon.info("codex", email);
                 let texture = poke_mode
                     .then(|| pokemon.texture(context, "codex", email, false).cloned())
@@ -1588,17 +1742,29 @@ fn render_codex_accounts(
                 let species = poke_mode
                     .then(|| info.as_ref().map(|info| info.name.clone()))
                     .flatten();
-                let five_hour = quota_percent(Some(account), "300");
-                let seven_day = quota_percent(Some(account), "10080");
-                let five_hour_countdown = quota_countdown(Some(account), "300");
-                let seven_day_countdown = quota_countdown(Some(account), "10080");
-                let five_hour_clock = quota_clock(Some(account), "300");
-                let seven_day_clock = quota_clock(Some(account), "10080");
+                let primeira = quota_percent_at(account, 0);
+                let segunda = quota_percent_at(account, 1);
+                let primeira_countdown = quota_countdown_at(account, 0);
+                let segunda_countdown = quota_countdown_at(account, 1);
+                let primeira_clock = quota_clock_at(account, 0);
+                let segunda_clock = quota_clock_at(account, 1);
+                let primeira_age = quota_window_at(account, 0).map(window_label);
+                let segunda_age = quota_window_at(account, 1).map(window_label);
                 let plan = account
                     .get("plano")
                     .and_then(Value::as_str)
                     .or_else(|| info.as_ref().and_then(|info| info.plan.as_deref()))
                     .unwrap_or("ausente");
+                let settings = account
+                    .get("perfil")
+                    .and_then(Value::as_str)
+                    .and_then(|profile| {
+                        profile_settings
+                            .iter()
+                            .find(|(known_profile, _, _)| known_profile == profile)
+                    });
+                let model = settings.and_then(|(_, model, _)| model.as_deref());
+                let effort = settings.and_then(|(_, _, effort)| effort.as_deref());
                 ui.allocate_ui_with_layout(
                     egui::vec2(CODEX_ACCOUNT_WIDTH, 40.0),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -1636,9 +1802,24 @@ fn render_codex_accounts(
                                     } else {
                                         0.0
                                     };
+                                    let ativa_width = if ativa {
+                                        text_width("ativa") + ui.spacing().item_spacing.x
+                                    } else {
+                                        0.0
+                                    };
+                                    let usar_width = if pode_usar {
+                                        text_width("usar") + ui.spacing().item_spacing.x
+                                    } else {
+                                        0.0
+                                    };
                                     if let Some(species) = species.as_deref() {
                                         ui.add_sized(
-                                            [(info_width - last_used_width - relogin_width).max(0.0), 20.0],
+                                            [(info_width
+                                                - last_used_width
+                                                - relogin_width
+                                                - ativa_width
+                                                - usar_width)
+                                                .max(0.0), 20.0],
                                             egui::Label::new(pixel_text(species, 10.0))
                                                 .truncate(true),
                                         );
@@ -1656,6 +1837,42 @@ fn render_codex_accounts(
                                             egui::Label::new(dim_text("relogar")).truncate(true),
                                         );
                                     }
+                                    if ativa {
+                                        ui.add_sized(
+                                            [text_width("ativa"), 20.0],
+                                            egui::Label::new(dim_text("ativa")).truncate(true),
+                                        );
+                                    }
+                                    if pode_usar {
+                                        if let Some(perfil) = account.get("perfil").and_then(Value::as_str) {
+                                            if ui
+                                                .add_sized(
+                                                    [text_width("usar"), 20.0],
+                                                    egui::Button::new(pixel_text("usar", 9.0)),
+                                                )
+                                                .clicked()
+                                            {
+                                                let perfil = perfil.to_owned();
+                                                thread::spawn(move || {
+                                                    let Some(home) = home_directory() else {
+                                                        eprintln!("setx CODEX_HOME: diretorio home nao encontrado");
+                                                        return;
+                                                    };
+                                                    let path = home.join(perfil);
+                                                    if let Err(error) = Command::new("setx")
+                                                        .arg("CODEX_HOME")
+                                                        .arg(&path)
+                                                        .output()
+                                                    {
+                                                        eprintln!(
+                                                            "setx CODEX_HOME {}: {error}",
+                                                            path.display()
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
                                 });
                             });
                         });
@@ -1665,15 +1882,77 @@ fn render_codex_accounts(
                     [CODEX_PLAN_WIDTH, 40.0],
                     egui::Label::new(data_text(plan)).truncate(true),
                 );
+                if let Some(profile) = account.get("perfil").and_then(Value::as_str) {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(CODEX_MODEL_WIDTH, 40.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                        if let Some(model) = model {
+                            if ui
+                                .add_sized([CODEX_MODEL_WIDTH, 40.0], egui::Button::new(data_text(model)))
+                                .clicked()
+                            {
+                                let next = next_model(model).to_owned();
+                                let next_effort = (effort == Some("ultra") && next != "gpt-5.6-sol")
+                                    .then(|| "high".to_owned());
+                                write_config_scalars(
+                                    profile.to_owned(),
+                                    Some(next),
+                                    next_effort.or_else(|| effort.map(str::to_owned)),
+                                );
+                            }
+                        } else {
+                            ui.label(data_text("—"));
+                        }
+                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(CODEX_EFFORT_WIDTH, 40.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                        if let (Some(effort), Some(model)) = (effort, model) {
+                            if ui
+                                .add_sized([CODEX_EFFORT_WIDTH, 40.0], egui::Button::new(data_text(effort)))
+                                .clicked()
+                            {
+                                write_config_scalars(
+                                    profile.to_owned(),
+                                    None,
+                                    Some(next_effort(effort, model).to_owned()),
+                                );
+                            }
+                        } else {
+                            ui.label(data_text("—"));
+                        }
+                    });
+                } else {
+                    ui.add_sized([CODEX_MODEL_WIDTH, 40.0], egui::Label::new(data_text("—")));
+                    ui.add_sized([CODEX_EFFORT_WIDTH, 40.0], egui::Label::new(data_text("—")));
+                }
                 ui.allocate_ui_with_layout(
                     egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
                     egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| usage_bar(ui, five_hour, five_hour_countdown, five_hour_clock),
+                    |ui| {
+                        usage_bar_aged(
+                            ui,
+                            primeira,
+                            primeira_countdown,
+                            primeira_clock,
+                            primeira_age.as_deref(),
+                        )
+                    },
                 );
                 ui.allocate_ui_with_layout(
                     egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
                     egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| usage_bar(ui, seven_day, seven_day_countdown, seven_day_clock),
+                    |ui| {
+                        usage_bar_aged(
+                            ui,
+                            segunda,
+                            segunda_countdown,
+                            segunda_clock,
+                            segunda_age.as_deref(),
+                        )
+                    },
                 );
                 ui.end_row();
             }
@@ -1684,6 +1963,8 @@ fn show_codex(
     ui: &mut egui::Ui,
     status: Option<&Result<Value, String>>,
     last_used_profile: Option<&str>,
+    active_profile: Option<&str>,
+    profile_settings: &[(String, Option<String>, Option<String>)],
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -1708,7 +1989,16 @@ fn show_codex(
             error_label(ui, "status.py: JSON sem codex.contas[]");
             return;
         };
-        render_codex_accounts(ui, accounts, last_used_profile, pokemon, context, poke_mode);
+        render_codex_accounts(
+            ui,
+            accounts,
+            last_used_profile,
+            active_profile,
+            profile_settings,
+            pokemon,
+            context,
+            poke_mode,
+        );
     });
 }
 
@@ -1782,14 +2072,30 @@ fn show_opencodex(ui: &mut egui::Ui, snapshot: &OpenCodexSnapshot) {
                     ui.allocate_ui_with_layout(
                         egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| usage_bar(ui, account.short_percent, short_countdown, short_clock),
+                        |ui| {
+                            usage_bar_aged(
+                                ui,
+                                account.short_percent,
+                                short_countdown,
+                                short_clock,
+                                None,
+                            )
+                        },
                     );
                     let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
                     let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
                     ui.allocate_ui_with_layout(
                         egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| usage_bar(ui, account.weekly_percent, weekly_countdown, weekly_clock),
+                        |ui| {
+                            usage_bar_aged(
+                                ui,
+                                account.weekly_percent,
+                                weekly_countdown,
+                                weekly_clock,
+                                None,
+                            )
+                        },
                     );
                     ui.end_row();
                 }
@@ -1830,13 +2136,15 @@ fn show_context(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
                 ui.horizontal(|ui| {
                     ui.label(pixel_text("tokens", 10.0));
                     ui.add_space(8.0);
-                    data_label(
-                        ui,
-                        format_number(
-                            nested_number_opt(value.get("codex"), &["janela_tokens"])
-                                .unwrap_or(0.0),
-                        ),
+                    let tokens = format_number(
+                        nested_number_opt(value.get("codex"), &["janela_tokens"]).unwrap_or(0.0),
                     );
+                    let text = value
+                        .get("codex")
+                        .and_then(|codex| quota_window_at(codex, 0))
+                        .map(|window| format!("{tokens} · {}", window_label(window)))
+                        .unwrap_or(tokens);
+                    data_label(ui, text);
                 });
             }
         };
@@ -1920,15 +2228,6 @@ fn usage_bar_aged(
     usage_bar_inner(ui, value, countdown, clock, age);
 }
 
-fn usage_bar(
-    ui: &mut egui::Ui,
-    value: Option<f64>,
-    countdown: Option<String>,
-    clock: Option<String>,
-) {
-    usage_bar_inner(ui, value, countdown, clock, None);
-}
-
 fn usage_bar_inner(
     ui: &mut egui::Ui,
     value: Option<f64>,
@@ -1939,7 +2238,14 @@ fn usage_bar_inner(
     let gap = ui.spacing().item_spacing.x;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        let fixed_width = gap + PERCENT_WIDTH;
+        let label = match (value, age) {
+            (Some(value), Some(age)) => format!("{value:.0}% {age}"),
+            (Some(value), None) => format!("{value:.0}%"),
+            (None, _) => "—".to_owned(),
+        };
+        let label_width = PERCENT_WIDTH.max(text_width(&label));
+        // A largura do rotulo entra no orcamento porque cresce quando ha age.
+        let fixed_width = gap + label_width;
         let reset_budget = (ui.available_width() - fixed_width - MIN_BAR_WIDTH).max(0.0);
         let reset_width =
             reset_details_width_for(countdown.as_deref(), clock.as_deref(), reset_budget);
@@ -1950,12 +2256,6 @@ fn usage_bar_inner(
             value.map(normalized_percent),
             value.map(hp_color),
         );
-        let label = match (value, age) {
-            (Some(value), Some(age)) => format!("{value:.0}% {age}"),
-            (Some(value), None) => format!("{value:.0}%"),
-            (None, _) => "—".to_owned(),
-        };
-        let label_width = PERCENT_WIDTH.max(text_width(&label));
         ui.add_space(gap);
         ui.add_sized([label_width, 20.0], egui::Label::new(data_text(label)));
         if reset_width > 0.0 {
@@ -2251,34 +2551,73 @@ fn format_claude_clock(clock: &str) -> String {
     }
 }
 
-fn quota<'a>(codex: Option<&'a Value>, minutes: &str) -> Option<&'a Value> {
-    let wanted = minutes.parse::<f64>().ok()?;
-    codex?.get("quotas")?.as_array()?.iter().find(|quota| {
-        quota
-            .get("janela")
-            .and_then(as_number)
-            .map_or(false, |window| (window - wanted).abs() < f64::EPSILON)
-    })
+/// A conta reporta as janelas em ordem crescente (primary, secondary).
+/// Indexar por posicao, e nao por duracao, sobrevive a troca de plano:
+/// o free reporta uma unica janela de 43200 min, o team reporta 300 + 10080.
+fn quota_at(account: &Value, index: usize) -> Option<&Value> {
+    account.get("quotas")?.as_array()?.get(index)
 }
 
-fn quota_percent(codex: Option<&Value>, minutes: &str) -> Option<f64> {
-    quota(codex, minutes)
+// Leio o registro, nao env::var, pois setx nao atualiza este processo; expando o caminho para nao literalizar %USERPROFILE%.
+fn read_codex_active_profile() -> Option<String> {
+    let output = Command::new("reg")
+        .args(["query", "HKCU\\Environment", "/v", "CODEX_HOME"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(".codex".to_owned());
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let value = stdout.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("CODEX_HOME")?.trim_start();
+        let rest = rest
+            .strip_prefix("REG_SZ")
+            .or_else(|| rest.strip_prefix("REG_EXPAND_SZ"))?
+            .trim();
+        (!rest.is_empty()).then_some(rest)
+    })?;
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+fn quota_percent_at(account: &Value, index: usize) -> Option<f64> {
+    quota_at(account, index)
         .and_then(|quota| quota.get("pct"))
         .and_then(as_number)
 }
 
-fn quota_countdown(codex: Option<&Value>, minutes: &str) -> Option<String> {
-    quota(codex, minutes)
+fn quota_countdown_at(account: &Value, index: usize) -> Option<String> {
+    quota_at(account, index)
         .and_then(|quota| quota.get("reseta_em"))
         .and_then(as_number)
         .and_then(format_reset_countdown)
 }
 
-fn quota_clock(codex: Option<&Value>, minutes: &str) -> Option<String> {
-    quota(codex, minutes)
+fn quota_clock_at(account: &Value, index: usize) -> Option<String> {
+    quota_at(account, index)
         .and_then(|quota| quota.get("reseta_em"))
         .and_then(as_number)
         .and_then(format_reset_clock)
+}
+
+fn quota_window_at(account: &Value, index: usize) -> Option<f64> {
+    quota_at(account, index)
+        .and_then(|quota| quota.get("janela"))
+        .and_then(as_number)
+}
+
+/// 300 -> "5h", 10080 -> "7d", 43200 -> "30d". Espelha status.py:459.
+fn window_label(minutes: f64) -> String {
+    let minutes = minutes as u64;
+    if minutes < 60 {
+        format!("{minutes}min")
+    } else if minutes < 1440 {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{}d", minutes / 1440)
+    }
 }
 
 fn format_reset_countdown(resets_at: f64) -> Option<String> {
@@ -2416,4 +2755,33 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|creation_context| Box::new(PanelApp::new(creation_context))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_config_scalar, set_config_scalar};
+
+    const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
+
+    #[test]
+    fn config_scalars_only_use_top_level_and_preserve_sections() {
+        assert_eq!(
+            read_config_scalar(SAMPLE, "model").as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            read_config_scalar(SAMPLE, "model_reasoning_effort").as_deref(),
+            Some("ultra")
+        );
+
+        let changed = set_config_scalar(SAMPLE, "model", "gpt-5.6-terra");
+        assert!(changed.starts_with("model = \"gpt-5.6-terra\"\r\n"));
+        assert!(changed.contains(
+            "[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n"
+        ));
+
+        let inserted = set_config_scalar(SAMPLE, "model_provider", "openai");
+        assert!(inserted.starts_with("model_provider = \"openai\"\r\nmodel ="));
+        assert!(inserted.ends_with("trust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n"));
+    }
 }
