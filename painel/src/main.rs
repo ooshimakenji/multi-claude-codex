@@ -795,14 +795,7 @@ fn read_hermes_activity() -> Option<Value> {
 }
 
 fn read_cswap() -> Result<Value, String> {
-    let home = match env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-        Some(home) => PathBuf::from(home),
-        None => return Err("cswap não encontrado".to_owned()),
-    };
-    let executable = home.join(".local").join("bin").join("cswap.exe");
-    if !executable.is_file() {
-        return Err("cswap não encontrado".to_owned());
-    }
+    let executable = cswap_executable().ok_or_else(|| "cswap não encontrado".to_owned())?;
 
     let output = match Command::new(&executable).arg("list").arg("--json").output() {
         Ok(output) => output,
@@ -820,6 +813,15 @@ fn read_cswap() -> Result<Value, String> {
         Err(error) => return Err(format!("cswap retornou UTF-8 inválido: {error}")),
     };
     serde_json::from_str(&stdout).map_err(|error| format!("cswap retornou JSON inválido: {error}"))
+}
+
+fn cswap_executable() -> Option<PathBuf> {
+    let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))?;
+    let executable = PathBuf::from(home)
+        .join(".local")
+        .join("bin")
+        .join("cswap.exe");
+    executable.is_file().then_some(executable)
 }
 
 fn home_directory() -> Option<PathBuf> {
@@ -1370,6 +1372,7 @@ fn show_claude(
                         .get("disabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    let number = account.get("number").and_then(Value::as_i64);
                     let precisa_relogin = account
                         .get("usageStatus")
                         .and_then(Value::as_str)
@@ -1431,14 +1434,24 @@ fn show_claude(
                                         } else {
                                             None
                                         };
-                                        let disabled_width = marca
+                                        let marca_width = marca
                                             .map(|texto| {
                                                 text_width(texto) + ui.spacing().item_spacing.x
                                             })
                                             .unwrap_or(0.0);
+                                        let can_use = !active && !disabled && number.is_some();
+                                        let usar_width = if can_use {
+                                            text_width("usar") + ui.spacing().item_spacing.x
+                                        } else {
+                                            0.0
+                                        };
                                         if let Some(species) = species.as_deref() {
                                             ui.add_sized(
-                                                [(info_width - disabled_width).max(0.0), 20.0],
+                                                [
+                                                    (info_width - marca_width - usar_width)
+                                                        .max(0.0),
+                                                    20.0,
+                                                ],
                                                 egui::Label::new(pixel_text(species, 10.0))
                                                     .truncate(true),
                                             );
@@ -1448,6 +1461,33 @@ fn show_claude(
                                                 [text_width(texto), 20.0],
                                                 egui::Label::new(dim_text(texto)).truncate(true),
                                             );
+                                        }
+                                        if can_use {
+                                            if let Some(number) = number {
+                                                if ui
+                                                    .add_sized(
+                                                        [text_width("usar"), 20.0],
+                                                        egui::Button::new(pixel_text("usar", 9.0)),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    thread::spawn(move || {
+                                                        let Some(executable) = cswap_executable()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        if let Err(error) = Command::new(executable)
+                                                            .arg("switch")
+                                                            .arg(number.to_string())
+                                                            .output()
+                                                        {
+                                                            eprintln!(
+                                                                "cswap switch {number}: {error}"
+                                                            );
+                                                        }
+                                                    });
+                                                }
+                                            }
                                         }
                                     });
                                 });
