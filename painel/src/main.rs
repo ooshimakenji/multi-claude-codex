@@ -220,6 +220,7 @@ fn icone() -> egui::IconData {
 struct Snapshot {
     status: Result<Value, String>,
     cswap: Result<Value, String>,
+    fixacao: Option<Value>,
     codex_last_used_profile: Option<String>,
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
@@ -247,6 +248,7 @@ struct PanelApp {
     receiver: Receiver<Snapshot>,
     status: Option<Result<Value, String>>,
     cswap: Option<Result<Value, String>>,
+    fixacao: Option<Value>,
     codex_last_used_profile: Option<String>,
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
@@ -265,6 +267,13 @@ struct PokemonInfo {
     name: String,
     provider: String,
     plan: Option<String>,
+}
+
+#[derive(Clone)]
+struct ClaudeAccountTarget {
+    number: i64,
+    email: String,
+    disabled: bool,
 }
 
 struct PokemonCache {
@@ -378,6 +387,7 @@ impl PanelApp {
             receiver,
             status: None,
             cswap: None,
+            fixacao: None,
             codex_last_used_profile: None,
             codex_active_profile: None,
             codex_profile_settings: Vec::new(),
@@ -394,6 +404,7 @@ impl PanelApp {
         while let Ok(snapshot) = self.receiver.try_recv() {
             self.status = Some(snapshot.status);
             self.cswap = Some(snapshot.cswap);
+            self.fixacao = snapshot.fixacao;
             self.codex_last_used_profile = snapshot.codex_last_used_profile;
             self.codex_active_profile = snapshot.codex_active_profile;
             self.codex_profile_settings = snapshot.codex_profile_settings;
@@ -510,6 +521,7 @@ impl eframe::App for PanelApp {
                         ui,
                         content_width,
                         self.cswap.as_ref(),
+                        self.fixacao.as_ref(),
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
@@ -789,6 +801,9 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
     loop {
         let status = read_status(&repo);
         let cswap = read_cswap();
+        let fixacao = claude_config_dir()
+            .map(|directory| directory.join("cswap-fixada.json"))
+            .and_then(|path| read_json_file(&path));
         let codex_last_used_profile = read_latest_codex_profile();
         let codex_active_profile = read_codex_active_profile();
         let codex_profile_settings = codex_profile_directories()
@@ -809,6 +824,7 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
             .send(Snapshot {
                 status,
                 cswap,
+                fixacao,
                 codex_last_used_profile,
                 codex_active_profile,
                 codex_profile_settings,
@@ -910,6 +926,131 @@ fn claude_config_dir() -> Option<PathBuf> {
 fn read_json_file(path: &Path) -> Option<Value> {
     let contents = fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+fn fixacao_tem_numero(fixacao: Option<&Value>, number: Option<i64>) -> bool {
+    let Some(number) = number else {
+        return false;
+    };
+    fixacao
+        .and_then(|value| value.get("desabilitou"))
+        .and_then(Value::as_array)
+        .is_some_and(|numbers| numbers.iter().any(|value| value.as_i64() == Some(number)))
+}
+
+fn email_esta_fixado(fixacao: Option<&Value>, email: &str) -> bool {
+    fixacao
+        .and_then(|value| value.get("email"))
+        .and_then(Value::as_str)
+        .is_some_and(|fixed_email| fixed_email.eq_ignore_ascii_case(email))
+}
+
+fn run_cswap_number(executable: &Path, action: &str, number: i64) -> bool {
+    match Command::new(executable)
+        .arg(action)
+        .arg(number.to_string())
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "cswap {action} {number}: {}",
+                process_output_message(&output)
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!("cswap {action} {number}: {error}");
+            false
+        }
+    }
+}
+
+fn write_fixacao(path: &Path, email: &str, numbers: &[i64]) -> bool {
+    let Some(directory) = path.parent() else {
+        return false;
+    };
+    if fs::create_dir_all(directory).is_err() {
+        return false;
+    }
+    let desde = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let contents = serde_json::json!({
+        "email": email,
+        "desde": desde,
+        "desabilitou": numbers,
+        "ultimo_pct": null,
+    })
+    .to_string()
+        + "\n";
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if fs::write(&temporary, contents).is_err() {
+        return false;
+    }
+    if fs::rename(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return false;
+    }
+    true
+}
+
+fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTarget>) {
+    let Some(executable) = cswap_executable() else {
+        return;
+    };
+    let Some(directory) = claude_config_dir() else {
+        return;
+    };
+    let state_path = directory.join("cswap-fixada.json");
+
+    if state_path.is_file() {
+        if let Some(fixacao) = read_json_file(&state_path) {
+            if let Some(numbers) = fixacao.get("desabilitou").and_then(Value::as_array) {
+                for number in numbers.iter().filter_map(Value::as_i64) {
+                    run_cswap_number(&executable, "enable", number);
+                }
+            }
+        }
+        let _ = fs::remove_file(&state_path);
+    }
+
+    let switched = match Command::new(&executable)
+        .arg("switch")
+        .arg(number.to_string())
+        .output()
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!("cswap switch {number}: {}", process_output_message(&output));
+            false
+        }
+        Err(error) => {
+            eprintln!("cswap switch {number}: {error}");
+            false
+        }
+    };
+    if !switched {
+        return;
+    }
+
+    let numbers = accounts
+        .iter()
+        .filter(|account| {
+            account.number != number
+                && !account.email.eq_ignore_ascii_case(&email)
+                && !account.disabled
+        })
+        .map(|account| account.number)
+        .collect::<Vec<_>>();
+    if !write_fixacao(&state_path, &email, &numbers) {
+        eprintln!("cswap fixacao: nao foi possivel gravar o estado");
+        return;
+    }
+    for number in numbers {
+        run_cswap_number(&executable, "disable", number);
+    }
 }
 
 fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -1538,6 +1679,7 @@ fn show_claude(
     ui: &mut egui::Ui,
     content_width: f32,
     cswap: Option<&Result<Value, String>>,
+    fixacao: Option<&Value>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -1561,6 +1703,19 @@ fn show_claude(
                 return;
             }
         };
+        let accounts_for_fixation = accounts
+            .iter()
+            .filter_map(|account| {
+                Some(ClaudeAccountTarget {
+                    number: account.get("number").and_then(Value::as_i64)?,
+                    email: account.get("email").and_then(Value::as_str)?.to_owned(),
+                    disabled: account
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect::<Vec<_>>();
 
         let cols = [
             (MIN_CLAUDE_ACCOUNT_WIDTH, CLAUDE_ACCOUNT_WIDTH),
@@ -1610,7 +1765,13 @@ fn show_claude(
                         .get("usageStatus")
                         .and_then(Value::as_str)
                         .is_some_and(|status| status == "relogin_required");
-                    let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+                    let email = account
+                        .get("email")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let fixada = email_esta_fixado(fixacao, &email);
+                    let em_espera = disabled && fixacao_tem_numero(fixacao, number);
                     let fainted = [five_hour, seven_day]
                         .into_iter()
                         .flatten()
@@ -1619,10 +1780,10 @@ fn show_claude(
                     // relogin_required tem usage=null e antes perdia o bichinho junto com o
                     // numero. A secao CODEX abaixo sempre fez assim.
                     let texture = poke_mode
-                        .then(|| pokemon.texture(context, "claude", email, fainted).cloned())
+                        .then(|| pokemon.texture(context, "claude", &email, fainted).cloned())
                         .flatten();
                     let species = poke_mode
-                        .then(|| pokemon.info("claude", email).map(|info| info.name))
+                        .then(|| pokemon.info("claude", &email).map(|info| info.name))
                         .flatten();
                     ui.allocate_ui_with_layout(
                         egui::vec2(widths[0], 40.0),
@@ -1662,7 +1823,7 @@ fn show_claude(
                                 ui.vertical(|ui| {
                                     ui.add_sized(
                                         [info_width, 20.0],
-                                        egui::Label::new(data_text(email)).truncate(true),
+                                        egui::Label::new(data_text(&email)).truncate(true),
                                     )
                                     .on_hover_text(string_field(account, "usageStatus"));
                                     ui.horizontal(|ui| {
@@ -1670,6 +1831,8 @@ fn show_claude(
                                         // a conta aparecia sem numero e sem motivo visivel.
                                         let marca = if precisa_relogin {
                                             Some("relogar")
+                                        } else if em_espera {
+                                            Some("em espera")
                                         } else if disabled {
                                             Some("desabilitada")
                                         } else {
@@ -1680,7 +1843,9 @@ fn show_claude(
                                                 text_width(texto) + ui.spacing().item_spacing.x
                                             })
                                             .unwrap_or(0.0);
-                                        let can_use = !active && !disabled && number.is_some();
+                                        let can_use = !active
+                                            && number.is_some()
+                                            && (!disabled || em_espera);
                                         let usar_width = if can_use {
                                             text_width("usar") + ui.spacing().item_spacing.x
                                         } else {
@@ -1691,10 +1856,19 @@ fn show_claude(
                                         } else {
                                             0.0
                                         };
+                                        let fixada_width = if fixada {
+                                            text_width("fixada") + ui.spacing().item_spacing.x
+                                        } else {
+                                            0.0
+                                        };
                                         if let Some(species) = species.as_deref() {
                                             ui.add_sized(
                                                 [
-                                                    (info_width - marca_width - ativa_width - usar_width)
+                                                    (info_width
+                                                        - marca_width
+                                                        - ativa_width
+                                                        - fixada_width
+                                                        - usar_width)
                                                         .max(0.0),
                                                     20.0,
                                                 ],
@@ -1714,30 +1888,28 @@ fn show_claude(
                                                 egui::Label::new(dim_text("ativa")).truncate(true),
                                             );
                                         }
+                                        if fixada {
+                                            ui.add_sized(
+                                                [text_width("fixada"), 20.0],
+                                                egui::Label::new(dim_text("fixada")).truncate(true),
+                                            );
+                                        }
                                         if can_use {
                                             if let Some(number) = number {
                                                 if ui
                                                     .add(egui::Button::new(pixel_text("usar", 9.0)))
                                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                    .on_hover_text("trocar o Claude Code para esta conta agora")
+                                                    .on_hover_text(
+                                                        "fixar esta conta até 100% · as outras ficam em espera",
+                                                    )
                                                     .clicked()
                                                 {
+                                                    let email = email.clone();
+                                                    let accounts = accounts_for_fixation.clone();
                                                     thread::spawn(move || {
-                                                        let Some(executable) = cswap_executable()
-                                                        else {
-                                                            return;
-                                                        };
-                                                        if let Err(error) = Command::new(executable)
-                                                            .arg("switch")
-                                                            .arg(number.to_string())
-                                                            .output()
-                                                        {
-                                                            eprintln!(
-                                                                "cswap switch {number}: {error}"
-                                                            );
-                                                        }
+                                                        fix_claude_account(number, email, accounts);
                                                     });
-                                                }
+                                                 }
                                             }
                                         }
                                     });
@@ -1784,6 +1956,8 @@ fn show_claude(
                         pokemon,
                         context,
                         poke_mode,
+                        fixacao,
+                        accounts_for_fixation.clone(),
                     );
                     if index + 1 < accounts.len() {
                         stacked_divider(ui);
@@ -1823,6 +1997,8 @@ fn render_claude_account_stacked(
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
+    fixacao: Option<&Value>,
+    accounts_for_fixation: Vec<ClaudeAccountTarget>,
 ) {
     let five_hour = usage_percent(account, "fiveHour");
     let seven_day = usage_percent(account, "sevenDay");
@@ -1844,16 +2020,22 @@ fn render_claude_account_stacked(
         .get("usageStatus")
         .and_then(Value::as_str)
         .is_some_and(|status| status == "relogin_required");
-    let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+    let email = account
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let fixada = email_esta_fixado(fixacao, &email);
+    let em_espera = disabled && fixacao_tem_numero(fixacao, number);
     let fainted = [five_hour, seven_day]
         .into_iter()
         .flatten()
         .any(|percent| percent >= 100.0);
     let texture = poke_mode
-        .then(|| pokemon.texture(context, "claude", email, fainted).cloned())
+        .then(|| pokemon.texture(context, "claude", &email, fainted).cloned())
         .flatten();
     let species = poke_mode
-        .then(|| pokemon.info("claude", email).map(|info| info.name))
+        .then(|| pokemon.info("claude", &email).map(|info| info.name))
         .flatten();
     let width = content_width;
 
@@ -1886,7 +2068,7 @@ fn render_claude_account_stacked(
             + ui.spacing().item_spacing.x * 2.0;
         ui.scope(|ui| {
             ui.set_max_width((width - reserved).max(0.0));
-            ui.add(egui::Label::new(data_text(email)).wrap(true))
+            ui.add(egui::Label::new(data_text(&email)).wrap(true))
                 .on_hover_text(string_field(account, "usageStatus"));
         });
     });
@@ -1897,32 +2079,28 @@ fn render_claude_account_stacked(
         }
         if precisa_relogin {
             ui.label(dim_text("relogar"));
+        } else if em_espera {
+            ui.label(dim_text("em espera"));
         } else if disabled {
             ui.label(dim_text("desabilitada"));
         }
         if active {
             ui.label(dim_text("ativa"));
         }
-        if !active && !disabled {
+        if fixada {
+            ui.label(dim_text("fixada"));
+        }
+        if !active && number.is_some() && (!disabled || em_espera) {
             if let Some(number) = number {
                 if ui
                     .add(egui::Button::new(pixel_text("usar", 9.0)))
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("trocar o Claude Code para esta conta agora")
+                    .on_hover_text("fixar esta conta até 100% · as outras ficam em espera")
                     .clicked()
                 {
-                    thread::spawn(move || {
-                        let Some(executable) = cswap_executable() else {
-                            return;
-                        };
-                        if let Err(error) = Command::new(executable)
-                            .arg("switch")
-                            .arg(number.to_string())
-                            .output()
-                        {
-                            eprintln!("cswap switch {number}: {error}");
-                        }
-                    });
+                    let email = email.clone();
+                    let accounts = accounts_for_fixation.clone();
+                    thread::spawn(move || fix_claude_account(number, email, accounts));
                 }
             }
         }
