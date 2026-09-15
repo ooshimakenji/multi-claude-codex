@@ -32,8 +32,6 @@ use winapi::{
 };
 
 const PANEL_TITLE: &str = "CENTRO DE COMANDO // HERMES";
-const HERMES_PROFILE: &str = "ambiental-operacoes";
-const HERMES_MODEL: &str = "gpt-5.6-terra";
 static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 
 // These are layout measurements, not arbitrary viewport defaults.  The
@@ -90,6 +88,14 @@ const MIN_BAR_WIDTH: f32 = 32.0;
 const PERCENT_WIDTH: f32 = 42.0;
 const ACCOUNT_SPRITE_SIZE: f32 = 40.0;
 const ACCOUNT_CURSOR_WIDTH: f32 = 10.0;
+const ARENA_PLATE_HEIGHT: f32 = 42.0;
+const ARENA_SPRITE_SIZE: f32 = 112.0;
+const ARENA_DELEGATION_HEIGHT: f32 = 38.0;
+const ARENA_MIN_PLATE_WIDTH: f32 = 150.0;
+const ARENA_MIN_SIDE_WIDTH: f32 = 160.0;
+const ARENA_MIN_DELEGATION_WIDTH: f32 = 120.0;
+const ARENA_COLUMN_GAP: f32 = 12.0;
+const ARENA_PLATE_MAX_WIDTH: f32 = 360.0;
 const HT_LEFT: usize = 10;
 const HT_RIGHT: usize = 11;
 const HT_TOP: usize = 12;
@@ -225,7 +231,6 @@ struct Snapshot {
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
-    hermes_activity: Option<Value>,
 }
 
 struct OpenCodexSnapshot {
@@ -253,8 +258,6 @@ struct PanelApp {
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
-    hermes_activity: Option<Value>,
-    workspace: String,
     pokemon: PokemonCache,
     poke_mode: bool,
     hwnd: Option<*mut c_void>,
@@ -374,11 +377,6 @@ impl PanelApp {
         configure_context(&creation_context.egui_ctx);
         let (sender, receiver) = mpsc::channel();
         let repo = find_repo();
-        let workspace = repo
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace não identificado")
-            .to_owned();
         thread::spawn(move || refresh_loop(sender, repo));
         let hwnd = native_window_handle(creation_context);
         set_taskbar_icon(hwnd);
@@ -392,8 +390,6 @@ impl PanelApp {
             codex_active_profile: None,
             codex_profile_settings: Vec::new(),
             opencodex: None,
-            hermes_activity: None,
-            workspace,
             pokemon: PokemonCache::new(),
             poke_mode: load_poke_mode(),
             hwnd,
@@ -409,7 +405,6 @@ impl PanelApp {
             self.codex_active_profile = snapshot.codex_active_profile;
             self.codex_profile_settings = snapshot.codex_profile_settings;
             self.opencodex = snapshot.opencodex;
-            self.hermes_activity = snapshot.hermes_activity;
         }
     }
 }
@@ -508,8 +503,12 @@ impl eframe::App for PanelApp {
                         ui,
                         content_width,
                         self.status.as_ref(),
-                        self.hermes_activity.as_ref(),
-                        &self.workspace,
+                        self.cswap.as_ref(),
+                        self.codex_active_profile.as_deref(),
+                        &self.codex_profile_settings,
+                        &mut self.pokemon,
+                        context,
+                        self.poke_mode,
                     );
                     ui.add_space(12.0);
                     show_command_line(ui, content_width, self.cswap.as_ref());
@@ -819,7 +818,6 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
             })
             .collect();
         let opencodex = read_opencodex();
-        let hermes_activity = read_hermes_activity();
         if sender
             .send(Snapshot {
                 status,
@@ -829,7 +827,6 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
                 codex_active_profile,
                 codex_profile_settings,
                 opencodex,
-                hermes_activity,
             })
             .is_err()
         {
@@ -864,21 +861,6 @@ fn read_status(repo: &Path) -> Result<Value, String> {
     };
     serde_json::from_str(&stdout)
         .map_err(|error| format!("status.py retornou JSON inválido: {error}"))
-}
-
-fn read_hermes_activity() -> Option<Value> {
-    let local_app_data = env::var_os("LOCALAPPDATA")?;
-    let path = PathBuf::from(local_app_data)
-        .join("hermes")
-        .join("profiles")
-        .join(HERMES_PROFILE)
-        .join("shared")
-        .join("visualizer-activity.json");
-    let modified = fs::metadata(&path).ok()?.modified().ok()?;
-    if SystemTime::now().duration_since(modified).ok()? > Duration::from_secs(300) {
-        return None;
-    }
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 fn read_cswap() -> Result<Value, String> {
@@ -1458,112 +1440,494 @@ fn show_command_center(
     ui: &mut egui::Ui,
     content_width: f32,
     status: Option<&Result<Value, String>>,
-    hermes_activity: Option<&Value>,
-    workspace: &str,
+    cswap: Option<&Result<Value, String>>,
+    active_profile: Option<&str>,
+    profile_settings: &[(String, Option<String>, Option<String>)],
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
 ) {
-    let hermes_state = hermes_activity
-        .and_then(|activity| activity.get("state"))
-        .and_then(Value::as_str)
-        .unwrap_or("PRONTO");
-    let hermes_detail = hermes_activity
-        .map(hermes_activity_detail)
-        .unwrap_or_else(|| format!("{HERMES_PROFILE} · {HERMES_MODEL}"));
-    let (codex_state, codex_detail) = match status {
-        None => ("CARREGANDO", "aguardando status local".to_owned()),
-        Some(Err(_)) => ("SEM STATUS", "status.py indisponível".to_owned()),
-        Some(Ok(value)) => match value.get("jobs").and_then(Value::as_array) {
-            Some(jobs) if !jobs.is_empty() => {
-                let job = &jobs[0];
-                (
-                    "EXECUTANDO",
-                    format!(
-                        "{} · {}",
-                        string_field(job, "projeto"),
-                        format_duration(number_field(job, "segundos")),
-                    ),
-                )
-            }
-            _ => ("DISPONÍVEL", "delegação por critério".to_owned()),
-        },
-    };
-
     section_frame(
         ui,
         "AGORA // CENTRO DE COMANDO",
         content_width,
         |ui, content_width| {
-            let card_max_width = (content_width / 3.0).max(130.0);
-            ui.horizontal_wrapped(|ui| {
-                agent_card(ui, card_max_width, "HERMES", hermes_state, &hermes_detail);
-                agent_card(
-                    ui,
-                    card_max_width,
-                    "CLAUDE",
-                    "DISPONÍVEL",
-                    "planeja e revisa quando agrega valor",
-                );
-                agent_card(ui, card_max_width, "CODEX", codex_state, &codex_detail);
-            });
-            ui.add_space(8.0);
-            dim_label(
-                ui,
-                content_width,
-                format!("workspace · {workspace}  //  delegação por critério  //  jobs e cotas são dados locais"),
+            let stacked = content_width < arena_wide_min_width(poke_mode);
+            let (arena, _) = ui.allocate_exact_size(
+                egui::vec2(content_width, arena_height(poke_mode, stacked)),
+                egui::Sense::hover(),
             );
+            let painter = ui.painter().with_clip_rect(arena);
+
+            let claude_account = cswap
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|value| value.get("accounts"))
+                .and_then(Value::as_array)
+                .and_then(|accounts| {
+                    accounts.iter().find(|account| {
+                        account.get("active").and_then(Value::as_bool) == Some(true)
+                    })
+                });
+            let claude_email = claude_account
+                .and_then(|account| account.get("email"))
+                .and_then(Value::as_str)
+                .unwrap_or("conta não identificada");
+            let claude_hp = claude_account
+                .and_then(|account| usage_percent(account, "fiveHour"))
+                .map(remaining_hp);
+            let claude_texture = poke_mode
+                .then(|| pokemon.texture(context, "claude", claude_email, true))
+                .flatten()
+                .map(|texture| texture.id());
+
+            let codex_account = status
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|value| value.get("codex"))
+                .and_then(|codex| codex.get("contas"))
+                .and_then(Value::as_array)
+                .and_then(|accounts| {
+                    active_profile.and_then(|profile| {
+                        accounts.iter().find(|account| {
+                            account.get("perfil").and_then(Value::as_str) == Some(profile)
+                        })
+                    })
+                });
+            let codex_email = codex_account
+                .and_then(|account| account.get("email"))
+                .and_then(Value::as_str)
+                .unwrap_or("conta não identificada");
+            let codex_texture = poke_mode
+                .then(|| pokemon.texture(context, "codex", codex_email, false))
+                .flatten()
+                .map(|texture| texture.id());
+            let codex_model = codex_account
+                .and_then(|account| account.get("perfil"))
+                .and_then(Value::as_str)
+                .and_then(|profile| {
+                    profile_settings
+                        .iter()
+                        .find(|(known, _, _)| known == profile)
+                })
+                .and_then(|(_, model, _)| model.as_deref())
+                .unwrap_or("—");
+            let codex_effort = codex_account
+                .and_then(|account| account.get("perfil"))
+                .and_then(Value::as_str)
+                .and_then(|profile| {
+                    profile_settings
+                        .iter()
+                        .find(|(known, _, _)| known == profile)
+                })
+                .and_then(|(_, _, effort)| effort.as_deref())
+                .unwrap_or("—");
+            let codex_hp = codex_account
+                .and_then(|account| quota_percent_at(account, 0))
+                .map(remaining_hp);
+
+            if stacked {
+                let row_height = arena_side_height(poke_mode);
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.top()),
+                        egui::vec2(arena.width(), row_height),
+                    ),
+                    &format!(
+                        "CLAUDE · {}",
+                        claude_email.split('@').next().unwrap_or(claude_email)
+                    ),
+                    claude_hp,
+                    claude_texture,
+                    true,
+                    poke_mode,
+                    ArenaSideLayout::Stacked,
+                );
+                draw_arena_delegation(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.top() + row_height),
+                        egui::vec2(arena.width(), 38.0),
+                    ),
+                    status,
+                );
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.bottom() - row_height),
+                        egui::vec2(arena.width(), row_height),
+                    ),
+                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    codex_hp,
+                    codex_texture,
+                    false,
+                    poke_mode,
+                    ArenaSideLayout::Stacked,
+                );
+            } else if poke_mode {
+                let row_height = ARENA_SPRITE_SIZE;
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.top()),
+                        egui::vec2(arena.width(), row_height),
+                    ),
+                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    codex_hp,
+                    codex_texture,
+                    false,
+                    true,
+                    ArenaSideLayout::WideTop,
+                );
+                draw_arena_delegation(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.top() + row_height),
+                        egui::vec2(arena.width(), ARENA_DELEGATION_HEIGHT),
+                    ),
+                    status,
+                );
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    egui::Rect::from_min_size(
+                        egui::pos2(arena.left(), arena.bottom() - ARENA_SPRITE_SIZE),
+                        egui::vec2(arena.width(), row_height),
+                    ),
+                    &format!(
+                        "CLAUDE · {}",
+                        claude_email.split('@').next().unwrap_or(claude_email)
+                    ),
+                    claude_hp,
+                    claude_texture,
+                    true,
+                    true,
+                    ArenaSideLayout::WideBottom,
+                );
+            } else {
+                let side_width =
+                    (arena.width() - ARENA_MIN_DELEGATION_WIDTH - ARENA_COLUMN_GAP * 2.0) / 2.0;
+                let claude_rect = egui::Rect::from_min_size(
+                    arena.left_top(),
+                    egui::vec2(side_width, arena.height()),
+                );
+                let codex_rect = egui::Rect::from_min_size(
+                    egui::pos2(arena.right() - side_width, arena.top()),
+                    egui::vec2(side_width, arena.height()),
+                );
+                let delegation_rect = egui::Rect::from_min_size(
+                    egui::pos2(claude_rect.right() + ARENA_COLUMN_GAP, arena.top()),
+                    egui::vec2(
+                        (codex_rect.left() - claude_rect.right() - ARENA_COLUMN_GAP * 2.0).max(0.0),
+                        arena.height(),
+                    ),
+                );
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    claude_rect,
+                    &format!(
+                        "CLAUDE · {}",
+                        claude_email.split('@').next().unwrap_or(claude_email)
+                    ),
+                    claude_hp,
+                    claude_texture,
+                    true,
+                    false,
+                    ArenaSideLayout::Sober,
+                );
+                draw_arena_delegation(&painter, ui, delegation_rect, status);
+                draw_arena_side(
+                    &painter,
+                    ui,
+                    codex_rect,
+                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    codex_hp,
+                    codex_texture,
+                    false,
+                    false,
+                    ArenaSideLayout::Sober,
+                );
+            }
         },
     );
 }
 
-fn hermes_activity_detail(activity: &Value) -> String {
-    let cwd = activity
-        .get("cwd")
-        .and_then(Value::as_str)
-        .and_then(|path| Path::new(path).file_name())
-        .and_then(|name| name.to_str())
-        .unwrap_or("workspace não identificado");
-    match activity.get("tool").and_then(Value::as_str) {
-        Some(tool) if !tool.is_empty() => format!("{tool} · {cwd}"),
-        _ => cwd.to_owned(),
+#[derive(Clone, Copy)]
+enum ArenaSideLayout {
+    WideTop,
+    WideBottom,
+    Stacked,
+    Sober,
+}
+
+fn arena_side_height(poke_mode: bool) -> f32 {
+    if poke_mode {
+        ARENA_SPRITE_SIZE
+    } else {
+        ARENA_PLATE_HEIGHT
     }
 }
 
-fn agent_card(ui: &mut egui::Ui, width: f32, name: &str, state: &str, detail: &str) {
-    let inner_margin = egui::Margin::symmetric(8.0, 7.0);
-    let content_width = text_width(name)
-        .max(text_width(state))
-        .max(text_width(detail));
-    let width = width.min(content_width + inner_margin.left + inner_margin.right + 2.0);
-    let inner_width = (width - inner_margin.left - inner_margin.right - 2.0).max(0.0);
-    let card_height = 16.0
-        + 20.0
-        + 18.0
-        + ui.spacing().item_spacing.y * 2.0
-        + inner_margin.top
-        + inner_margin.bottom;
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, card_height),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            egui::Frame::none()
-                .fill(ground())
-                .stroke(egui::Stroke::new(1.0_f32, border()))
-                .inner_margin(inner_margin)
-                .show(ui, |ui| {
-                    ui.add_sized(
-                        [inner_width, 16.0],
-                        egui::Label::new(pixel_text(name, 11.0)),
-                    );
-                    ui.add_sized(
-                        [inner_width, 20.0],
-                        egui::Label::new(data_text(state)).truncate(true),
-                    );
-                    ui.add_sized(
-                        [inner_width, 18.0],
-                        egui::Label::new(dim_text(detail)).truncate(true),
-                    );
-                });
-        },
+fn arena_height(poke_mode: bool, stacked: bool) -> f32 {
+    if stacked {
+        arena_side_height(poke_mode) * 2.0 + ARENA_DELEGATION_HEIGHT
+    } else if poke_mode {
+        ARENA_SPRITE_SIZE * 2.0 + ARENA_DELEGATION_HEIGHT
+    } else {
+        ARENA_PLATE_HEIGHT
+    }
+}
+
+fn arena_wide_min_width(poke_mode: bool) -> f32 {
+    let side_width = if poke_mode {
+        ARENA_MIN_SIDE_WIDTH
+    } else {
+        ARENA_MIN_PLATE_WIDTH
+    };
+    side_width * 2.0 + ARENA_MIN_DELEGATION_WIDTH + ARENA_COLUMN_GAP * 2.0
+}
+
+fn remaining_hp(used: f64) -> f64 {
+    100.0 - normalized_percent(used)
+}
+
+fn draw_arena_side(
+    painter: &egui::Painter,
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    plate_text: &str,
+    hp: Option<f64>,
+    texture: Option<egui::TextureId>,
+    player: bool,
+    poke_mode: bool,
+    layout: ArenaSideLayout,
+) {
+    let sprite_size = ARENA_SPRITE_SIZE;
+    let sprite_zone = if player {
+        sprite_size + 46.0
+    } else {
+        sprite_size
+    };
+    let plate_width = match layout {
+        ArenaSideLayout::Sober => (rect.width() - 8.0).max(0.0),
+        _ if poke_mode => (rect.width() - sprite_zone - ARENA_COLUMN_GAP)
+            .min(ARENA_PLATE_MAX_WIDTH)
+            .max(96.0),
+        _ => (rect.width() - 8.0).min(ARENA_PLATE_MAX_WIDTH).max(96.0),
+    }
+    .min(rect.width());
+    let plate_left = match layout {
+        ArenaSideLayout::WideTop | ArenaSideLayout::Sober => rect.left() + 4.0,
+        ArenaSideLayout::WideBottom | ArenaSideLayout::Stacked => rect.right() - plate_width - 4.0,
+    };
+    let plate_top = match layout {
+        ArenaSideLayout::WideTop => rect.top(),
+        ArenaSideLayout::WideBottom => rect.bottom() - ARENA_PLATE_HEIGHT,
+        ArenaSideLayout::Stacked | ArenaSideLayout::Sober => {
+            rect.center().y - ARENA_PLATE_HEIGHT / 2.0
+        }
+    };
+    let plate = egui::Rect::from_min_size(
+        egui::pos2(plate_left, plate_top),
+        egui::vec2(plate_width, ARENA_PLATE_HEIGHT),
     );
+    painter.rect_filled(plate, 0.0, ground());
+    painter.rect_stroke(plate, 0.0, egui::Stroke::new(1.0_f32, border()));
+    draw_arena_text(
+        painter,
+        plate.left_top() + egui::vec2(8.0, 6.0),
+        plate_text,
+        (plate.width() - 16.0).max(0.0),
+        egui::FontId::monospace(11.0),
+        text_color(),
+    );
+    draw_arena_hp(ui, painter, plate, hp);
+
+    let sprite_left = match layout {
+        ArenaSideLayout::WideTop => rect.right() - sprite_size,
+        ArenaSideLayout::WideBottom | ArenaSideLayout::Stacked => {
+            rect.left() + if player { 46.0 } else { 0.0 }
+        }
+        ArenaSideLayout::Sober => rect.left(),
+    };
+    if !poke_mode || matches!(layout, ArenaSideLayout::Sober) {
+        return;
+    }
+    let sprite_top = match layout {
+        ArenaSideLayout::WideTop => rect.top(),
+        ArenaSideLayout::WideBottom => rect.bottom() - sprite_size,
+        ArenaSideLayout::Stacked => rect.center().y - sprite_size / 2.0,
+        ArenaSideLayout::Sober => rect.top(),
+    };
+    let sprite_rect = egui::Rect::from_min_size(
+        egui::pos2(sprite_left, sprite_top),
+        egui::vec2(sprite_size, sprite_size),
+    );
+    if player {
+        draw_trainer(
+            painter,
+            egui::pos2(rect.left() + 5.0, sprite_rect.top() + 12.0),
+        );
+    }
+    if let Some(texture) = texture {
+        painter.image(
+            texture,
+            sprite_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+}
+
+fn draw_arena_hp(ui: &mut egui::Ui, _painter: &egui::Painter, plate: egui::Rect, hp: Option<f64>) {
+    let bar_rect = egui::Rect::from_min_size(
+        egui::pos2(plate.left() + 8.0, plate.bottom() - 17.0),
+        egui::vec2((plate.width() - 16.0).max(0.0), 11.0),
+    );
+    ui.allocate_ui_at_rect(bar_rect, |ui| {
+        let (blocks, _) = allocate_blocks(ui, bar_rect.width());
+        paint_blocks(
+            ui,
+            blocks,
+            |index| hp.is_some_and(|value| index < ((value / 10.0).round() as usize).min(10)),
+            |_| hp.map(hp_color).unwrap_or(dim_color()),
+            |_| egui::Color32::from_rgba_unmultiplied(0x4A, 0x5D, 0x3F, 80),
+        );
+    });
+}
+
+fn draw_arena_delegation(
+    painter: &egui::Painter,
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    status: Option<&Result<Value, String>>,
+) {
+    let job = status
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|value| value.get("jobs"))
+        .and_then(Value::as_array)
+        .and_then(|jobs| jobs.first());
+    let text = job.map(|job| {
+        format!(
+            "{} · {}",
+            string_field(job, "projeto"),
+            format_duration(number_field(job, "segundos"))
+        )
+    });
+    let text = text.as_deref().unwrap_or("aguardando delegação");
+    let text_color = if job.is_some() {
+        text_color()
+    } else {
+        dim_color()
+    };
+    draw_arena_text_centered(
+        painter,
+        rect.center().x,
+        rect.top() + 4.0,
+        text,
+        (rect.width() - 12.0).max(0.0),
+        egui::FontId::monospace(11.0),
+        text_color,
+    );
+    if job.is_some() {
+        let blocks = egui::Rect::from_center_size(
+            rect.center() + egui::vec2(0.0, 9.0),
+            egui::vec2(84.0, 12.0),
+        );
+        ui.allocate_ui_at_rect(blocks, loading_blocks);
+    }
+}
+
+fn draw_arena_text(
+    painter: &egui::Painter,
+    position: egui::Pos2,
+    text: &str,
+    max_width: f32,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    let text = truncate_arena_text(painter, text, max_width, font.clone(), color);
+    painter.galley(position, painter.layout_no_wrap(text, font, color));
+}
+
+fn draw_arena_text_centered(
+    painter: &egui::Painter,
+    center_x: f32,
+    top: f32,
+    text: &str,
+    max_width: f32,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    let text = truncate_arena_text(painter, text, max_width, font.clone(), color);
+    let galley = painter.layout_no_wrap(text, font, color);
+    painter.galley(egui::pos2(center_x - galley.size().x / 2.0, top), galley);
+}
+
+fn truncate_arena_text(
+    painter: &egui::Painter,
+    text: &str,
+    max_width: f32,
+    font: egui::FontId,
+    color: egui::Color32,
+) -> String {
+    if max_width <= 0.0 {
+        return String::new();
+    }
+    if painter
+        .layout_no_wrap(text.to_owned(), font.clone(), color)
+        .size()
+        .x
+        <= max_width
+    {
+        return text.to_owned();
+    }
+
+    let ellipsis = "…";
+    let ellipsis_width = painter
+        .layout_no_wrap(ellipsis.to_owned(), font.clone(), color)
+        .size()
+        .x;
+    if ellipsis_width > max_width {
+        return String::new();
+    }
+
+    let mut prefix = String::new();
+    for character in text.chars() {
+        let candidate = format!("{prefix}{character}{ellipsis}");
+        if painter
+            .layout_no_wrap(candidate, font.clone(), color)
+            .size()
+            .x
+            <= max_width
+        {
+            prefix.push(character);
+        } else {
+            break;
+        }
+    }
+    format!("{prefix}{ellipsis}")
+}
+
+fn draw_trainer(painter: &egui::Painter, origin: egui::Pos2) {
+    let block = 3.0;
+    let rect = |x: f32, y: f32, width: f32, height: f32| {
+        egui::Rect::from_min_size(
+            origin + egui::vec2(x * block, y * block),
+            egui::vec2(width * block, height * block),
+        )
+    };
+    painter.rect_filled(rect(4.0, 0.0, 4.0, 4.0), 0.0, text_color());
+    painter.rect_filled(rect(3.0, 4.0, 6.0, 6.0), 0.0, border());
+    painter.rect_filled(rect(1.0, 5.0, 2.0, 4.0), 0.0, text_color());
+    painter.rect_filled(rect(9.0, 5.0, 2.0, 4.0), 0.0, text_color());
+    painter.rect_filled(rect(3.0, 10.0, 2.0, 6.0), 0.0, border());
+    painter.rect_filled(rect(7.0, 10.0, 2.0, 6.0), 0.0, border());
 }
 
 fn show_command_line(ui: &mut egui::Ui, content_width: f32, cswap: Option<&Result<Value, String>>) {
@@ -1780,7 +2144,7 @@ fn show_claude(
                     // relogin_required tem usage=null e antes perdia o bichinho junto com o
                     // numero. A secao CODEX abaixo sempre fez assim.
                     let texture = poke_mode
-                        .then(|| pokemon.texture(context, "claude", &email, fainted).cloned())
+                        .then(|| pokemon.texture(context, "claude", &email, false).cloned())
                         .flatten();
                     let species = poke_mode
                         .then(|| pokemon.info("claude", &email).map(|info| info.name))
@@ -1791,9 +2155,14 @@ fn show_claude(
                         |ui| {
                             if let Some(texture) = texture.as_ref() {
                                 ui.add(
-                                    egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
-                                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                                        .texture_options(egui::TextureOptions::NEAREST),
+                                        egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
+                                            .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                                            .texture_options(egui::TextureOptions::NEAREST)
+                                            .tint(if fainted {
+                                                dim_color()
+                                            } else {
+                                                egui::Color32::WHITE
+                                            }),
                                 );
                             } else {
                                 // Sem sprite o espaco continua reservado: a largura ja desconta
@@ -1843,6 +2212,11 @@ fn show_claude(
                                                 text_width(texto) + ui.spacing().item_spacing.x
                                             })
                                             .unwrap_or(0.0);
+                                        let desmaiou_width = if fainted {
+                                            text_width("desmaiou") + ui.spacing().item_spacing.x
+                                        } else {
+                                            0.0
+                                        };
                                         let can_use = !active
                                             && number.is_some()
                                             && (!disabled || em_espera);
@@ -1866,6 +2240,7 @@ fn show_claude(
                                                 [
                                                     (info_width
                                                         - marca_width
+                                                        - desmaiou_width
                                                         - ativa_width
                                                         - fixada_width
                                                         - usar_width)
@@ -1880,6 +2255,12 @@ fn show_claude(
                                             ui.add_sized(
                                                 [text_width(texto), 20.0],
                                                 egui::Label::new(dim_text(texto)).truncate(true),
+                                            );
+                                        }
+                                        if fainted {
+                                            ui.add_sized(
+                                                [text_width("desmaiou"), 20.0],
+                                                egui::Label::new(dim_text("desmaiou")).truncate(true),
                                             );
                                         }
                                         if active {
@@ -2032,7 +2413,7 @@ fn render_claude_account_stacked(
         .flatten()
         .any(|percent| percent >= 100.0);
     let texture = poke_mode
-        .then(|| pokemon.texture(context, "claude", &email, fainted).cloned())
+        .then(|| pokemon.texture(context, "claude", &email, false).cloned())
         .flatten();
     let species = poke_mode
         .then(|| pokemon.info("claude", &email).map(|info| info.name))
@@ -2045,7 +2426,12 @@ fn render_claude_account_stacked(
                 ui.add(
                     egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
                         .fit_to_exact_size(egui::vec2(40.0, 40.0))
-                        .texture_options(egui::TextureOptions::NEAREST),
+                        .texture_options(egui::TextureOptions::NEAREST)
+                        .tint(if fainted {
+                            dim_color()
+                        } else {
+                            egui::Color32::WHITE
+                        }),
                 );
             } else {
                 ui.add_space(ACCOUNT_SPRITE_SIZE);
@@ -2076,6 +2462,9 @@ fn render_claude_account_stacked(
     ui.horizontal_wrapped(|ui| {
         if let Some(species) = species.as_deref() {
             ui.label(pixel_text(species, 10.0));
+        }
+        if fainted {
+            ui.label(dim_text("desmaiou"));
         }
         if precisa_relogin {
             ui.label(dim_text("relogar"));
