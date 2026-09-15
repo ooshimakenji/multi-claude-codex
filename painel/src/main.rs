@@ -419,6 +419,7 @@ fn configure_context(context: &egui::Context) {
     let mut style = (*context.style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.window_margin = egui::Margin::same(12.0);
+    style.spacing.button_padding = egui::vec2(6.0, 3.0);
     style.visuals = terminal_visuals();
     context.set_style(style);
 }
@@ -449,35 +450,65 @@ fn terminal_visuals() -> egui::Visuals {
         widget.rounding = egui::Rounding::same(0.0);
         widget.bg_stroke = egui::Stroke::new(1.0_f32, border());
         widget.fg_stroke = egui::Stroke::new(1.0_f32, text_color());
+        widget.expansion = 0.0;
     }
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.inactive.weak_bg_fill = ground();
+    visuals.widgets.hovered.weak_bg_fill = border();
+    visuals.widgets.active.weak_bg_fill = hp_ok();
+    visuals.widgets.open.weak_bg_fill = border();
     visuals
 }
 
 impl eframe::App for PanelApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        // A janela nasce dimensionada em pixels, mas o egui desenha em pontos. Com a
+        // escala do Windows em 125% o conteudo saia 25% maior que o quadro em qualquer
+        // largura. Fixar 1 ponto = 1 pixel alinha os dois e deixa a Silkscreen, que e
+        // uma fonte pixelada, nitida em vez de interpolada. Precisa ser a cada frame:
+        // o eframe reimpoe a escala nativa e sobrescreve o ajuste feito na inicializacao.
+
         self.receive_latest();
         context.request_repaint_after(Duration::from_millis(100));
 
         show_title_bar(context, &mut self.poke_mode);
 
         egui::CentralPanel::default().show(context, |ui| {
+            let central_panel_margin =
+                ui.spacing().window_margin.left + ui.spacing().window_margin.right;
+            // A largura vem do screen_rect, nao do clip_rect: quando o conteudo nao
+            // cabe, a ScrollArea infla o clip_rect e o layout passa a acreditar que
+            // tem MAIS espaco justo quando tem menos — realimentacao que impedia as
+            // secoes de encolher. O screen_rect e a janela e nao sofre disso.
+            // O eframe reporta screen_rect em PIXELS fisicos, mas o egui desenha em
+            // pontos (aqui 1 ponto = 1.25 px). Sem dividir pela escala o layout acha
+            // que tem 700 pontos numa janela de 700 px e estoura 25% em toda largura.
+            // Nao usar clip_rect: quando o conteudo nao cabe, a ScrollArea o infla e a
+            // realimentacao impede as secoes de encolher.
+            let content_width = (context.screen_rect().width() / context.pixels_per_point()
+                - central_panel_margin
+                - SECTION_HORIZONTAL_OVERHEAD
+                - ui.spacing().scroll.allocated_width())
+            .max(0.0);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     show_command_center(
                         ui,
+                        content_width,
                         self.status.as_ref(),
                         self.hermes_activity.as_ref(),
                         &self.workspace,
                     );
                     ui.add_space(12.0);
-                    show_command_line(ui, self.cswap.as_ref());
+                    show_command_line(ui, content_width, self.cswap.as_ref());
                     ui.add_space(12.0);
-                    show_running_jobs(ui, self.status.as_ref());
+                    show_running_jobs(ui, content_width, self.status.as_ref());
                     ui.add_space(12.0);
 
                     show_claude(
                         ui,
+                        content_width,
                         self.cswap.as_ref(),
                         &mut self.pokemon,
                         context,
@@ -487,6 +518,7 @@ impl eframe::App for PanelApp {
 
                     show_codex(
                         ui,
+                        content_width,
                         self.status.as_ref(),
                         self.codex_last_used_profile.as_deref(),
                         self.codex_active_profile.as_deref(),
@@ -497,12 +529,12 @@ impl eframe::App for PanelApp {
                     );
                     ui.add_space(8.0);
                     if let Some(opencodex) = self.opencodex.as_ref() {
-                        show_opencodex(ui, opencodex);
+                        show_opencodex(ui, content_width, opencodex);
                         ui.add_space(8.0);
                     }
-                    show_free_tier(ui, self.status.as_ref());
+                    show_free_tier(ui, content_width, self.status.as_ref());
                     ui.add_space(8.0);
-                    show_context(ui, self.status.as_ref());
+                    show_context(ui, content_width, self.status.as_ref());
                 });
         });
 
@@ -1283,6 +1315,7 @@ fn find_repo() -> PathBuf {
 
 fn show_command_center(
     ui: &mut egui::Ui,
+    content_width: f32,
     status: Option<&Result<Value, String>>,
     hermes_activity: Option<&Value>,
     workspace: &str,
@@ -1313,26 +1346,31 @@ fn show_command_center(
         },
     };
 
-    section_frame(ui, "AGORA // CENTRO DE COMANDO", |ui| {
-        let card_width =
-            ((ui.available_width() - ui.spacing().item_spacing.x * 2.0) / 3.0).max(130.0);
-        ui.horizontal(|ui| {
-            agent_card(ui, card_width, "HERMES", hermes_state, &hermes_detail);
-            agent_card(
+    section_frame(
+        ui,
+        "AGORA // CENTRO DE COMANDO",
+        content_width,
+        |ui, content_width| {
+            let card_max_width = (content_width / 3.0).max(130.0);
+            ui.horizontal_wrapped(|ui| {
+                agent_card(ui, card_max_width, "HERMES", hermes_state, &hermes_detail);
+                agent_card(
+                    ui,
+                    card_max_width,
+                    "CLAUDE",
+                    "DISPONÍVEL",
+                    "planeja e revisa quando agrega valor",
+                );
+                agent_card(ui, card_max_width, "CODEX", codex_state, &codex_detail);
+            });
+            ui.add_space(8.0);
+            dim_label(
                 ui,
-                card_width,
-                "CLAUDE",
-                "DISPONÍVEL",
-                "planeja e revisa quando agrega valor",
+                content_width,
+                format!("workspace · {workspace}  //  delegação por critério  //  jobs e cotas são dados locais"),
             );
-            agent_card(ui, card_width, "CODEX", codex_state, &codex_detail);
-        });
-        ui.add_space(8.0);
-        dim_label(
-            ui,
-            format!("workspace · {workspace}  //  delegação por critério  //  jobs e cotas são dados locais"),
-        );
-    });
+        },
+    );
 }
 
 fn hermes_activity_detail(activity: &Value) -> String {
@@ -1349,36 +1387,53 @@ fn hermes_activity_detail(activity: &Value) -> String {
 }
 
 fn agent_card(ui: &mut egui::Ui, width: f32, name: &str, state: &str, detail: &str) {
-    egui::Frame::none()
-        .fill(ground())
-        .stroke(egui::Stroke::new(1.0_f32, border()))
-        .inner_margin(egui::Margin::symmetric(8.0, 7.0))
-        .show(ui, |ui| {
-            ui.set_width(width - 16.0);
-            ui.add_sized(
-                [ui.available_width(), 16.0],
-                egui::Label::new(pixel_text(name, 11.0)),
-            );
-            ui.add_sized(
-                [ui.available_width(), 20.0],
-                egui::Label::new(data_text(state)).truncate(true),
-            );
-            ui.add_sized(
-                [ui.available_width(), 18.0],
-                egui::Label::new(dim_text(detail)).truncate(true),
-            );
-        });
+    let inner_margin = egui::Margin::symmetric(8.0, 7.0);
+    let content_width = text_width(name)
+        .max(text_width(state))
+        .max(text_width(detail));
+    let width = width.min(content_width + inner_margin.left + inner_margin.right + 2.0);
+    let inner_width = (width - inner_margin.left - inner_margin.right - 2.0).max(0.0);
+    let card_height = 16.0
+        + 20.0
+        + 18.0
+        + ui.spacing().item_spacing.y * 2.0
+        + inner_margin.top
+        + inner_margin.bottom;
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, card_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::none()
+                .fill(ground())
+                .stroke(egui::Stroke::new(1.0_f32, border()))
+                .inner_margin(inner_margin)
+                .show(ui, |ui| {
+                    ui.add_sized(
+                        [inner_width, 16.0],
+                        egui::Label::new(pixel_text(name, 11.0)),
+                    );
+                    ui.add_sized(
+                        [inner_width, 20.0],
+                        egui::Label::new(data_text(state)).truncate(true),
+                    );
+                    ui.add_sized(
+                        [inner_width, 18.0],
+                        egui::Label::new(dim_text(detail)).truncate(true),
+                    );
+                });
+        },
+    );
 }
 
-fn show_command_line(ui: &mut egui::Ui, cswap: Option<&Result<Value, String>>) {
-    section_frame(ui, "NO COMANDO", |ui| {
+fn show_command_line(ui: &mut egui::Ui, content_width: f32, cswap: Option<&Result<Value, String>>) {
+    section_frame(ui, "NO COMANDO", content_width, |ui, content_width| {
         let value = match cswap {
             None => {
-                dim_label(ui, "carregando…");
+                dim_label(ui, content_width, "carregando…");
                 return;
             }
             Some(Err(error)) => {
-                error_label(ui, error);
+                error_label(ui, content_width, error);
                 return;
             }
             Some(Ok(value)) => value,
@@ -1401,20 +1456,25 @@ fn show_command_line(ui: &mut egui::Ui, cswap: Option<&Result<Value, String>>) {
             .unwrap_or("conta não identificada");
         data_label(
             ui,
+            content_width,
             format!("Claude Code · {account} · modelo não disponível"),
         );
     });
 }
 
-fn show_running_jobs(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
-    section_frame(ui, "RODANDO AGORA", |ui| {
+fn show_running_jobs(
+    ui: &mut egui::Ui,
+    content_width: f32,
+    status: Option<&Result<Value, String>>,
+) {
+    section_frame(ui, "RODANDO AGORA", content_width, |ui, content_width| {
         let value = match status {
             None => {
-                dim_label(ui, "carregando…");
+                dim_label(ui, content_width, "carregando…");
                 return;
             }
             Some(Err(error)) => {
-                error_label(ui, error);
+                error_label(ui, content_width, error);
                 return;
             }
             Some(Ok(value)) => value,
@@ -1422,26 +1482,53 @@ fn show_running_jobs(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) 
 
         let jobs = value.get("jobs").and_then(Value::as_array);
         if jobs.is_none_or(Vec::is_empty) {
-            dim_label(ui, "nenhuma delegação em andamento");
+            dim_label(ui, content_width, "nenhuma delegação em andamento");
             return;
         }
         if let Some(jobs) = jobs {
-            for job in jobs {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [70.0, 20.0],
-                        egui::Label::new(data_text(string_field(job, "modelo"))).truncate(true),
-                    );
-                    ui.add_sized(
-                        [130.0, 20.0],
-                        egui::Label::new(data_text(string_field(job, "projeto"))).truncate(true),
-                    );
-                    ui.add_sized(
-                        [44.0, 20.0],
-                        egui::Label::new(data_text(format_duration(number_field(job, "segundos")))),
-                    );
+            let gaps = ui.spacing().item_spacing.x * 3.0;
+            let widths = column_widths(
+                content_width - 84.0 - gaps,
+                gaps,
+                &[(70.0, 100.0), (130.0, 320.0), (44.0, 60.0)],
+            );
+            for (index, job) in jobs.iter().enumerate() {
+                if let Some(widths) = widths.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [widths[0], 20.0],
+                            egui::Label::new(data_text(string_field(job, "modelo"))).truncate(true),
+                        );
+                        ui.add_sized(
+                            [widths[1], 20.0],
+                            egui::Label::new(data_text(string_field(job, "projeto")))
+                                .truncate(true),
+                        );
+                        ui.add_sized(
+                            [widths[2], 20.0],
+                            egui::Label::new(data_text(format_duration(number_field(
+                                job, "segundos",
+                            )))),
+                        );
+                        loading_blocks(ui);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(data_text(string_field(job, "modelo")));
+                        ui.add_space(8.0);
+                        ui.label(data_text(format_duration(number_field(job, "segundos"))));
+                    });
+                    ui.scope(|ui| {
+                        ui.set_max_width(content_width);
+                        ui.add(
+                            egui::Label::new(data_text(string_field(job, "projeto"))).wrap(true),
+                        );
+                    });
                     loading_blocks(ui);
-                });
+                }
+                if index + 1 < jobs.len() {
+                    stacked_divider(ui);
+                }
             }
         }
     });
@@ -1449,19 +1536,20 @@ fn show_running_jobs(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) 
 
 fn show_claude(
     ui: &mut egui::Ui,
+    content_width: f32,
     cswap: Option<&Result<Value, String>>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
 ) {
-    section_frame(ui, "CLAUDE", |ui| {
+    section_frame(ui, "CLAUDE", content_width, |ui, content_width| {
         let value = match cswap {
             None => {
-                dim_label(ui, "carregando…");
+                dim_label(ui, content_width, "carregando…");
                 return;
             }
             Some(Err(error)) => {
-                error_label(ui, error);
+                error_label(ui, content_width, error);
                 return;
             }
             Some(Ok(value)) => value,
@@ -1469,28 +1557,34 @@ fn show_claude(
         let accounts = match value.get("accounts").and_then(Value::as_array) {
             Some(accounts) => accounts,
             None => {
-                error_label(ui, "cswap: JSON sem accounts[]");
+                error_label(ui, content_width, "cswap: JSON sem accounts[]");
                 return;
             }
         };
 
-        let (account_width, quota_width) = claude_column_widths(ui.available_width());
-        egui::Grid::new("claude_accounts")
-            .num_columns(3)
-            .min_col_width(0.0)
-            .min_row_height(20.0)
-            .spacing(egui::vec2(10.0, 8.0))
-            .show(ui, |ui| {
+        let cols = [
+            (MIN_CLAUDE_ACCOUNT_WIDTH, CLAUDE_ACCOUNT_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, CLAUDE_QUOTA_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, CLAUDE_QUOTA_WIDTH),
+        ];
+        match column_widths(content_width, CLAUDE_GRID_GAPS, &cols) {
+            Some(widths) => {
+                egui::Grid::new("claude_accounts")
+                    .num_columns(3)
+                    .min_col_width(0.0)
+                    .min_row_height(20.0)
+                    .spacing(egui::vec2(10.0, 8.0))
+                    .show(ui, |ui| {
                 ui.add_sized(
-                    [account_width, 20.0],
+                    [widths[0], 20.0],
                     egui::Label::new(pixel_text("conta", 10.0)),
                 );
                 ui.add_sized(
-                    [quota_width, 20.0],
+                    [widths[1], 20.0],
                     egui::Label::new(pixel_text("5h", 10.0)),
                 );
                 ui.add_sized(
-                    [quota_width, 20.0],
+                    [widths[2], 20.0],
                     egui::Label::new(pixel_text("7d", 10.0)),
                 );
                 ui.end_row();
@@ -1531,7 +1625,7 @@ fn show_claude(
                         .then(|| pokemon.info("claude", email).map(|info| info.name))
                         .flatten();
                     ui.allocate_ui_with_layout(
-                        egui::vec2(account_width, 40.0),
+                        egui::vec2(widths[0], 40.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             if let Some(texture) = texture.as_ref() {
@@ -1546,11 +1640,19 @@ fn show_claude(
                                 // deslizava para a esquerda em relacao as outras.
                                 ui.add_space(ACCOUNT_SPRITE_SIZE);
                             }
-                            let cursor = if active { "▶" } else { " " };
-                            ui.label(
-                                egui::RichText::new(cursor).font(egui::FontId::monospace(13.0)),
+                            let cursor = if active { "●" } else { " " };
+                            let cursor_response = ui.add_sized(
+                                [ACCOUNT_CURSOR_WIDTH, 20.0],
+                                egui::Label::new(
+                                    egui::RichText::new(cursor)
+                                        .color(hp_ok())
+                                        .font(egui::FontId::monospace(13.0)),
+                                ),
                             );
-                            let info_width = (account_width
+                            if active {
+                                cursor_response.on_hover_text("conta no comando");
+                            }
+                            let info_width = (widths[0]
                                 - ACCOUNT_SPRITE_SIZE
                                 - ACCOUNT_CURSOR_WIDTH
                                 - ui.spacing().item_spacing.x * 2.0)
@@ -1584,10 +1686,15 @@ fn show_claude(
                                         } else {
                                             0.0
                                         };
+                                        let ativa_width = if active {
+                                            text_width("ativa") + ui.spacing().item_spacing.x
+                                        } else {
+                                            0.0
+                                        };
                                         if let Some(species) = species.as_deref() {
                                             ui.add_sized(
                                                 [
-                                                    (info_width - marca_width - usar_width)
+                                                    (info_width - marca_width - ativa_width - usar_width)
                                                         .max(0.0),
                                                     20.0,
                                                 ],
@@ -1601,13 +1708,18 @@ fn show_claude(
                                                 egui::Label::new(dim_text(texto)).truncate(true),
                                             );
                                         }
+                                        if active {
+                                            ui.add_sized(
+                                                [text_width("ativa"), 20.0],
+                                                egui::Label::new(dim_text("ativa")).truncate(true),
+                                            );
+                                        }
                                         if can_use {
                                             if let Some(number) = number {
                                                 if ui
-                                                    .add_sized(
-                                                        [text_width("usar"), 20.0],
-                                                        egui::Button::new(pixel_text("usar", 9.0)),
-                                                    )
+                                                    .add(egui::Button::new(pixel_text("usar", 9.0)))
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                    .on_hover_text("trocar o Claude Code para esta conta agora")
                                                     .clicked()
                                                 {
                                                     thread::spawn(move || {
@@ -1634,7 +1746,7 @@ fn show_claude(
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        egui::vec2(quota_width, 20.0),
+                        egui::vec2(widths[1], 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             usage_bar_aged(
@@ -1647,7 +1759,7 @@ fn show_claude(
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        egui::vec2(quota_width, 20.0),
+                        egui::vec2(widths[2], 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             usage_bar_aged(
@@ -1661,17 +1773,363 @@ fn show_claude(
                     );
                     ui.end_row();
                 }
-            });
+                    });
+            }
+            None => {
+                for (index, account) in accounts.iter().enumerate() {
+                    render_claude_account_stacked(
+                        ui,
+                        account,
+                        content_width,
+                        pokemon,
+                        context,
+                        poke_mode,
+                    );
+                    if index + 1 < accounts.len() {
+                        stacked_divider(ui);
+                    }
+                }
+            }
+        }
     });
 }
 
-fn claude_column_widths(available_width: f32) -> (f32, f32) {
-    let minimum = MIN_CLAUDE_ACCOUNT_WIDTH + CLAUDE_GRID_GAPS + MIN_CLAUDE_QUOTA_WIDTH * 2.0;
-    let scale = ((available_width - minimum) / (CLAUDE_CONTENT_WIDTH - minimum)).clamp(0.0, 1.0);
-    (
-        MIN_CLAUDE_ACCOUNT_WIDTH + (CLAUDE_ACCOUNT_WIDTH - MIN_CLAUDE_ACCOUNT_WIDTH) * scale,
-        MIN_CLAUDE_QUOTA_WIDTH + (CLAUDE_QUOTA_WIDTH - MIN_CLAUDE_QUOTA_WIDTH) * scale,
-    )
+/// Reparte `available` entre colunas descritas como (minimo, ideal).
+/// None = nao cabe nem no minimo -> o chamador empilha em blocos.
+fn column_widths(available: f32, gaps: f32, cols: &[(f32, f32)]) -> Option<Vec<f32>> {
+    let min: f32 = cols.iter().map(|(m, _)| m).sum();
+    let ideal: f32 = cols.iter().map(|(_, i)| i).sum();
+    if available < min + gaps {
+        return None;
+    }
+    let scale = ((available - gaps - min) / (ideal - min)).clamp(0.0, 1.0);
+    Some(cols.iter().map(|(m, i)| m + (i - m) * scale).collect())
+}
+
+fn stacked_divider(ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [rect.left_center(), rect.right_center()],
+        egui::Stroke::new(1.0_f32, border()),
+    );
+}
+
+fn render_claude_account_stacked(
+    ui: &mut egui::Ui,
+    account: &Value,
+    content_width: f32,
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
+) {
+    let five_hour = usage_percent(account, "fiveHour");
+    let seven_day = usage_percent(account, "sevenDay");
+    let cache_age = usage_age(account);
+    let five_hour_countdown = usage_text(account, "fiveHour", "countdown");
+    let seven_day_countdown = usage_text(account, "sevenDay", "countdown");
+    let five_hour_clock = usage_clock(account, "fiveHour");
+    let seven_day_clock = usage_clock(account, "sevenDay");
+    let active = account
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let disabled = account
+        .get("disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let number = account.get("number").and_then(Value::as_i64);
+    let precisa_relogin = account
+        .get("usageStatus")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status == "relogin_required");
+    let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+    let fainted = [five_hour, seven_day]
+        .into_iter()
+        .flatten()
+        .any(|percent| percent >= 100.0);
+    let texture = poke_mode
+        .then(|| pokemon.texture(context, "claude", email, fainted).cloned())
+        .flatten();
+    let species = poke_mode
+        .then(|| pokemon.info("claude", email).map(|info| info.name))
+        .flatten();
+    let width = content_width;
+
+    ui.horizontal(|ui| {
+        if poke_mode {
+            if let Some(texture) = texture.as_ref() {
+                ui.add(
+                    egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
+                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                        .texture_options(egui::TextureOptions::NEAREST),
+                );
+            } else {
+                ui.add_space(ACCOUNT_SPRITE_SIZE);
+            }
+        }
+        let cursor = if active { "●" } else { " " };
+        let cursor_response = ui.add_sized(
+            [ACCOUNT_CURSOR_WIDTH, 20.0],
+            egui::Label::new(
+                egui::RichText::new(cursor)
+                    .color(hp_ok())
+                    .font(egui::FontId::monospace(13.0)),
+            ),
+        );
+        if active {
+            cursor_response.on_hover_text("conta no comando");
+        }
+        let reserved = if poke_mode { ACCOUNT_SPRITE_SIZE } else { 0.0 }
+            + ACCOUNT_CURSOR_WIDTH
+            + ui.spacing().item_spacing.x * 2.0;
+        ui.scope(|ui| {
+            ui.set_max_width((width - reserved).max(0.0));
+            ui.add(egui::Label::new(data_text(email)).wrap(true))
+                .on_hover_text(string_field(account, "usageStatus"));
+        });
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        if let Some(species) = species.as_deref() {
+            ui.label(pixel_text(species, 10.0));
+        }
+        if precisa_relogin {
+            ui.label(dim_text("relogar"));
+        } else if disabled {
+            ui.label(dim_text("desabilitada"));
+        }
+        if active {
+            ui.label(dim_text("ativa"));
+        }
+        if !active && !disabled {
+            if let Some(number) = number {
+                if ui
+                    .add(egui::Button::new(pixel_text("usar", 9.0)))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("trocar o Claude Code para esta conta agora")
+                    .clicked()
+                {
+                    thread::spawn(move || {
+                        let Some(executable) = cswap_executable() else {
+                            return;
+                        };
+                        if let Err(error) = Command::new(executable)
+                            .arg("switch")
+                            .arg(number.to_string())
+                            .output()
+                        {
+                            eprintln!("cswap switch {number}: {error}");
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("5h", 10.0)));
+        usage_bar_aged(
+            ui,
+            five_hour,
+            five_hour_countdown,
+            five_hour_clock,
+            cache_age.as_deref(),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("7d", 10.0)));
+        usage_bar_aged(
+            ui,
+            seven_day,
+            seven_day_countdown,
+            seven_day_clock,
+            cache_age.as_deref(),
+        );
+    });
+}
+
+fn render_codex_account_stacked(
+    ui: &mut egui::Ui,
+    account: &Value,
+    content_width: f32,
+    last_used_profile: Option<&str>,
+    active_profile: Option<&str>,
+    profile_settings: &[(String, Option<String>, Option<String>)],
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
+) {
+    let email = account.get("email").and_then(Value::as_str).unwrap_or("");
+    let precisa_relogin = account
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status != "ok");
+    let last_used = last_used_profile
+        .is_some_and(|profile| account.get("perfil").and_then(Value::as_str) == Some(profile));
+    let ativa = active_profile
+        .is_some_and(|profile| account.get("perfil").and_then(Value::as_str) == Some(profile));
+    let pode_usar = !ativa && account.get("status").and_then(Value::as_str) == Some("ok");
+    let info = pokemon.info("codex", email);
+    let texture = poke_mode
+        .then(|| pokemon.texture(context, "codex", email, false).cloned())
+        .flatten();
+    let species = poke_mode
+        .then(|| info.as_ref().map(|info| info.name.clone()))
+        .flatten();
+    let primeira = quota_percent_at(account, 0);
+    let segunda = quota_percent_at(account, 1);
+    let primeira_countdown = quota_countdown_at(account, 0);
+    let segunda_countdown = quota_countdown_at(account, 1);
+    let primeira_clock = quota_clock_at(account, 0);
+    let segunda_clock = quota_clock_at(account, 1);
+    let primeira_age = quota_window_at(account, 0).map(window_label);
+    let segunda_age = quota_window_at(account, 1).map(window_label);
+    let plan = account
+        .get("plano")
+        .and_then(Value::as_str)
+        .or_else(|| info.as_ref().and_then(|info| info.plan.as_deref()))
+        .unwrap_or("ausente");
+    let settings = account
+        .get("perfil")
+        .and_then(Value::as_str)
+        .and_then(|profile| {
+            profile_settings
+                .iter()
+                .find(|(known_profile, _, _)| known_profile == profile)
+        });
+    let model = settings.and_then(|(_, model, _)| model.as_deref());
+    let effort = settings.and_then(|(_, _, effort)| effort.as_deref());
+    let width = content_width;
+
+    ui.horizontal(|ui| {
+        if poke_mode {
+            if let Some(texture) = texture.as_ref() {
+                ui.add(
+                    egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
+                        .fit_to_exact_size(egui::vec2(40.0, 40.0))
+                        .texture_options(egui::TextureOptions::NEAREST),
+                );
+            } else {
+                ui.add_space(ACCOUNT_SPRITE_SIZE);
+            }
+        }
+        let marker = if ativa { "●" } else { " " };
+        let marker_response = ui.add_sized(
+            [ACCOUNT_CURSOR_WIDTH, 20.0],
+            egui::Label::new(data_text(marker).color(hp_ok())),
+        );
+        if ativa {
+            marker_response.on_hover_text("conta no comando");
+        }
+        let reserved = if poke_mode { ACCOUNT_SPRITE_SIZE } else { 0.0 }
+            + ACCOUNT_CURSOR_WIDTH
+            + ui.spacing().item_spacing.x * 2.0;
+        ui.scope(|ui| {
+            ui.set_max_width((width - reserved).max(0.0));
+            ui.add(egui::Label::new(data_text(email)).wrap(true));
+        });
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        if let Some(species) = species.as_deref() {
+            ui.label(pixel_text(species, 10.0));
+        }
+        if last_used {
+            ui.label(dim_text("· última usada"));
+        }
+        if precisa_relogin {
+            ui.label(dim_text("relogar"));
+        }
+        if ativa {
+            ui.label(dim_text("ativa"));
+        }
+        ui.label(data_text(plan));
+        if let Some(profile) = account.get("perfil").and_then(Value::as_str) {
+            if let Some(model) = model {
+                let next = next_model(model);
+                if ui
+                    .add(egui::Button::new(data_text(model)))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!("clique para trocar o modelo · próximo: {next}"))
+                    .clicked()
+                {
+                    let next = next.to_owned();
+                    let next_effort = (effort == Some("ultra") && next != "gpt-5.6-sol")
+                        .then(|| "high".to_owned());
+                    write_config_scalars(
+                        profile.to_owned(),
+                        Some(next),
+                        next_effort.or_else(|| effort.map(str::to_owned)),
+                    );
+                }
+            } else {
+                ui.label(data_text("—"));
+            }
+            if let (Some(effort), Some(model)) = (effort, model) {
+                let next = next_effort(effort, model);
+                if ui
+                    .add(egui::Button::new(data_text(effort)))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(format!("clique para trocar o effort · próximo: {next}"))
+                    .clicked()
+                {
+                    write_config_scalars(profile.to_owned(), None, Some(next.to_owned()));
+                }
+            } else {
+                ui.label(data_text("—"));
+            }
+        } else {
+            ui.label(data_text("—"));
+            ui.label(data_text("—"));
+        }
+        if pode_usar {
+            if let Some(perfil) = account.get("perfil").and_then(Value::as_str) {
+                if ui
+                    .add(egui::Button::new(pixel_text("usar", 9.0)))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("usar este perfil do Codex · vale só para novos terminais")
+                    .clicked()
+                {
+                    let perfil = perfil.to_owned();
+                    thread::spawn(move || {
+                        let Some(home) = home_directory() else {
+                            eprintln!("setx CODEX_HOME: diretorio home nao encontrado");
+                            return;
+                        };
+                        let path = home.join(perfil);
+                        if let Err(error) =
+                            Command::new("setx").arg("CODEX_HOME").arg(&path).output()
+                        {
+                            eprintln!("setx CODEX_HOME {}: {error}", path.display());
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.add_sized([42.0, 20.0], egui::Label::new(pixel_text("cota", 10.0)));
+        usage_bar_aged(
+            ui,
+            primeira,
+            primeira_countdown,
+            primeira_clock,
+            primeira_age.as_deref(),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([42.0, 20.0], egui::Label::new(pixel_text("cota", 10.0)));
+        usage_bar_aged(
+            ui,
+            segunda,
+            segunda_countdown,
+            segunda_clock,
+            segunda_age.as_deref(),
+        );
+    });
 }
 
 fn render_codex_accounts(
@@ -1683,11 +2141,34 @@ fn render_codex_accounts(
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
+    content_width: f32,
+    widths: Option<&[f32]>,
 ) {
     if accounts.is_empty() {
-        dim_label(ui, "contas Codex ausentes");
+        dim_label(ui, content_width, "contas Codex ausentes");
         return;
     }
+
+    if widths.is_none() {
+        for (index, account) in accounts.iter().enumerate() {
+            render_codex_account_stacked(
+                ui,
+                account,
+                content_width,
+                last_used_profile,
+                active_profile,
+                profile_settings,
+                pokemon,
+                context,
+                poke_mode,
+            );
+            if index + 1 < accounts.len() {
+                stacked_divider(ui);
+            }
+        }
+        return;
+    }
+    let widths = widths.expect("larguras do grid do Codex");
 
     egui::Grid::new("codex_accounts")
         .num_columns(6)
@@ -1696,27 +2177,27 @@ fn render_codex_accounts(
         .spacing(egui::vec2(10.0, 8.0))
         .show(ui, |ui| {
             ui.add_sized(
-                [CODEX_ACCOUNT_WIDTH, 20.0],
+                [widths[0], 20.0],
                 egui::Label::new(pixel_text("conta", 10.0)),
             );
             ui.add_sized(
-                [CODEX_PLAN_WIDTH, 20.0],
+                [widths[1], 20.0],
                 egui::Label::new(pixel_text("plano", 10.0)),
             );
             ui.add_sized(
-                [CODEX_MODEL_WIDTH, 20.0],
+                [widths[2], 20.0],
                 egui::Label::new(pixel_text("modelo", 10.0)),
             );
             ui.add_sized(
-                [CODEX_EFFORT_WIDTH, 20.0],
+                [widths[3], 20.0],
                 egui::Label::new(pixel_text("effort", 10.0)),
             );
             ui.add_sized(
-                [CODEX_QUOTA_WIDTH, 20.0],
+                [widths[4], 20.0],
                 egui::Label::new(pixel_text("cota", 10.0)),
             );
             ui.add_sized(
-                [CODEX_QUOTA_WIDTH, 20.0],
+                [widths[5], 20.0],
                 egui::Label::new(pixel_text("cota", 10.0)),
             );
             ui.end_row();
@@ -1766,7 +2247,7 @@ fn render_codex_accounts(
                 let model = settings.and_then(|(_, model, _)| model.as_deref());
                 let effort = settings.and_then(|(_, _, effort)| effort.as_deref());
                 ui.allocate_ui_with_layout(
-                    egui::vec2(CODEX_ACCOUNT_WIDTH, 40.0),
+                    egui::vec2(widths[0], 40.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         if let Some(texture) = texture.as_ref() {
@@ -1779,7 +2260,7 @@ fn render_codex_accounts(
                             ui.add_space(ACCOUNT_SPRITE_SIZE);
                         }
                         ui.label(egui::RichText::new(" ").font(egui::FontId::monospace(13.0)));
-                        let info_width = (CODEX_ACCOUNT_WIDTH
+                        let info_width = (widths[0]
                             - ACCOUNT_SPRITE_SIZE
                             - ACCOUNT_CURSOR_WIDTH
                             - ui.spacing().item_spacing.x * 2.0)
@@ -1846,10 +2327,9 @@ fn render_codex_accounts(
                                     if pode_usar {
                                         if let Some(perfil) = account.get("perfil").and_then(Value::as_str) {
                                             if ui
-                                                .add_sized(
-                                                    [text_width("usar"), 20.0],
-                                                    egui::Button::new(pixel_text("usar", 9.0)),
-                                                )
+                                                .add(egui::Button::new(pixel_text("usar", 9.0)))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("usar este perfil do Codex · vale só para novos terminais")
                                                 .clicked()
                                             {
                                                 let perfil = perfil.to_owned();
@@ -1879,20 +2359,23 @@ fn render_codex_accounts(
                     },
                 );
                 ui.add_sized(
-                    [CODEX_PLAN_WIDTH, 40.0],
+                    [widths[1], 40.0],
                     egui::Label::new(data_text(plan)).truncate(true),
                 );
                 if let Some(profile) = account.get("perfil").and_then(Value::as_str) {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(CODEX_MODEL_WIDTH, 40.0),
+                        egui::vec2(widths[2], 24.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                         if let Some(model) = model {
+                            let next = next_model(model);
                             if ui
-                                .add_sized([CODEX_MODEL_WIDTH, 40.0], egui::Button::new(data_text(model)))
+                                .add(egui::Button::new(data_text(model)))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("clique para trocar o modelo · próximo: {next}"))
                                 .clicked()
                             {
-                                let next = next_model(model).to_owned();
+                                let next = next.to_owned();
                                 let next_effort = (effort == Some("ultra") && next != "gpt-5.6-sol")
                                     .then(|| "high".to_owned());
                                 write_config_scalars(
@@ -1906,18 +2389,21 @@ fn render_codex_accounts(
                         }
                     });
                     ui.allocate_ui_with_layout(
-                        egui::vec2(CODEX_EFFORT_WIDTH, 40.0),
+                        egui::vec2(widths[3], 24.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                         if let (Some(effort), Some(model)) = (effort, model) {
+                            let next = next_effort(effort, model);
                             if ui
-                                .add_sized([CODEX_EFFORT_WIDTH, 40.0], egui::Button::new(data_text(effort)))
+                                .add(egui::Button::new(data_text(effort)))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(format!("clique para trocar o effort · próximo: {next}"))
                                 .clicked()
                             {
                                 write_config_scalars(
                                     profile.to_owned(),
                                     None,
-                                    Some(next_effort(effort, model).to_owned()),
+                                    Some(next.to_owned()),
                                 );
                             }
                         } else {
@@ -1925,11 +2411,11 @@ fn render_codex_accounts(
                         }
                     });
                 } else {
-                    ui.add_sized([CODEX_MODEL_WIDTH, 40.0], egui::Label::new(data_text("—")));
-                    ui.add_sized([CODEX_EFFORT_WIDTH, 40.0], egui::Label::new(data_text("—")));
+                    ui.add_sized([widths[2], 24.0], egui::Label::new(data_text("—")));
+                    ui.add_sized([widths[3], 24.0], egui::Label::new(data_text("—")));
                 }
                 ui.allocate_ui_with_layout(
-                    egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
+                    egui::vec2(widths[4], 20.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         usage_bar_aged(
@@ -1942,7 +2428,7 @@ fn render_codex_accounts(
                     },
                 );
                 ui.allocate_ui_with_layout(
-                    egui::vec2(CODEX_QUOTA_WIDTH, 20.0),
+                    egui::vec2(widths[5], 20.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         usage_bar_aged(
@@ -1961,6 +2447,7 @@ fn render_codex_accounts(
 
 fn show_codex(
     ui: &mut egui::Ui,
+    content_width: f32,
     status: Option<&Result<Value, String>>,
     last_used_profile: Option<&str>,
     active_profile: Option<&str>,
@@ -1969,26 +2456,35 @@ fn show_codex(
     context: &egui::Context,
     poke_mode: bool,
 ) {
-    section_frame(ui, "CODEX", |ui| {
+    section_frame(ui, "CODEX", content_width, |ui, content_width| {
         let value = match status {
             None => {
-                dim_label(ui, "carregando…");
+                dim_label(ui, content_width, "carregando…");
                 return;
             }
             Some(Err(error)) => {
-                error_label(ui, error);
+                error_label(ui, content_width, error);
                 return;
             }
             Some(Ok(value)) => value,
         };
         let Some(codex) = value.get("codex") else {
-            error_label(ui, "status.py: JSON sem codex");
+            error_label(ui, content_width, "status.py: JSON sem codex");
             return;
         };
         let Some(accounts) = codex.get("contas").and_then(Value::as_array) else {
-            error_label(ui, "status.py: JSON sem codex.contas[]");
+            error_label(ui, content_width, "status.py: JSON sem codex.contas[]");
             return;
         };
+        let cols = [
+            (200.0, CODEX_ACCOUNT_WIDTH),
+            (90.0, CODEX_PLAN_WIDTH),
+            (110.0, CODEX_MODEL_WIDTH),
+            (70.0, CODEX_EFFORT_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, CODEX_QUOTA_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, CODEX_QUOTA_WIDTH),
+        ];
+        let widths = column_widths(content_width, CODEX_GRID_GAPS, &cols);
         render_codex_accounts(
             ui,
             accounts,
@@ -1998,12 +2494,60 @@ fn show_codex(
             pokemon,
             context,
             poke_mode,
+            content_width,
+            widths.as_deref(),
         );
     });
 }
 
-fn show_opencodex(ui: &mut egui::Ui, snapshot: &OpenCodexSnapshot) {
-    section_frame(ui, "OPENCODEX", |ui| {
+fn render_opencodex_account_stacked(
+    ui: &mut egui::Ui,
+    account: &OpenCodexAccount,
+    content_width: f32,
+) {
+    let width = content_width;
+    ui.horizontal(|ui| {
+        let marker = if account.active { "●" } else { " " };
+        let marker_response = ui.add_sized(
+            [ACCOUNT_CURSOR_WIDTH, 20.0],
+            egui::Label::new(data_text(marker).color(hp_ok())),
+        );
+        if account.active {
+            marker_response.on_hover_text("conta no comando");
+        }
+        ui.scope(|ui| {
+            ui.set_max_width((width - ACCOUNT_CURSOR_WIDTH - ui.spacing().item_spacing.x).max(0.0));
+            ui.add(egui::Label::new(data_text(&account.id)).wrap(true));
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("5h", 10.0)));
+        let short_countdown = account.short_reset_at.and_then(format_reset_countdown);
+        let short_clock = account.short_reset_at.and_then(format_reset_clock);
+        usage_bar_aged(
+            ui,
+            account.short_percent,
+            short_countdown,
+            short_clock,
+            None,
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("7d", 10.0)));
+        let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
+        let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
+        usage_bar_aged(
+            ui,
+            account.weekly_percent,
+            weekly_countdown,
+            weekly_clock,
+            None,
+        );
+    });
+}
+
+fn show_opencodex(ui: &mut egui::Ui, content_width: f32, snapshot: &OpenCodexSnapshot) {
+    section_frame(ui, "OPENCODEX", content_width, |ui, content_width| {
         ui.horizontal_wrapped(|ui| {
             ui.label(pixel_text("provedor", 10.0));
             ui.label(data_text(
@@ -2023,101 +2567,119 @@ fn show_opencodex(ui: &mut egui::Ui, snapshot: &OpenCodexSnapshot) {
         });
         ui.add_space(10.0);
         if snapshot.accounts.is_empty() {
-            dim_label(ui, "contas de cota ausentes");
+            dim_label(ui, content_width, "contas de cota ausentes");
             return;
         }
 
-        egui::Grid::new("opencodex_accounts")
-            .num_columns(3)
-            .min_col_width(0.0)
-            .min_row_height(20.0)
-            .spacing(egui::vec2(10.0, 8.0))
-            .show(ui, |ui| {
-                ui.add_sized(
-                    [OPENCODEX_ACCOUNT_WIDTH, 20.0],
-                    egui::Label::new(pixel_text("conta", 10.0)),
-                );
-                ui.add_sized(
-                    [OPENCODEX_QUOTA_WIDTH, 20.0],
-                    egui::Label::new(pixel_text("5h", 10.0)),
-                );
-                ui.add_sized(
-                    [OPENCODEX_QUOTA_WIDTH, 20.0],
-                    egui::Label::new(pixel_text("7d", 10.0)),
-                );
-                ui.end_row();
+        let cols = [
+            (240.0, OPENCODEX_ACCOUNT_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, OPENCODEX_QUOTA_WIDTH),
+            (MIN_CLAUDE_QUOTA_WIDTH, OPENCODEX_QUOTA_WIDTH),
+        ];
+        match column_widths(content_width, OPENCODEX_GRID_GAPS, &cols) {
+            Some(widths) => {
+                egui::Grid::new("opencodex_accounts")
+                    .num_columns(3)
+                    .min_col_width(0.0)
+                    .min_row_height(20.0)
+                    .spacing(egui::vec2(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.add_sized(
+                            [widths[0], 20.0],
+                            egui::Label::new(pixel_text("conta", 10.0)),
+                        );
+                        ui.add_sized([widths[1], 20.0], egui::Label::new(pixel_text("5h", 10.0)));
+                        ui.add_sized([widths[2], 20.0], egui::Label::new(pixel_text("7d", 10.0)));
+                        ui.end_row();
 
-                for account in &snapshot.accounts {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(OPENCODEX_ACCOUNT_WIDTH, 40.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            let marker = if account.active { "▶" } else { " " };
-                            let marker_response = ui.label(data_text(marker));
-                            if account.active {
-                                marker_response.on_hover_text("conta no comando");
-                            }
-                            let info_width = (OPENCODEX_ACCOUNT_WIDTH
-                                - ACCOUNT_CURSOR_WIDTH
-                                - ui.spacing().item_spacing.x)
-                                .max(0.0);
-                            ui.add_sized(
-                                [info_width, 20.0],
-                                egui::Label::new(data_text(&account.id)).truncate(true),
+                        for account in &snapshot.accounts {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(widths[0], 40.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let marker = if account.active { "●" } else { " " };
+                                    let marker_response = ui.add_sized(
+                                        [ACCOUNT_CURSOR_WIDTH, 20.0],
+                                        egui::Label::new(data_text(marker).color(hp_ok())),
+                                    );
+                                    if account.active {
+                                        marker_response.on_hover_text("conta no comando");
+                                    }
+                                    let info_width = (widths[0]
+                                        - ACCOUNT_CURSOR_WIDTH
+                                        - ui.spacing().item_spacing.x)
+                                        .max(0.0);
+                                    ui.add_sized(
+                                        [info_width, 20.0],
+                                        egui::Label::new(data_text(&account.id)).truncate(true),
+                                    );
+                                },
                             );
-                        },
-                    );
-                    let short_countdown = account.short_reset_at.and_then(format_reset_countdown);
-                    let short_clock = account.short_reset_at.and_then(format_reset_clock);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            usage_bar_aged(
-                                ui,
-                                account.short_percent,
-                                short_countdown,
-                                short_clock,
-                                None,
-                            )
-                        },
-                    );
-                    let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
-                    let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(OPENCODEX_QUOTA_WIDTH, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            usage_bar_aged(
-                                ui,
-                                account.weekly_percent,
-                                weekly_countdown,
-                                weekly_clock,
-                                None,
-                            )
-                        },
-                    );
-                    ui.end_row();
+                            let short_countdown =
+                                account.short_reset_at.and_then(format_reset_countdown);
+                            let short_clock = account.short_reset_at.and_then(format_reset_clock);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(widths[1], 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    usage_bar_aged(
+                                        ui,
+                                        account.short_percent,
+                                        short_countdown,
+                                        short_clock,
+                                        None,
+                                    )
+                                },
+                            );
+                            let weekly_countdown =
+                                account.weekly_reset_at.and_then(format_reset_countdown);
+                            let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(widths[2], 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    usage_bar_aged(
+                                        ui,
+                                        account.weekly_percent,
+                                        weekly_countdown,
+                                        weekly_clock,
+                                        None,
+                                    )
+                                },
+                            );
+                            ui.end_row();
+                        }
+                    });
+            }
+            None => {
+                for (index, account) in snapshot.accounts.iter().enumerate() {
+                    render_opencodex_account_stacked(ui, account, content_width);
+                    if index + 1 < snapshot.accounts.len() {
+                        stacked_divider(ui);
+                    }
                 }
-            });
+            }
+        }
     });
 }
 
-fn show_free_tier(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
-    section_frame(ui, "FREE TIER", |ui| {
+fn show_free_tier(ui: &mut egui::Ui, content_width: f32, status: Option<&Result<Value, String>>) {
+    section_frame(ui, "FREE TIER", content_width, |ui, content_width| {
         match status {
-            None => dim_label(ui, "carregando…"),
-            Some(Err(error)) => error_label(ui, error),
+            None => dim_label(ui, content_width, "carregando…"),
+            Some(Err(error)) => error_label(ui, content_width, error),
             Some(Ok(value)) => {
                 let free = value.get("free_tier");
                 metric_row(
                     ui,
+                    content_width,
                     "nvidia",
                     nested_display(free, &["nvidia", "usadas"]),
                     nested_display(free, &["nvidia", "limite"]),
                 );
                 metric_row(
                     ui,
+                    content_width,
                     "gemini",
                     nested_display(free, &["gemini", "usadas"]),
                     nested_display(free, &["gemini", "limite"]),
@@ -2127,11 +2689,11 @@ fn show_free_tier(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
     });
 }
 
-fn show_context(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
-    section_frame(ui, "CONTEXTO", |ui| {
+fn show_context(ui: &mut egui::Ui, content_width: f32, status: Option<&Result<Value, String>>) {
+    section_frame(ui, "CONTEXTO", content_width, |ui, content_width| {
         match status {
-            None => dim_label(ui, "carregando…"),
-            Some(Err(error)) => error_label(ui, error),
+            None => dim_label(ui, content_width, "carregando…"),
+            Some(Err(error)) => error_label(ui, content_width, error),
             Some(Ok(value)) => {
                 ui.horizontal(|ui| {
                     ui.label(pixel_text("tokens", 10.0));
@@ -2144,33 +2706,45 @@ fn show_context(ui: &mut egui::Ui, status: Option<&Result<Value, String>>) {
                         .and_then(|codex| quota_window_at(codex, 0))
                         .map(|window| format!("{tokens} · {}", window_label(window)))
                         .unwrap_or(tokens);
-                    data_label(ui, text);
+                    let value_width = (content_width
+                        - text_width("tokens")
+                        - 8.0
+                        - ui.spacing().item_spacing.x * 2.0)
+                        .max(0.0);
+                    data_label(ui, value_width, text);
                 });
             }
         };
     });
 }
 
-fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+fn section_frame(
+    ui: &mut egui::Ui,
+    title: &str,
+    content_width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui, f32),
+) {
     egui::Frame::none()
         .fill(panel())
         .stroke(egui::Stroke::new(2.0_f32, border()))
         .rounding(egui::Rounding::same(0.0))
         .inner_margin(egui::Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
+            ui.set_width(content_width);
             ui.add_sized(
-                [ui.available_width(), 16.0],
+                [content_width, 16.0],
                 egui::Label::new(pixel_text(title, 13.0)),
             );
             ui.add_space(10.0);
-            add_contents(ui);
+            add_contents(ui, content_width);
         });
 }
 
-fn metric_row(ui: &mut egui::Ui, label: &str, used: String, limit: String) {
+fn metric_row(ui: &mut egui::Ui, content_width: f32, label: &str, used: String, limit: String) {
+    let value_width = (content_width - 72.0 - ui.spacing().item_spacing.x).max(0.0);
     ui.horizontal(|ui| {
         ui.add_sized([72.0, 20.0], egui::Label::new(pixel_text(label, 10.0)));
-        data_label(ui, format!("{used} / {limit}"));
+        data_label(ui, value_width, format!("{used} / {limit}"));
     });
 }
 
@@ -2196,22 +2770,25 @@ fn dim_text(text: impl Into<String>) -> egui::RichText {
         .color(dim_color())
 }
 
-fn data_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+fn data_label(ui: &mut egui::Ui, width: f32, text: impl Into<String>) -> egui::Response {
     ui.add_sized(
-        [ui.available_width().max(0.0), 20.0],
+        [width.max(0.0), 20.0],
         egui::Label::new(data_text(text)).truncate(true),
     )
 }
 
-fn dim_label(ui: &mut egui::Ui, text: impl Into<String>) {
+fn dim_label(ui: &mut egui::Ui, width: f32, text: impl Into<String>) {
     ui.add_sized(
-        [ui.available_width().max(0.0), 20.0],
+        [width.max(0.0), 20.0],
         egui::Label::new(dim_text(text)).truncate(true),
     );
 }
 
-fn error_label(ui: &mut egui::Ui, error: &str) {
-    dim_label(ui, error);
+fn error_label(ui: &mut egui::Ui, width: f32, error: &str) {
+    ui.add_sized(
+        [width.max(0.0), 20.0],
+        egui::Label::new(egui::RichText::new(error).color(hp_low())).truncate(true),
+    );
 }
 
 /// Igual a usage_bar, mas anexa a idade quando o valor veio de lastGoodUsage.
@@ -2759,7 +3336,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_config_scalar, set_config_scalar};
+    use super::{column_widths, read_config_scalar, set_config_scalar};
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
 
@@ -2783,5 +3360,21 @@ mod tests {
         let inserted = set_config_scalar(SAMPLE, "model_provider", "openai");
         assert!(inserted.starts_with("model_provider = \"openai\"\r\nmodel ="));
         assert!(inserted.ends_with("trust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n"));
+    }
+
+    #[test]
+    fn column_widths_cabem() {
+        let cols = [(2.0_f32, 4.0_f32), (3.0_f32, 6.0_f32)];
+        let gaps = 5.0_f32;
+        let min = 5.0_f32;
+        let ideal = 10.0_f32;
+        let at_min = column_widths(min + gaps, gaps, &cols).expect("cabem no minimo");
+        let at_ideal = column_widths(ideal + gaps, gaps, &cols).expect("cabem no ideal");
+        let intermediate = column_widths(7.5 + gaps, gaps, &cols).expect("cabem no intermediario");
+
+        assert!((at_min.iter().sum::<f32>() - min).abs() < f32::EPSILON);
+        assert!((at_ideal.iter().sum::<f32>() - ideal).abs() < f32::EPSILON);
+        assert!(column_widths(min + gaps - 1.0, gaps, &cols).is_none());
+        assert!(intermediate.iter().sum::<f32>() <= 7.5 + f32::EPSILON);
     }
 }
