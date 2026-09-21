@@ -234,12 +234,28 @@ ambiente que aponta para outra pasta.
 | Claude Code | `CLAUDE_CONFIG_DIR` | `~/.claude` | `.credentials.json` |
 | Codex CLI | `CODEX_HOME` | `~/.codex` | `auth.json` |
 | Gemini CLI | `GEMINI_CLI_HOME` | `~/.gemini` | settings + chave |
+| Antigravity CLI (`agy`) | **nenhuma** | `~/.gemini/antigravity-cli` | nada — a credencial não é arquivo |
 
 Nota honesta: `CLAUDE_CONFIG_DIR` e `CODEX_HOME` estão verificados em uso nesta
 máquina. `CODEX_HOME` foi provado assim: `codex login status` diz "Logged in using
 ChatGPT", mas `CODEX_HOME=<pasta vazia> codex login status` diz "Not logged in".
 `GEMINI_CLI_HOME` aparece no bundle do CLI, mas não foi testado — sonde antes de
 confiar.
+
+⚠️ **`agy` (Antigravity CLI) NÃO segue esse padrão — testado e confirmado
+2026-09-21.** O login OAuth grava a credencial direto no Windows Credential
+Manager, target fixo `gemini:antigravity` (visto via `cmdkey /list` antes/depois
+do login), não em arquivo dentro de `~/.gemini/antigravity-cli/` — esse diretório
+só tem `settings.json` (sem token, só `trustedWorkspaces`), cache, logs e bancos
+de conversa. O binário (`strings` no `.exe`) usa `go_keyring`/`keyring_windows`
+internamente e não expõe nenhuma env var de override tipo `AGY_HOME` ou
+`ANTIGRAVITY_CONFIG_DIR`. **Não dá para multiplicar conta por junction/hardlink
+como Claude e Codex**: o target do Credential Manager não varia por pasta, então
+um segundo perfil sobrescreveria a mesma credencial. Hoje só dá para manter UMA
+conta Antigravity logada por vez nesta máquina — sem contorno de baixo risco
+conhecido (trocar `USERPROFILE`/`HOME` teria blast radius alto demais para valer
+a pena). Canário de que o login funciona de verdade (não só "sign-in ok"):
+`agy --print "<prompt>"` devolvendo texto real do modelo.
 
 As notas abaixo são apenas técnicas, para quem decidir montar o wrapper manualmente;
 `claude-swap` é o caminho recomendado para a rotação do Claude.
