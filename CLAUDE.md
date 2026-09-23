@@ -12,6 +12,20 @@
 - Toda delegação declara `modelo / effort / sandbox` **antes** de rodar, com
   `run_in_background` e `< /dev/null` (o `codex exec` lê stdin mesmo com prompt no
   argumento e pendura para sempre sem isso).
+- **Isolar em worktree quando há trabalho aprovado sem commit na árvore.** Um
+  agente que rode `git reset`/`checkout .`/`clean` apaga o trabalho de TODO MUNDO
+  na cópia compartilhada, não só o dele — aconteceu em 2026-09-17: um
+  `ocx-gpt-5-6-terra` fez isso e apagou um gráfico, uma tela e dois scripts, todos
+  já revisados e aprovados, só porque estavam sem commit no momento. `isolation:
+  "worktree"` no Agent tool contém o estrago; e todo briefing de delegação que
+  escreve leva, literal, a instrução de nunca rodar git destrutivo. Ver skill
+  `codex`, seção "Isolamento".
+- **Todo briefing de escrita também leva: "se travar ou achar necessária qualquer
+  ação destrutiva/fora do escopo, PARE e pergunte via SendMessage a 'main' em vez
+  de decidir sozinho."** O agente do incidente tinha esse caminho disponível
+  (é ferramenta padrão de subagente em background) e nunca o usou — nenhum dos 5
+  agentes da sessão de 2026-09-17 pausou pra perguntar por conta própria; só param
+  se o briefing pedir. Isolamento contém o dano; isto tenta evitar que aconteça.
 
 ### Quando o Codex CLI está indisponível
 

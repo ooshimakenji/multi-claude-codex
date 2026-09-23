@@ -231,6 +231,7 @@ struct Snapshot {
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
+    antigravity: Option<AntigravitySnapshot>,
 }
 
 struct OpenCodexSnapshot {
@@ -249,18 +250,56 @@ struct OpenCodexAccount {
     active: bool,
 }
 
+struct AntigravitySnapshot {
+    logged_in: bool,
+}
+
 struct PanelApp {
     receiver: Receiver<Snapshot>,
     status: Option<Result<Value, String>>,
     cswap: Option<Result<Value, String>>,
+    status_err_streak: u32,
+    cswap_err_streak: u32,
     fixacao: Option<Value>,
     codex_last_used_profile: Option<String>,
     codex_active_profile: Option<String>,
     codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
     opencodex: Option<OpenCodexSnapshot>,
+    antigravity: Option<AntigravitySnapshot>,
     pokemon: PokemonCache,
     poke_mode: bool,
     hwnd: Option<*mut c_void>,
+}
+
+/// Teto de erros consecutivos antes de deixar o erro aparecer na tela.
+/// A ~2s por poll, 5 é ~10s de falha sustentada.
+const MAX_TRANSIENT_ERR_STREAK: u32 = 5;
+
+/// Funde o resultado de um novo poll com o anterior: uma falha isolada (ou
+/// uma sequencia curta de falhas) nao apaga o ultimo dado bom, mas depois de
+/// MAX_TRANSIENT_ERR_STREAK falhas consecutivas o erro passa a aparecer, para
+/// nao esconder um problema real para sempre.
+fn merge_poll_result(
+    prev: Option<Result<Value, String>>,
+    streak: &mut u32,
+    new: Result<Value, String>,
+) -> Option<Result<Value, String>> {
+    match new {
+        Ok(_) => {
+            *streak = 0;
+            Some(new)
+        }
+        Err(_) => match prev {
+            Some(Ok(good)) if *streak < MAX_TRANSIENT_ERR_STREAK => {
+                *streak += 1;
+                Some(Ok(good))
+            }
+            _ => {
+                *streak = 0;
+                Some(new)
+            }
+        },
+    }
 }
 
 #[derive(Clone)]
@@ -385,11 +424,14 @@ impl PanelApp {
             receiver,
             status: None,
             cswap: None,
+            status_err_streak: 0,
+            cswap_err_streak: 0,
             fixacao: None,
             codex_last_used_profile: None,
             codex_active_profile: None,
             codex_profile_settings: Vec::new(),
             opencodex: None,
+            antigravity: None,
             pokemon: PokemonCache::new(),
             poke_mode: load_poke_mode(),
             hwnd,
@@ -398,13 +440,14 @@ impl PanelApp {
 
     fn receive_latest(&mut self) {
         while let Ok(snapshot) = self.receiver.try_recv() {
-            self.status = Some(snapshot.status);
-            self.cswap = Some(snapshot.cswap);
+            self.status = merge_poll_result(self.status.take(), &mut self.status_err_streak, snapshot.status);
+            self.cswap = merge_poll_result(self.cswap.take(), &mut self.cswap_err_streak, snapshot.cswap);
             self.fixacao = snapshot.fixacao;
             self.codex_last_used_profile = snapshot.codex_last_used_profile;
             self.codex_active_profile = snapshot.codex_active_profile;
             self.codex_profile_settings = snapshot.codex_profile_settings;
             self.opencodex = snapshot.opencodex;
+            self.antigravity = snapshot.antigravity;
         }
     }
 }
@@ -543,6 +586,8 @@ impl eframe::App for PanelApp {
                         show_opencodex(ui, content_width, opencodex);
                         ui.add_space(8.0);
                     }
+                    show_antigravity(ui, content_width, self.antigravity.as_ref());
+                    ui.add_space(8.0);
                     show_free_tier(ui, content_width, self.status.as_ref());
                     ui.add_space(8.0);
                     show_context(ui, content_width, self.status.as_ref());
@@ -818,6 +863,7 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
             })
             .collect();
         let opencodex = read_opencodex();
+        let antigravity = read_antigravity();
         if sender
             .send(Snapshot {
                 status,
@@ -827,6 +873,7 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
                 codex_active_profile,
                 codex_profile_settings,
                 opencodex,
+                antigravity,
             })
             .is_err()
         {
@@ -1078,6 +1125,19 @@ fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
 
     stream.read_to_end(&mut response).ok()?;
     Some((headers, response[body_start..].to_vec()))
+}
+
+// Antigravity (CLI `agy` da Google) não expõe cota via API — só sabemos se a
+// conta está logada, através da entrada fixa que o login OAuth grava no
+// Windows Credential Manager (target=gemini:antigravity). Ver README/memória
+// do projeto: a API local do agy exige um CSRF token gerado em runtime, sem
+// arquivo/env var de descoberta encontrado (investigado e descartado).
+fn read_antigravity() -> Option<AntigravitySnapshot> {
+    let output = Command::new("cmdkey").arg("/list").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Some(AntigravitySnapshot {
+        logged_in: stdout.to_lowercase().contains("target=gemini:antigravity"),
+    })
 }
 
 fn opencodex_health_ok() -> bool {
@@ -3113,6 +3173,25 @@ fn render_opencodex_account_stacked(
     });
 }
 
+fn show_antigravity(ui: &mut egui::Ui, content_width: f32, snapshot: Option<&AntigravitySnapshot>) {
+    section_frame(ui, "ANTIGRAVITY", content_width, |ui, content_width| {
+        match snapshot {
+            Some(snapshot) if snapshot.logged_in => {
+                ui.horizontal(|ui| {
+                    ui.label(data_text("●").color(hp_ok()));
+                    ui.label(pixel_text("logado", 10.0));
+                    ui.add_space(12.0);
+                    ui.label(data_text("gemini:antigravity"));
+                });
+                ui.add_space(4.0);
+                dim_label(ui, content_width, "sem cota exponível (CLI não publica uso)");
+            }
+            Some(_) => dim_label(ui, content_width, "não logado"),
+            None => dim_label(ui, content_width, "status indisponível"),
+        }
+    });
+}
+
 fn show_opencodex(ui: &mut egui::Ui, content_width: f32, snapshot: &OpenCodexSnapshot) {
     section_frame(ui, "OPENCODEX", content_width, |ui, content_width| {
         ui.horizontal_wrapped(|ui| {
@@ -3903,7 +3982,7 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_widths, read_config_scalar, set_config_scalar};
+    use super::{column_widths, merge_poll_result, read_config_scalar, set_config_scalar, MAX_TRANSIENT_ERR_STREAK};
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
 
@@ -3943,5 +4022,33 @@ mod tests {
         assert!((at_ideal.iter().sum::<f32>() - ideal).abs() < f32::EPSILON);
         assert!(column_widths(min + gaps - 1.0, gaps, &cols).is_none());
         assert!(intermediate.iter().sum::<f32>() <= 7.5 + f32::EPSILON);
+    }
+
+    #[test]
+    fn merge_poll_result_mantem_dado_bom_em_falha_transitoria() {
+        let mut streak = 0u32;
+        let bom = Ok(serde_json::json!({"ok": true}));
+
+        let apos_ok = merge_poll_result(None, &mut streak, bom.clone());
+        assert!(matches!(apos_ok, Some(Ok(_))));
+        assert_eq!(streak, 0);
+
+        let apos_erro_isolado = merge_poll_result(apos_ok, &mut streak, Err("hiccup".into()));
+        assert!(matches!(apos_erro_isolado, Some(Ok(_))), "erro isolado nao deve apagar o dado bom");
+        assert_eq!(streak, 1);
+
+        let mut estado = apos_erro_isolado;
+        for _ in 0..(MAX_TRANSIENT_ERR_STREAK - 1) {
+            estado = merge_poll_result(estado, &mut streak, Err("hiccup".into()));
+        }
+        assert!(matches!(estado, Some(Ok(_))), "ainda dentro do teto, mantem o dado bom");
+
+        let estado_apos_teto = merge_poll_result(estado, &mut streak, Err("hiccup".into()));
+        assert!(matches!(estado_apos_teto, Some(Err(_))), "passou do teto, erro deve aparecer");
+        assert_eq!(streak, 0);
+
+        let recuperado = merge_poll_result(estado_apos_teto, &mut streak, bom.clone());
+        assert!(matches!(recuperado, Some(Ok(_))));
+        assert_eq!(streak, 0);
     }
 }

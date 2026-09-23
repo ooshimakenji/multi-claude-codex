@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 POKE_API = "https://pokeapi.co/api/v2/pokemon/{number}"
 SPRITE_URL = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/{path}.png"
 MIN_SPECIES = 1
-MAX_SPECIES = 1025
+MAX_SPECIES = 151  # so 1a geracao
 SPECIES_NUMBERS = tuple(range(MIN_SPECIES, MAX_SPECIES + 1))
 
 
@@ -300,13 +300,13 @@ def populate(reset=False):
 
 
 def selftest():
-    old = {"old@example.com": {"numero": 503, "nome": "samurott"}}
+    old = {"old@example.com": {"numero": 25, "nome": "pikachu"}}
     allocated, reuse = assign_numbers(
         [{"email": "old@example.com", "provedor": "claude"},
          {"email": "new@example.com", "provedor": "codex", "plano": "plus"}], old)
-    assert allocated["claude:old@example.com"]["numero"] == 503
+    assert allocated["claude:old@example.com"]["numero"] == 25
     assert 1 <= allocated["codex:new@example.com"]["numero"] <= MAX_SPECIES
-    assert allocated["codex:new@example.com"]["numero"] != 503
+    assert allocated["codex:new@example.com"]["numero"] != 25
     assert allocated["codex:new@example.com"]["provedor"] == "codex"
     assert not reuse
     allocated_again, reuse_again = assign_numbers(
