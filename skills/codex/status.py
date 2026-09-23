@@ -370,6 +370,7 @@ def jobs_ativos():
         cwd = contexto.get("cwd") if isinstance(contexto, dict) else None
         inicio = _epoch(primeiro.get("timestamp")) if isinstance(primeiro, dict) else None
         encontrados.append({
+            "tipo": "codex",
             "modelo": contexto.get("model") if isinstance(contexto, dict) else None,
             "cwd": cwd,
             "projeto": os.path.basename(os.path.normpath(cwd)) if cwd else None,
@@ -377,7 +378,81 @@ def jobs_ativos():
             "segundos": max(0, agora - (inicio if inicio is not None else mtime)),
             "arquivo": os.path.basename(arq),
         })
+
+    subagentes = glob.glob(os.path.join(
+        CLAUDE_HOME, "projects", "*", "*", "subagents", "agent-*.jsonl"))
+    recentes = []
+    for arq in subagentes:
+        try:
+            mtime = os.path.getmtime(arq)
+        except OSError:
+            continue
+        if mtime < corte:
+            continue
+        recentes.append((mtime, arq))
+
+    # O mtime e o unico criterio confiavel encontrado nos arquivos atuais de
+    # subagente; sinais de termino explicitos, quando presentes, tambem valem.
+    for mtime, arq in sorted(recentes, reverse=True):
+        try:
+            linhas = tail(arq, 65536)
+            primeiro = None
+            for indice, evento in enumerate(_loads(arq)):
+                if isinstance(evento, dict):
+                    primeiro = evento
+                    break
+                if indice >= 127:
+                    break
+            if _subagente_terminou(linhas):
+                continue
+            meta_path = os.path.splitext(arq)[0] + ".meta.json"
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            meta = {}
+            try:
+                linhas = tail(arq, 65536)
+                primeiro = next((evento for evento in _loads(arq)
+                                 if isinstance(evento, dict)), None)
+            except (OSError, ValueError):
+                continue
+
+        inicio = _epoch(primeiro.get("timestamp")) if isinstance(primeiro, dict) else None
+        if inicio is None:
+            try:
+                inicio = os.path.getctime(arq)
+            except OSError:
+                inicio = mtime
+        encontrados.append({
+            "tipo": "claude",
+            "modelo": meta.get("model") if isinstance(meta.get("model"), str) else "—",
+            "projeto": (
+                meta.get("description") if isinstance(meta.get("description"), str)
+                else meta.get("agentType") if isinstance(meta.get("agentType"), str)
+                else "—"
+            ),
+            "segundos": max(0, agora - inicio),
+            "arquivo": os.path.basename(arq),
+        })
     return encontrados
+
+
+def _subagente_terminou(linhas):
+    """Aceita apenas marcadores de termino explicitos, nao uma mensagem qualquer."""
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        if not isinstance(evento, dict):
+            continue
+        if evento.get("type") in ("result", "subagent_stop", "task_complete"):
+            return True
+        payload = evento.get("payload") or {}
+        if isinstance(payload, dict) and payload.get("type") in (
+                "result", "subagent_stop", "task_complete"):
+            return True
+    return False
 
 
 def claude_side():
@@ -770,6 +845,25 @@ def selftest():
     assert job["modelo"] == "gpt-5.6-luna" and job["cwd"] == proj, job
     assert job["projeto"] == "algum-projeto" and job["tokens"] == 1234, job
     assert 10 <= job["segundos"] <= 20, job
+    subagents = os.path.join(d, "projects", "claude-projeto", "sessao", "subagents")
+    os.makedirs(subagents)
+    claude_active = os.path.join(subagents, "agent-active.jsonl")
+    claude_stopped = os.path.join(subagents, "agent-stopped.jsonl")
+    for caminho, timestamp in ((claude_active, agora - 6), (claude_stopped, agora - 120)):
+        with open(caminho, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"timestamp": timestamp, "type": "user"}) + "\n")
+    with open(os.path.splitext(claude_active)[0] + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump({"agentType": "general-purpose", "description": "confere asfalto", "model": "opus"}, fh)
+    with open(os.path.splitext(claude_stopped)[0] + ".meta.json", "w", encoding="utf-8") as fh:
+        json.dump({"agentType": "Explore", "description": "parado", "model": "sonnet"}, fh)
+    os.utime(claude_stopped, (agora - 120, agora - 120))
+    jobs = jobs_ativos()
+    por_arquivo = {job["arquivo"]: job for job in jobs}
+    assert por_arquivo["agent-active.jsonl"]["tipo"] == "claude", jobs
+    assert por_arquivo["agent-active.jsonl"]["modelo"] == "opus", jobs
+    assert por_arquivo["agent-active.jsonl"]["projeto"] == "confere asfalto", jobs
+    assert "agent-stopped.jsonl" not in por_arquivo, jobs
+    assert all("tipo" in job for job in jobs), jobs
 
     # o contrato que importa: --line NAO pode gravar o marco
     global MARK

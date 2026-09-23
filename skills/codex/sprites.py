@@ -19,6 +19,13 @@ SPRITE_URL = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/p
 MIN_SPECIES = 1
 MAX_SPECIES = 151  # so 1a geracao
 SPECIES_NUMBERS = tuple(range(MIN_SPECIES, MAX_SPECIES + 1))
+SELVAGENS = (16, 19, 21, 10, 13, 41, 74, 129, 23, 27, 46, 48, 50, 52, 54, 56, 72, 77, 81, 100)
+AGY_ACCOUNT = {"email": "antigravity", "provedor": "agy"}
+AGY_NUMBER = 92
+TRAINER_URLS = (
+    "https://play.pokemonshowdown.com/sprites/trainers/red.png",
+    "https://play.pokemonshowdown.com/sprites/trainers/red-gen1.png",
+)
 
 
 def random_species(available):
@@ -165,12 +172,23 @@ def map_identity(map_key, item):
     source_key = str(map_key)
     key_provider, separator, key_email = source_key.partition(":")
     provider = item.get("provedor")
-    if provider not in ("claude", "codex"):
-        provider = key_provider if key_provider in ("claude", "codex") else "claude"
+    accepted = ("claude", "codex", "agy")
+    if provider not in accepted:
+        if separator and key_provider in accepted:
+            provider = key_provider
+        elif separator:
+            return None
+        else:
+            provider = "claude"
 
     email = item.get("email")
     if not isinstance(email, str) or not email.strip():
-        email = key_email if separator and key_provider in ("claude", "codex") else source_key
+        if separator:
+            if key_provider not in accepted:
+                return None
+            email = key_email
+        else:
+            email = source_key
     return provider, email.strip().lower()
 
 
@@ -190,7 +208,13 @@ def assign_numbers(accounts, mapping, reset=False):
             continue
 
         normalized = dict(item)
-        provider, email = map_identity(source_key, normalized)
+        identity = map_identity(source_key, normalized)
+        if identity is None:
+            continue
+        provider, email = identity
+        if provider == "agy":
+            email = "antigravity"
+            number = AGY_NUMBER
         identity = (provider, email)
         normalized["email"] = email
         normalized["provedor"] = provider
@@ -200,7 +224,12 @@ def assign_numbers(accounts, mapping, reset=False):
         candidates.append((source_key == map_key, map_key, source_key, number, normalized, identity))
 
     for is_qualified, map_key, _source_key, number, normalized, identity in sorted(
-        candidates, key=lambda candidate: (not candidate[0], candidate[1].lower(), str(candidate[2]).lower())
+        candidates, key=lambda candidate: (
+            candidate[5] != ("agy", "antigravity"),
+            not candidate[0],
+            candidate[1].lower(),
+            str(candidate[2]).lower(),
+        )
     ):
         if map_key in retained or number in owners:
             continue
@@ -212,14 +241,18 @@ def assign_numbers(accounts, mapping, reset=False):
     for account in accounts:
         provider = account.get("provedor")
         email = account.get("email")
-        if provider not in ("claude", "codex") or not isinstance(email, str) or not email.strip():
+        if provider not in ("claude", "codex", "agy") or not isinstance(email, str) or not email.strip():
             continue
         email = email.strip().lower()
+        if provider == "agy":
+            email = "antigravity"
         account["provedor"] = provider
         account["email"] = email
         by_identity[(provider, email)] = account
 
     available = set(SPECIES_NUMBERS) - set(owners)
+    if ("agy", "antigravity") in by_identity:
+        available.discard(AGY_NUMBER)
     reuse = []
     for identity in sorted(by_identity):
         provider, email = identity
@@ -227,7 +260,9 @@ def assign_numbers(accounts, mapping, reset=False):
         map_key = identity_keys.get(identity)
         item = retained.get(map_key) if map_key is not None else None
         if item is None:
-            if available:
+            if provider == "agy":
+                number = AGY_NUMBER
+            elif available:
                 number = random_species(available)
                 available.remove(number)
             else:
@@ -241,6 +276,8 @@ def assign_numbers(accounts, mapping, reset=False):
         account["map_key"] = map_key
         item["email"] = email
         item["provedor"] = provider
+        if provider == "agy":
+            item["nome"] = "gastly"
         if account.get("plano"):
             item["plano"] = account["plano"]
         else:
@@ -249,7 +286,7 @@ def assign_numbers(accounts, mapping, reset=False):
 
 
 def populate(reset=False):
-    accounts = claude_accounts() + codex_accounts()
+    accounts = claude_accounts() + codex_accounts() + [dict(AGY_ACCOUNT)]
     target = cache_dir()
     mapping, map_ok = read_map(target / "mapa.json")
     mapping, reuse = assign_numbers(accounts, mapping, reset=reset)
@@ -280,6 +317,53 @@ def populate(reset=False):
                 item["nome"] = pokemon_name(number)
             except Exception as error:
                 print(f"aviso: nome Pokemon {number}: {error}", file=sys.stderr)
+
+    selvagens_path = target / "selvagens.json"
+    selvagens_existentes = {}
+    try:
+        valor = json.loads(selvagens_path.read_text(encoding="utf-8"))
+        if isinstance(valor, list):
+            selvagens_existentes = {
+                item["numero"]: item["nome"]
+                for item in valor
+                if isinstance(item, dict)
+                and isinstance(item.get("numero"), int)
+                and isinstance(item.get("nome"), str)
+            }
+    except (OSError, ValueError):
+        pass
+    selvagens = []
+    for number in SELVAGENS:
+        destination = target / f"{number}-frente.png"
+        if not destination.is_file():
+            try:
+                atomic_write(destination, download(SPRITE_URL.format(path=str(number))))
+            except Exception as error:
+                print(f"aviso: sprite selvagem {number}: {error}", file=sys.stderr)
+        name = selvagens_existentes.get(number)
+        if name is None:
+            try:
+                name = pokemon_name(number)
+            except Exception as error:
+                print(f"aviso: nome Pokemon selvagem {number}: {error}", file=sys.stderr)
+        if name is not None:
+            selvagens.append({"numero": number, "nome": name})
+    selvagens_data = json.dumps(selvagens, ensure_ascii=False, indent=2).encode("utf-8")
+    if not selvagens_path.is_file() or selvagens_path.read_bytes() != selvagens_data:
+        atomic_write(selvagens_path, selvagens_data)
+
+    trainer_path = target / "treinador.png"
+    if not trainer_path.is_file():
+        for trainer_url in TRAINER_URLS:
+            try:
+                trainer_data = download(trainer_url)
+                if not trainer_data.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError("resposta nao e PNG")
+                atomic_write(trainer_path, trainer_data)
+                print(f"treinador Red: {trainer_url}")
+                break
+            except Exception as error:
+                print(f"aviso: treinador Red {trainer_url}: {error}", file=sys.stderr)
 
     if map_ok or reset:
         try:
@@ -320,6 +404,11 @@ def selftest():
     assert set(reset) == {"claude:old@example.com", "codex:new@example.com"}
     assert len({item["numero"] for item in reset.values()}) == 2
     assert not reset_reuse
+    agy, agy_reuse = assign_numbers(
+        [{"email": "antigravity", "provedor": "agy"}], old, reset=True)
+    assert agy["agy:antigravity"]["numero"] == AGY_NUMBER
+    assert agy["agy:antigravity"]["provedor"] == "agy"
+    assert not agy_reuse
     print("sprites.py selftest: ok")
 
 
@@ -337,6 +426,9 @@ def clean_orphans():
         number = item.get("numero")
         if isinstance(number, int) and MIN_SPECIES <= number <= MAX_SPECIES:
             referenced.update((f"{number}-frente.png", f"{number}-costas.png"))
+    for number in SELVAGENS:
+        referenced.update((f"{number}-frente.png", f"{number}-costas.png"))
+    referenced.update((f"{AGY_NUMBER}-frente.png", f"{AGY_NUMBER}-costas.png", "treinador.png"))
 
     removed = 0
     if target.is_dir():

@@ -91,6 +91,9 @@ const ACCOUNT_CURSOR_WIDTH: f32 = 10.0;
 const ARENA_PLATE_HEIGHT: f32 = 42.0;
 const ARENA_SPRITE_SIZE: f32 = 112.0;
 const ARENA_DELEGATION_HEIGHT: f32 = 38.0;
+const ARENA_AGY_BAND_HEIGHT: f32 = 28.0;
+const ARENA_AGY_WIDE_ZONE_WIDTH: f32 = 280.0;
+const ARENA_AGY_SPRITE_SIZE: f32 = 56.0;
 const ARENA_MIN_PLATE_WIDTH: f32 = 150.0;
 const ARENA_MIN_SIDE_WIDTH: f32 = 160.0;
 const ARENA_MIN_DELEGATION_WIDTH: f32 = 120.0;
@@ -252,6 +255,9 @@ struct OpenCodexAccount {
 
 struct AntigravitySnapshot {
     logged_in: bool,
+    conta: Option<String>,
+    conversas: Option<usize>,
+    ultima_conversa: Option<SystemTime>,
 }
 
 struct PanelApp {
@@ -312,6 +318,12 @@ struct PokemonInfo {
 }
 
 #[derive(Clone)]
+struct WildPokemon {
+    number: u16,
+    name: String,
+}
+
+#[derive(Clone)]
 struct ClaudeAccountTarget {
     number: i64,
     email: String,
@@ -321,8 +333,29 @@ struct ClaudeAccountTarget {
 struct PokemonCache {
     directory: PathBuf,
     map: HashMap<String, PokemonInfo>,
-    textures: HashMap<(u16, bool), egui::TextureHandle>,
-    attempted: HashSet<(u16, bool)>,
+    selvagens: Vec<WildPokemon>,
+    textures: HashMap<(u16, bool, bool), egui::TextureHandle>,
+    attempted: HashSet<(u16, bool, bool)>,
+    treinador: Option<egui::TextureHandle>,
+    treinador_attempted: bool,
+}
+
+fn trim_transparent(image: image::RgbaImage) -> image::RgbaImage {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 0 {
+            bounds = Some(match bounds {
+                Some((left, top, right, bottom)) => {
+                    (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                }
+                None => (x, y, x, y),
+            });
+        }
+    }
+    let Some((left, top, right, bottom)) = bounds else {
+        return image;
+    };
+    image::imageops::crop_imm(&image, left, top, right - left + 1, bottom - top + 1).to_image()
 }
 
 impl PokemonCache {
@@ -368,11 +401,27 @@ impl PokemonCache {
                 }
             }
         }
+        let selvagens = fs::read_to_string(directory.join("selvagens.json"))
+            .ok()
+            .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                Some(WildPokemon {
+                    number: entry.get("numero")?.as_u64()?.try_into().ok()?,
+                    name: entry.get("nome")?.as_str()?.to_owned(),
+                })
+            })
+            .collect();
         Self {
             directory,
             map,
+            selvagens,
             textures: HashMap::new(),
             attempted: HashSet::new(),
+            treinador: None,
+            treinador_attempted: false,
         }
     }
 
@@ -391,23 +440,73 @@ impl PokemonCache {
         back: bool,
     ) -> Option<&egui::TextureHandle> {
         let info = self.info(provider, email)?;
-        let key = (info.number, back);
+        self.texture_by_number(context, info.number, back)
+    }
+
+    fn texture_by_number(
+        &mut self,
+        context: &egui::Context,
+        number: u16,
+        back: bool,
+    ) -> Option<&egui::TextureHandle> {
+        self.texture_by_number_with_crop(context, number, back, false)
+    }
+
+    fn texture_by_number_cropped(
+        &mut self,
+        context: &egui::Context,
+        number: u16,
+        back: bool,
+    ) -> Option<&egui::TextureHandle> {
+        self.texture_by_number_with_crop(context, number, back, true)
+    }
+
+    fn texture_by_number_with_crop(
+        &mut self,
+        context: &egui::Context,
+        number: u16,
+        back: bool,
+        crop_transparent: bool,
+    ) -> Option<&egui::TextureHandle> {
+        let key = (number, back, crop_transparent);
         if !self.attempted.insert(key) {
             return self.textures.get(&key);
         }
         let side = if back { "costas" } else { "frente" };
-        let path = self.directory.join(format!("{}-{side}.png", info.number));
+        let path = self.directory.join(format!("{number}-{side}.png"));
         let bytes = fs::read(path).ok()?;
         let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let decoded = if crop_transparent {
+            trim_transparent(decoded)
+        } else {
+            decoded
+        };
         let size = [decoded.width() as usize, decoded.height() as usize];
         let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
         let texture = context.load_texture(
-            format!("pokemon-{}-{side}", info.number),
+            format!("pokemon-{number}-{side}-{crop_transparent}"),
             color_image,
             egui::TextureOptions::NEAREST,
         );
         self.textures.insert(key, texture);
         self.textures.get(&key)
+    }
+
+    fn trainer_texture(&mut self, context: &egui::Context) -> Option<&egui::TextureHandle> {
+        if self.treinador_attempted {
+            return self.treinador.as_ref();
+        }
+        self.treinador_attempted = true;
+        let bytes = fs::read(self.directory.join("treinador.png")).ok()?;
+        let decoded = trim_transparent(image::load_from_memory(&bytes).ok()?.to_rgba8());
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+        self.treinador = Some(context.load_texture(
+            "pokemon-trainer-red",
+            color_image,
+            egui::TextureOptions::NEAREST,
+        ));
+        self.treinador.as_ref()
     }
 }
 
@@ -549,14 +648,20 @@ impl eframe::App for PanelApp {
                         self.cswap.as_ref(),
                         self.codex_active_profile.as_deref(),
                         &self.codex_profile_settings,
+                        self.antigravity.as_ref(),
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
                     );
                     ui.add_space(12.0);
-                    show_command_line(ui, content_width, self.cswap.as_ref());
-                    ui.add_space(12.0);
-                    show_running_jobs(ui, content_width, self.status.as_ref());
+                    show_running_jobs(
+                        ui,
+                        content_width,
+                        self.status.as_ref(),
+                        &mut self.pokemon,
+                        context,
+                        self.poke_mode,
+                    );
                     ui.add_space(12.0);
 
                     show_claude(
@@ -586,7 +691,14 @@ impl eframe::App for PanelApp {
                         show_opencodex(ui, content_width, opencodex);
                         ui.add_space(8.0);
                     }
-                    show_antigravity(ui, content_width, self.antigravity.as_ref());
+                    show_antigravity(
+                        ui,
+                        content_width,
+                        self.antigravity.as_ref(),
+                        &mut self.pokemon,
+                        context,
+                        self.poke_mode,
+                    );
                     ui.add_space(8.0);
                     show_free_tier(ui, content_width, self.status.as_ref());
                     ui.add_space(8.0);
@@ -1127,6 +1239,68 @@ fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     Some((headers, response[body_start..].to_vec()))
 }
 
+fn antigravity_email_from_text(text: &str) -> Option<String> {
+    const MARKER: &str = "authenticated successfully as ";
+
+    let mut search_end = text.len();
+    while let Some(index) = text[..search_end].rfind(MARKER) {
+        let email = text[index + MARKER.len()..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !email.is_empty() && email.contains('@') {
+            return Some(email.to_owned());
+        }
+        search_end = index;
+    }
+    None
+}
+
+fn read_antigravity_account(home: &Path) -> Option<String> {
+    let directory = home.join(".gemini/antigravity-cli");
+    if let Ok(bytes) = fs::read(directory.join("cli.log")) {
+        if let Some(email) = antigravity_email_from_text(&String::from_utf8_lossy(&bytes)) {
+            return Some(email);
+        }
+    }
+
+    let mut logs = fs::read_dir(directory.join("log"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|_| entry.path())
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by(|left, right| {
+        let left_name = left
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let right_name = right
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        right_name.cmp(&left_name)
+    });
+    for path in logs {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        if let Some(email) = antigravity_email_from_text(&String::from_utf8_lossy(&bytes)) {
+            return Some(email);
+        }
+    }
+    None
+}
+
 // Antigravity (CLI `agy` da Google) não expõe cota via API — só sabemos se a
 // conta está logada, através da entrada fixa que o login OAuth grava no
 // Windows Credential Manager (target=gemini:antigravity). Ver README/memória
@@ -1135,8 +1309,40 @@ fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
 fn read_antigravity() -> Option<AntigravitySnapshot> {
     let output = Command::new("cmdkey").arg("/list").output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let conta = home_directory().and_then(|home| read_antigravity_account(&home));
+    let mut conversas = None;
+    let mut ultima_conversa = None;
+    if let Some(home) = home_directory() {
+        if let Ok(entries) = fs::read_dir(home.join(".gemini/antigravity-cli/conversations")) {
+            let mut count = 0;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_file()
+                    || !path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("db"))
+                {
+                    continue;
+                }
+                count += 1;
+                if let Ok(mtime) = metadata.modified() {
+                    if ultima_conversa.map_or(true, |known| mtime > known) {
+                        ultima_conversa = Some(mtime);
+                    }
+                }
+            }
+            conversas = Some(count);
+        }
+    }
     Some(AntigravitySnapshot {
         logged_in: stdout.to_lowercase().contains("target=gemini:antigravity"),
+        conta,
+        conversas,
+        ultima_conversa,
     })
 }
 
@@ -1503,6 +1709,7 @@ fn show_command_center(
     cswap: Option<&Result<Value, String>>,
     active_profile: Option<&str>,
     profile_settings: &[(String, Option<String>, Option<String>)],
+    antigravity: Option<&AntigravitySnapshot>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -1513,8 +1720,9 @@ fn show_command_center(
         content_width,
         |ui, content_width| {
             let stacked = content_width < arena_wide_min_width(poke_mode);
+            let agy_visible = antigravity.is_some();
             let (arena, _) = ui.allocate_exact_size(
-                egui::vec2(content_width, arena_height(poke_mode, stacked)),
+                egui::vec2(content_width, arena_height(poke_mode, stacked, agy_visible)),
                 egui::Sense::hover(),
             );
             let painter = ui.painter().with_clip_rect(arena);
@@ -1583,6 +1791,22 @@ fn show_command_center(
             let codex_hp = codex_account
                 .and_then(|account| quota_percent_at(account, 0))
                 .map(remaining_hp);
+            let codex_label = if codex_email.contains('@') {
+                let account = codex_email.split('@').next().unwrap_or(codex_email);
+                let model = codex_model.strip_prefix("gpt-").unwrap_or(codex_model);
+                format!("CODEX · {account} · {model}/{codex_effort}")
+            } else {
+                format!("CODEX · {codex_model}/{codex_effort}")
+            };
+            let agy_label = antigravity.map(antigravity_arena_label);
+            let agy_texture = (!stacked && poke_mode && agy_visible)
+                .then(|| pokemon.texture_by_number_cropped(context, 92, false))
+                .flatten()
+                .map(|texture| texture.id());
+            let trainer_texture = poke_mode
+                .then(|| pokemon.trainer_texture(context))
+                .flatten()
+                .map(|texture| (texture.id(), texture.size_vec2()));
 
             if stacked {
                 let row_height = arena_side_height(poke_mode);
@@ -1599,6 +1823,7 @@ fn show_command_center(
                     ),
                     claude_hp,
                     claude_texture,
+                    trainer_texture,
                     true,
                     poke_mode,
                     ArenaSideLayout::Stacked,
@@ -1619,15 +1844,34 @@ fn show_command_center(
                         egui::pos2(arena.left(), arena.bottom() - row_height),
                         egui::vec2(arena.width(), row_height),
                     ),
-                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    &codex_label,
                     codex_hp,
                     codex_texture,
+                    trainer_texture,
                     false,
                     poke_mode,
                     ArenaSideLayout::Stacked,
                 );
+                if let Some(label) = agy_label.as_deref() {
+                    draw_arena_antigravity_band(
+                        &painter,
+                        egui::Rect::from_min_size(
+                            egui::pos2(
+                                arena.left(),
+                                arena.bottom() - row_height - ARENA_AGY_BAND_HEIGHT,
+                            ),
+                            egui::vec2(arena.width(), ARENA_AGY_BAND_HEIGHT),
+                        ),
+                        label,
+                    );
+                }
             } else if poke_mode {
                 let row_height = ARENA_SPRITE_SIZE;
+                let codex_layout = if agy_visible {
+                    ArenaSideLayout::WideTopWithAgy
+                } else {
+                    ArenaSideLayout::WideTop
+                };
                 draw_arena_side(
                     &painter,
                     ui,
@@ -1635,13 +1879,25 @@ fn show_command_center(
                         egui::pos2(arena.left(), arena.top()),
                         egui::vec2(arena.width(), row_height),
                     ),
-                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    &codex_label,
                     codex_hp,
                     codex_texture,
+                    trainer_texture,
                     false,
                     true,
-                    ArenaSideLayout::WideTop,
+                    codex_layout,
                 );
+                if let Some(label) = agy_label.as_deref() {
+                    draw_arena_antigravity_wide(
+                        &painter,
+                        egui::Rect::from_min_size(
+                            egui::pos2(arena.left(), arena.top()),
+                            egui::vec2(arena.width(), row_height),
+                        ),
+                        agy_texture,
+                        label,
+                    );
+                }
                 draw_arena_delegation(
                     &painter,
                     ui,
@@ -1664,6 +1920,7 @@ fn show_command_center(
                     ),
                     claude_hp,
                     claude_texture,
+                    trainer_texture,
                     true,
                     true,
                     ArenaSideLayout::WideBottom,
@@ -1673,17 +1930,17 @@ fn show_command_center(
                     (arena.width() - ARENA_MIN_DELEGATION_WIDTH - ARENA_COLUMN_GAP * 2.0) / 2.0;
                 let claude_rect = egui::Rect::from_min_size(
                     arena.left_top(),
-                    egui::vec2(side_width, arena.height()),
+                    egui::vec2(side_width, ARENA_PLATE_HEIGHT),
                 );
                 let codex_rect = egui::Rect::from_min_size(
                     egui::pos2(arena.right() - side_width, arena.top()),
-                    egui::vec2(side_width, arena.height()),
+                    egui::vec2(side_width, ARENA_PLATE_HEIGHT),
                 );
                 let delegation_rect = egui::Rect::from_min_size(
                     egui::pos2(claude_rect.right() + ARENA_COLUMN_GAP, arena.top()),
                     egui::vec2(
                         (codex_rect.left() - claude_rect.right() - ARENA_COLUMN_GAP * 2.0).max(0.0),
-                        arena.height(),
+                        ARENA_PLATE_HEIGHT,
                     ),
                 );
                 draw_arena_side(
@@ -1696,6 +1953,7 @@ fn show_command_center(
                     ),
                     claude_hp,
                     claude_texture,
+                    trainer_texture,
                     true,
                     false,
                     ArenaSideLayout::Sober,
@@ -1705,13 +1963,24 @@ fn show_command_center(
                     &painter,
                     ui,
                     codex_rect,
-                    &format!("CODEX · {codex_model}/{codex_effort}"),
+                    &codex_label,
                     codex_hp,
                     codex_texture,
+                    trainer_texture,
                     false,
                     false,
                     ArenaSideLayout::Sober,
                 );
+                if let Some(label) = agy_label.as_deref() {
+                    draw_arena_antigravity_band(
+                        &painter,
+                        egui::Rect::from_min_size(
+                            egui::pos2(arena.left(), arena.bottom() - ARENA_AGY_BAND_HEIGHT),
+                            egui::vec2(arena.width(), ARENA_AGY_BAND_HEIGHT),
+                        ),
+                        label,
+                    );
+                }
             }
         },
     );
@@ -1720,6 +1989,7 @@ fn show_command_center(
 #[derive(Clone, Copy)]
 enum ArenaSideLayout {
     WideTop,
+    WideTopWithAgy,
     WideBottom,
     Stacked,
     Sober,
@@ -1733,13 +2003,14 @@ fn arena_side_height(poke_mode: bool) -> f32 {
     }
 }
 
-fn arena_height(poke_mode: bool, stacked: bool) -> f32 {
+fn arena_height(poke_mode: bool, stacked: bool, agy_visible: bool) -> f32 {
+    let agy_band = agy_visible.then_some(ARENA_AGY_BAND_HEIGHT).unwrap_or(0.0);
     if stacked {
-        arena_side_height(poke_mode) * 2.0 + ARENA_DELEGATION_HEIGHT
+        arena_side_height(poke_mode) * 2.0 + ARENA_DELEGATION_HEIGHT + agy_band
     } else if poke_mode {
         ARENA_SPRITE_SIZE * 2.0 + ARENA_DELEGATION_HEIGHT
     } else {
-        ARENA_PLATE_HEIGHT
+        ARENA_PLATE_HEIGHT + agy_band
     }
 }
 
@@ -1763,6 +2034,7 @@ fn draw_arena_side(
     plate_text: &str,
     hp: Option<f64>,
     texture: Option<egui::TextureId>,
+    trainer_texture: Option<(egui::TextureId, egui::Vec2)>,
     player: bool,
     poke_mode: bool,
     layout: ArenaSideLayout,
@@ -1775,6 +2047,11 @@ fn draw_arena_side(
     };
     let plate_width = match layout {
         ArenaSideLayout::Sober => (rect.width() - 8.0).max(0.0),
+        ArenaSideLayout::WideTopWithAgy if poke_mode => {
+            (rect.width() / 2.0 - ARENA_AGY_WIDE_ZONE_WIDTH / 2.0 - ARENA_COLUMN_GAP - 4.0)
+                .min(ARENA_PLATE_MAX_WIDTH)
+                .max(96.0)
+        }
         _ if poke_mode => (rect.width() - sprite_zone - ARENA_COLUMN_GAP)
             .min(ARENA_PLATE_MAX_WIDTH)
             .max(96.0),
@@ -1782,11 +2059,13 @@ fn draw_arena_side(
     }
     .min(rect.width());
     let plate_left = match layout {
-        ArenaSideLayout::WideTop | ArenaSideLayout::Sober => rect.left() + 4.0,
+        ArenaSideLayout::WideTop | ArenaSideLayout::WideTopWithAgy | ArenaSideLayout::Sober => {
+            rect.left() + 4.0
+        }
         ArenaSideLayout::WideBottom | ArenaSideLayout::Stacked => rect.right() - plate_width - 4.0,
     };
     let plate_top = match layout {
-        ArenaSideLayout::WideTop => rect.top(),
+        ArenaSideLayout::WideTop | ArenaSideLayout::WideTopWithAgy => rect.top(),
         ArenaSideLayout::WideBottom => rect.bottom() - ARENA_PLATE_HEIGHT,
         ArenaSideLayout::Stacked | ArenaSideLayout::Sober => {
             rect.center().y - ARENA_PLATE_HEIGHT / 2.0
@@ -1809,7 +2088,7 @@ fn draw_arena_side(
     draw_arena_hp(ui, painter, plate, hp);
 
     let sprite_left = match layout {
-        ArenaSideLayout::WideTop => rect.right() - sprite_size,
+        ArenaSideLayout::WideTop | ArenaSideLayout::WideTopWithAgy => rect.right() - sprite_size,
         ArenaSideLayout::WideBottom | ArenaSideLayout::Stacked => {
             rect.left() + if player { 46.0 } else { 0.0 }
         }
@@ -1819,7 +2098,7 @@ fn draw_arena_side(
         return;
     }
     let sprite_top = match layout {
-        ArenaSideLayout::WideTop => rect.top(),
+        ArenaSideLayout::WideTop | ArenaSideLayout::WideTopWithAgy => rect.top(),
         ArenaSideLayout::WideBottom => rect.bottom() - sprite_size,
         ArenaSideLayout::Stacked => rect.center().y - sprite_size / 2.0,
         ArenaSideLayout::Sober => rect.top(),
@@ -1831,7 +2110,8 @@ fn draw_arena_side(
     if player {
         draw_trainer(
             painter,
-            egui::pos2(rect.left() + 5.0, sprite_rect.top() + 12.0),
+            egui::pos2(rect.left() + 2.0, sprite_rect.bottom() - 72.0),
+            trainer_texture,
         );
     }
     if let Some(texture) = texture {
@@ -1842,6 +2122,77 @@ fn draw_arena_side(
             egui::Color32::WHITE,
         );
     }
+}
+
+fn antigravity_arena_label(snapshot: &AntigravitySnapshot) -> String {
+    if !snapshot.logged_in {
+        return "AGY · não logado".to_owned();
+    }
+    let account = snapshot
+        .conta
+        .as_deref()
+        .unwrap_or("conta não identificada");
+    let prefix = account.split('@').next().unwrap_or(account);
+    let xp = snapshot
+        .conversas
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "—".to_owned());
+    format!("AGY · {prefix} · XP {xp}")
+}
+
+fn draw_arena_antigravity_band(painter: &egui::Painter, rect: egui::Rect, label: &str) {
+    painter.rect_filled(rect, 0.0, ground());
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, border()));
+    draw_arena_text_centered(
+        painter,
+        rect.center().x,
+        rect.top() + 7.0,
+        label,
+        (rect.width() - 12.0).max(0.0),
+        egui::FontId::monospace(11.0),
+        text_color(),
+    );
+}
+
+fn draw_arena_antigravity_wide(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    texture: Option<egui::TextureId>,
+    label: &str,
+) {
+    let sprite_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.center().x,
+            rect.top() + ARENA_AGY_SPRITE_SIZE / 2.0 + 2.0,
+        ),
+        egui::vec2(ARENA_AGY_SPRITE_SIZE, ARENA_AGY_SPRITE_SIZE),
+    );
+    if let Some(texture) = texture {
+        painter.image(
+            texture,
+            sprite_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    let plate = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.center().x - ARENA_AGY_WIDE_ZONE_WIDTH / 2.0 + 2.0,
+            rect.top() + ARENA_AGY_SPRITE_SIZE + 8.0,
+        ),
+        egui::vec2(ARENA_AGY_WIDE_ZONE_WIDTH - 4.0, 28.0),
+    );
+    painter.rect_filled(plate, 0.0, ground());
+    painter.rect_stroke(plate, 0.0, egui::Stroke::new(1.0_f32, border()));
+    draw_arena_text(
+        painter,
+        plate.left_top() + egui::vec2(6.0, 7.0),
+        label,
+        (plate.width() - 12.0).max(0.0),
+        egui::FontId::monospace(10.0),
+        text_color(),
+    );
 }
 
 fn draw_arena_hp(ui: &mut egui::Ui, _painter: &egui::Painter, plate: egui::Rect, hp: Option<f64>) {
@@ -1974,7 +2325,27 @@ fn truncate_arena_text(
     format!("{prefix}{ellipsis}")
 }
 
-fn draw_trainer(painter: &egui::Painter, origin: egui::Pos2) {
+fn draw_trainer(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    texture: Option<(egui::TextureId, egui::Vec2)>,
+) {
+    if let Some((texture, size)) = texture {
+        let target = egui::vec2(42.0, 72.0);
+        let scale = (target.x / size.x).min(target.y / size.y);
+        let drawn = size * scale;
+        let rect = egui::Rect::from_min_size(
+            origin + egui::vec2((target.x - drawn.x) / 2.0, target.y - drawn.y),
+            drawn,
+        );
+        painter.image(
+            texture,
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        return;
+    }
     let block = 3.0;
     let rect = |x: f32, y: f32, width: f32, height: f32| {
         egui::Rect::from_min_size(
@@ -1990,47 +2361,26 @@ fn draw_trainer(painter: &egui::Painter, origin: egui::Pos2) {
     painter.rect_filled(rect(7.0, 10.0, 2.0, 6.0), 0.0, border());
 }
 
-fn show_command_line(ui: &mut egui::Ui, content_width: f32, cswap: Option<&Result<Value, String>>) {
-    section_frame(ui, "NO COMANDO", content_width, |ui, content_width| {
-        let value = match cswap {
-            None => {
-                dim_label(ui, content_width, "carregando…");
-                return;
-            }
-            Some(Err(error)) => {
-                error_label(ui, content_width, error);
-                return;
-            }
-            Some(Ok(value)) => value,
-        };
-        let account = value
-            .get("accounts")
-            .and_then(Value::as_array)
-            .and_then(|accounts| {
-                accounts.iter().find_map(|account| {
-                    let active = account
-                        .get("active")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    active
-                        .then(|| account.get("email").and_then(Value::as_str))
-                        .flatten()
-                        .filter(|email| !email.is_empty())
-                })
-            })
-            .unwrap_or("conta não identificada");
-        data_label(
-            ui,
-            content_width,
-            format!("Claude Code · {account} · modelo não disponível"),
-        );
-    });
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn job_type_label(job: &Value) -> &'static str {
+    match job.get("tipo").and_then(Value::as_str) {
+        Some("claude") => "CLAUDE",
+        _ => "CODEX",
+    }
 }
 
 fn show_running_jobs(
     ui: &mut egui::Ui,
     content_width: f32,
     status: Option<&Result<Value, String>>,
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
 ) {
     section_frame(ui, "RODANDO AGORA", content_width, |ui, content_width| {
         let value = match status {
@@ -2051,26 +2401,81 @@ fn show_running_jobs(
             return;
         }
         if let Some(jobs) = jobs {
-            let gaps = ui.spacing().item_spacing.x * 3.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let mut wild_rows = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let wild = if poke_mode && !pokemon.selvagens.is_empty() {
+                    let index = (fnv1a(&string_field(job, "arquivo"))
+                        % pokemon.selvagens.len() as u64) as usize;
+                    let wild = pokemon.selvagens[index].clone();
+                    let texture = pokemon
+                        .texture_by_number_cropped(context, wild.number, false)
+                        .map(|texture| (texture.id(), texture.size_vec2()));
+                    Some((wild.name.to_ascii_uppercase(), texture))
+                } else {
+                    None
+                };
+                wild_rows.push(wild);
+            }
+            let show_wild = poke_mode && wild_rows.iter().any(Option::is_some);
+            let gaps = if show_wild {
+                spacing * 4.0
+            } else {
+                spacing * 3.0
+            };
             let widths = column_widths(
                 content_width - 84.0 - gaps,
                 gaps,
-                &[(70.0, 100.0), (130.0, 320.0), (44.0, 60.0)],
+                if show_wild {
+                    &[(180.0, 240.0), (150.0, 210.0), (130.0, 320.0), (44.0, 60.0)]
+                } else {
+                    &[(150.0, 210.0), (130.0, 320.0), (44.0, 60.0)]
+                },
             );
             for (index, job) in jobs.iter().enumerate() {
+                let wild = wild_rows[index].clone();
                 if let Some(widths) = widths.as_ref() {
                     ui.horizontal(|ui| {
+                        let mut offset = 0;
+                        if show_wild {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(widths[0], 40.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    if let Some((name, texture)) = wild.as_ref() {
+                                        if let Some((texture, size)) = texture {
+                                            ui.add_sized(
+                                                [40.0, 40.0],
+                                                egui::Image::new((*texture, *size))
+                                                    .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                                            );
+                                            ui.add_space(spacing);
+                                        }
+                                        ui.add(
+                                            egui::Label::new(data_text(format!("{name} selvagem")))
+                                                .truncate(true),
+                                        );
+                                    }
+                                },
+                            );
+                            offset = 1;
+                        }
                         ui.add_sized(
-                            [widths[0], 20.0],
-                            egui::Label::new(data_text(string_field(job, "modelo"))).truncate(true),
+                            [widths[offset], 20.0],
+                            egui::Label::new(data_text(format!(
+                                "{} · {}",
+                                job_type_label(job),
+                                string_field(job, "modelo")
+                            )))
+                            .truncate(true),
                         );
                         ui.add_sized(
-                            [widths[1], 20.0],
+                            [widths[offset + 1], 20.0],
                             egui::Label::new(data_text(string_field(job, "projeto")))
                                 .truncate(true),
                         );
                         ui.add_sized(
-                            [widths[2], 20.0],
+                            [widths[offset + 2], 20.0],
                             egui::Label::new(data_text(format_duration(number_field(
                                 job, "segundos",
                             )))),
@@ -2078,8 +2483,27 @@ fn show_running_jobs(
                         loading_blocks(ui);
                     });
                 } else {
+                    if show_wild {
+                        ui.horizontal(|ui| {
+                            if let Some((name, texture)) = wild.as_ref() {
+                                if let Some((texture, size)) = texture {
+                                    ui.add_sized(
+                                        [40.0, 40.0],
+                                        egui::Image::new((*texture, *size))
+                                            .fit_to_exact_size(egui::vec2(40.0, 40.0)),
+                                    );
+                                    ui.add_space(spacing);
+                                }
+                                ui.label(data_text(format!("{name} selvagem")));
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
-                        ui.label(data_text(string_field(job, "modelo")));
+                        ui.label(data_text(format!(
+                            "{} · {}",
+                            job_type_label(job),
+                            string_field(job, "modelo")
+                        )));
                         ui.add_space(8.0);
                         ui.label(data_text(format_duration(number_field(job, "segundos"))));
                     });
@@ -3173,22 +3597,54 @@ fn render_opencodex_account_stacked(
     });
 }
 
-fn show_antigravity(ui: &mut egui::Ui, content_width: f32, snapshot: Option<&AntigravitySnapshot>) {
+fn show_antigravity(
+    ui: &mut egui::Ui,
+    content_width: f32,
+    snapshot: Option<&AntigravitySnapshot>,
+    pokemon: &mut PokemonCache,
+    context: &egui::Context,
+    poke_mode: bool,
+) {
     section_frame(ui, "ANTIGRAVITY", content_width, |ui, content_width| {
-        match snapshot {
-            Some(snapshot) if snapshot.logged_in => {
-                ui.horizontal(|ui| {
-                    ui.label(data_text("●").color(hp_ok()));
-                    ui.label(pixel_text("logado", 10.0));
-                    ui.add_space(12.0);
-                    ui.label(data_text("gemini:antigravity"));
-                });
-                ui.add_space(4.0);
-                dim_label(ui, content_width, "sem cota exponível (CLI não publica uso)");
+        let texture = poke_mode
+            .then(|| pokemon.texture_by_number_cropped(context, 92, false))
+            .flatten()
+            .map(|texture| texture.id());
+        ui.horizontal(|ui| {
+            if let Some(texture) = texture {
+                ui.add_sized(
+                    [64.0, 64.0],
+                    egui::Image::new((texture, egui::vec2(64.0, 64.0))),
+                );
+                ui.add_space(8.0);
             }
-            Some(_) => dim_label(ui, content_width, "não logado"),
-            None => dim_label(ui, content_width, "status indisponível"),
-        }
+            ui.vertical(|ui| {
+                match snapshot {
+                    Some(snapshot) if snapshot.logged_in => {
+                        ui.horizontal(|ui| {
+                            ui.label(data_text("●").color(hp_ok()));
+                            ui.label(pixel_text("logado", 10.0));
+                            ui.add_space(12.0);
+                            ui.label(data_text("gemini:antigravity"));
+                        });
+                    }
+                    Some(_) => dim_label(ui, content_width, "não logado"),
+                    None => dim_label(ui, content_width, "status indisponível"),
+                }
+                if let Some(snapshot) = snapshot {
+                    let xp = snapshot
+                        .conversas
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "—".to_owned());
+                    let visto = snapshot
+                        .ultima_conversa
+                        .map(format_relative_time)
+                        .unwrap_or_else(|| "—".to_owned());
+                    ui.add_space(4.0);
+                    ui.label(data_text(format!("XP {xp} · visto {visto}")));
+                }
+            });
+        });
     });
 }
 
@@ -3952,6 +4408,22 @@ fn format_duration(seconds: f64) -> String {
     format!("{:02}:{:02}", total / 60, total % 60)
 }
 
+fn format_relative_time(timestamp: SystemTime) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(timestamp)
+        .unwrap_or_default()
+        .as_secs();
+    if seconds < 60 {
+        "agora".to_owned()
+    } else if seconds < 3600 {
+        format!("h\u{00e1} {}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("h\u{00e1} {}h", seconds / 3600)
+    } else {
+        format!("h\u{00e1} {}d", seconds / 86_400)
+    }
+}
+
 fn format_number(number: f64) -> String {
     let number = number.max(0.0);
     if number >= 1_000_000.0 {
@@ -3982,9 +4454,29 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{column_widths, merge_poll_result, read_config_scalar, set_config_scalar, MAX_TRANSIENT_ERR_STREAK};
+    use super::{
+        antigravity_email_from_text, column_widths, merge_poll_result, read_config_scalar,
+        set_config_scalar, MAX_TRANSIENT_ERR_STREAK,
+    };
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
+
+    #[test]
+    fn extrai_a_ultima_conta_do_log_antigravity() {
+        let duas_ocorrencias =
+            "authenticated successfully as primeira@example.com\nauthenticated successfully as ultima@gmail.com\n";
+        assert_eq!(
+            antigravity_email_from_text(duas_ocorrencias).as_deref(),
+            Some("ultima@gmail.com")
+        );
+        assert_eq!(antigravity_email_from_text("sem autenticacao"), None);
+        assert_eq!(
+            antigravity_email_from_text(
+                "authenticated successfully as conta@gmail.com lixo depois"
+            ),
+            Some("conta@gmail.com".to_owned())
+        );
+    }
 
     #[test]
     fn config_scalars_only_use_top_level_and_preserve_sections() {
