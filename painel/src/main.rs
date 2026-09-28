@@ -6,10 +6,13 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::Command,
-    sync::mpsc::{self, Receiver, Sender},
+    process::{Command, Output, Stdio},
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        Mutex,
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui;
@@ -995,14 +998,114 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
     }
 }
 
+/// Teto pra qualquer comando externo (status.py, cswap, setx, reg, cmdkey).
+/// Sem isto, um filho que trava pendura a refresh_loop pra sempre: nenhum
+/// Err chega, merge_poll_result (linha ~288) nunca troca o dado bom por
+/// erro, e a tela fica com dado velho pra sempre, em silencio.
+const TIMEOUT_COMANDO_EXTERNO: Duration = Duration::from_secs(10);
+
+/// Ultimo erro de uma acao disparada pelo usuario (troca de conta Claude via
+/// fix_claude_account, troca de perfil Codex via trocar_perfil_codex) que
+/// roda em thread separada -- e a unica forma dela avisar a UI, ja que nao
+/// tem `&self` ali. A UI le a cada frame (100ms) em show_claude/show_codex.
+static CLAUDE_ACTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static CODEX_ACTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_action_error(slot: &Mutex<Option<String>>, message: String) {
+    eprintln!("{message}");
+    *slot.lock().unwrap() = Some(message);
+}
+
+fn clear_action_error(slot: &Mutex<Option<String>>) {
+    *slot.lock().unwrap() = None;
+}
+
+fn action_error(slot: &Mutex<Option<String>>) -> Option<String> {
+    slot.lock().unwrap().clone()
+}
+
+/// Roda `cmd` e mata o processo se ele nao terminar em `limite`. Le
+/// stdout/stderr em threads separadas: sem isso, um filho tagarela enche o
+/// pipe e trava no write antes de sair, e o wait nunca retorna (o classico
+/// deadlock de Command::output com processos que escrevem muito). stdin
+/// fica fechado (Stdio::null()), igual ao Command::output() padrao -- a doc
+/// oficial confirma que output() nao herda stdin do pai, so spawn() herda;
+/// sem isso o filho herdaria o console do painel e uma leitura acidental
+/// travaria pra sempre em vez de fechar na hora.
+fn saida_com_timeout(cmd: &mut Command, limite: Duration) -> Result<Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout configurado acima");
+    let mut stderr_pipe = child.stderr.take().expect("stderr configurado acima");
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer);
+        let _ = stdout_tx.send(buffer);
+    });
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        let _ = stderr_tx.send(buffer);
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < limite => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                // ponytail: nao junto as threads leitoras aqui de proposito.
+                // Um neto do processo (ex.: `cmd /C algo`) pode ter herdado
+                // o pipe e continuar segurando aberto depois do pai morrer
+                // (TerminateProcess so mata o filho direto) -- esperar por
+                // elas reintroduziria o mesmo travamento que este helper
+                // existe pra evitar. As threads ficam soltas e morrem
+                // sozinhas quando o pipe delas fechar.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("não respondeu em {} s", limite.as_secs()));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+
+    // O processo terminou dentro do prazo, mas ainda limito a leitura: se um
+    // neto herdou o pipe (mesmo cenario acima), ele pode seguir segurando
+    // aberto mesmo com o pai morto. Isto e so drenar buffer ja escrito, entao
+    // uma folga curta e suficiente.
+    let folga = Duration::from_millis(500);
+    let stdout = stdout_rx.recv_timeout(folga).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(folga).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn read_status(repo: &Path) -> Result<Value, String> {
     let script = repo.join("skills").join("codex").join("status.py");
-    let output = match Command::new("python")
-        .arg(&script)
-        .arg("--json")
-        .current_dir(repo)
-        .output()
-    {
+    let mut cmd = Command::new("python");
+    cmd.arg(&script).arg("--json").current_dir(repo);
+    // status.py herda o CODEX_HOME de quando o painel abriu; setx nao
+    // atualiza esse env do processo ja rodando (mesmo motivo do comentario
+    // em read_codex_active_profile), entao sem isto os dados do Codex
+    // ficavam presos no perfil antigo depois de uma troca feita pelo painel.
+    // status.py:31 confirma que ele so olha o env CODEX_HOME (senao cai pra
+    // ~/.codex), entao setar aqui e exatamente o que ele espera.
+    if let Some(codex_home) = read_codex_home_path() {
+        cmd.env("CODEX_HOME", codex_home);
+    }
+    let output = match saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO) {
         Ok(output) => output,
         Err(error) => return Err(format!("status.py: {error}")),
     };
@@ -1025,7 +1128,9 @@ fn read_status(repo: &Path) -> Result<Value, String> {
 fn read_cswap() -> Result<Value, String> {
     let executable = cswap_executable().ok_or_else(|| "cswap não encontrado".to_owned())?;
 
-    let output = match Command::new(&executable).arg("list").arg("--json").output() {
+    let mut cmd = Command::new(&executable);
+    cmd.arg("list").arg("--json");
+    let output = match saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO) {
         Ok(output) => output,
         Err(error) => return Err(format!("cswap: {error}")),
     };
@@ -1087,21 +1192,30 @@ fn email_esta_fixado(fixacao: Option<&Value>, email: &str) -> bool {
 }
 
 fn run_cswap_number(executable: &Path, action: &str, number: i64) -> bool {
-    match Command::new(executable)
-        .arg(action)
-        .arg(number.to_string())
-        .output()
-    {
+    // So SETA erro aqui, nunca limpa: fix_claude_account (unico chamador)
+    // roda varios run_cswap_number numa acao so (enable* + switch + disable*),
+    // e um sucesso no meio (ex.: disable de outra conta) nao pode apagar a
+    // falha de uma chamada anterior. Quem limpa e fix_claude_account, uma vez
+    // so, no inicio de cada nova acao.
+    let mut cmd = Command::new(executable);
+    cmd.arg(action).arg(number.to_string());
+    match saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO) {
         Ok(output) if output.status.success() => true,
         Ok(output) => {
-            eprintln!(
-                "cswap {action} {number}: {}",
-                process_output_message(&output)
+            set_action_error(
+                &CLAUDE_ACTION_ERROR,
+                format!(
+                    "cswap {action} {number}: {}",
+                    process_output_message(&output)
+                ),
             );
             false
         }
         Err(error) => {
-            eprintln!("cswap {action} {number}: {error}");
+            set_action_error(
+                &CLAUDE_ACTION_ERROR,
+                format!("cswap {action} {number}: {error}"),
+            );
             false
         }
     }
@@ -1138,10 +1252,20 @@ fn write_fixacao(path: &Path, email: &str, numbers: &[i64]) -> bool {
 }
 
 fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTarget>) {
+    // Limpa no INICIO da acao (nao a cada chamada que der certo): assim um
+    // erro de uma etapa anterior (ex.: falhou desabilitar a conta 2) sobrevive
+    // ate o fim mesmo que uma etapa posterior (ex.: desabilitar a conta 4)
+    // funcione. Fica visivel ate a proxima acao comecar do zero.
+    clear_action_error(&CLAUDE_ACTION_ERROR);
     let Some(executable) = cswap_executable() else {
+        set_action_error(&CLAUDE_ACTION_ERROR, "cswap não encontrado".to_owned());
         return;
     };
     let Some(directory) = claude_config_dir() else {
+        set_action_error(
+            &CLAUDE_ACTION_ERROR,
+            "diretório de config do Claude não encontrado".to_owned(),
+        );
         return;
     };
     let state_path = directory.join("cswap-fixada.json");
@@ -1157,22 +1281,11 @@ fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTar
         let _ = fs::remove_file(&state_path);
     }
 
-    let switched = match Command::new(&executable)
-        .arg("switch")
-        .arg(number.to_string())
-        .output()
-    {
-        Ok(output) if output.status.success() => true,
-        Ok(output) => {
-            eprintln!("cswap switch {number}: {}", process_output_message(&output));
-            false
-        }
-        Err(error) => {
-            eprintln!("cswap switch {number}: {error}");
-            false
-        }
-    };
-    if !switched {
+    // "switch" segue exatamente o mesmo padrao de run_cswap_number (mesmos
+    // args, mesma mensagem de erro "cswap switch {number}: ..."), entao
+    // reusa a funcao em vez de duplicar o match -- e ja sai com timeout e
+    // erro visivel na UI de graca.
+    if !run_cswap_number(&executable, "switch", number) {
         return;
     }
 
@@ -1186,7 +1299,10 @@ fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTar
         .map(|account| account.number)
         .collect::<Vec<_>>();
     if !write_fixacao(&state_path, &email, &numbers) {
-        eprintln!("cswap fixacao: nao foi possivel gravar o estado");
+        set_action_error(
+            &CLAUDE_ACTION_ERROR,
+            "cswap fixação: não foi possível gravar o estado".to_owned(),
+        );
         return;
     }
     for number in numbers {
@@ -1307,7 +1423,9 @@ fn read_antigravity_account(home: &Path) -> Option<String> {
 // do projeto: a API local do agy exige um CSRF token gerado em runtime, sem
 // arquivo/env var de descoberta encontrado (investigado e descartado).
 fn read_antigravity() -> Option<AntigravitySnapshot> {
-    let output = Command::new("cmdkey").arg("/list").output().ok()?;
+    let mut cmd = Command::new("cmdkey");
+    cmd.arg("/list");
+    let output = saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO).ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let conta = home_directory().and_then(|home| read_antigravity_account(&home));
     let mut conversas = None;
@@ -1574,6 +1692,39 @@ fn next_effort(value: &str, model: &str) -> &'static str {
         ("high", _) => "low",
         ("ultra", _) => "low",
         _ => "low",
+    }
+}
+
+/// Troca o perfil ativo do Codex (setx CODEX_HOME). Os dois botoes "usar" do
+/// Codex (layout largo e layout empilhado) chamavam essa mesma logica
+/// inline, duplicada byte a byte; agora e uma funcao so, com timeout e erro
+/// visivel na UI (antes so ia pro eprintln!, e um exit != 0 do setx nem
+/// isso -- so Err(spawn) era checado).
+fn trocar_perfil_codex(perfil: String) {
+    let Some(home) = home_directory() else {
+        set_action_error(
+            &CODEX_ACTION_ERROR,
+            "setx CODEX_HOME: diretório home não encontrado".to_owned(),
+        );
+        return;
+    };
+    let path = home.join(&perfil);
+    let mut cmd = Command::new("setx");
+    cmd.arg("CODEX_HOME").arg(&path);
+    match saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO) {
+        Ok(output) if output.status.success() => clear_action_error(&CODEX_ACTION_ERROR),
+        Ok(output) => set_action_error(
+            &CODEX_ACTION_ERROR,
+            format!(
+                "setx CODEX_HOME {}: {}",
+                path.display(),
+                process_output_message(&output)
+            ),
+        ),
+        Err(error) => set_action_error(
+            &CODEX_ACTION_ERROR,
+            format!("setx CODEX_HOME {}: {error}", path.display()),
+        ),
     }
 }
 
@@ -2587,6 +2738,9 @@ fn show_claude(
     poke_mode: bool,
 ) {
     section_frame(ui, "CLAUDE", content_width, |ui, content_width| {
+        if let Some(error) = action_error(&CLAUDE_ACTION_ERROR) {
+            error_label(ui, content_width, &format!("Troca de conta falhou: {error}"));
+        }
         let value = match cswap {
             None => {
                 dim_label(ui, content_width, "carregando…");
@@ -3198,18 +3352,7 @@ fn render_codex_account_stacked(
                     .clicked()
                 {
                     let perfil = perfil.to_owned();
-                    thread::spawn(move || {
-                        let Some(home) = home_directory() else {
-                            eprintln!("setx CODEX_HOME: diretorio home nao encontrado");
-                            return;
-                        };
-                        let path = home.join(perfil);
-                        if let Err(error) =
-                            Command::new("setx").arg("CODEX_HOME").arg(&path).output()
-                        {
-                            eprintln!("setx CODEX_HOME {}: {error}", path.display());
-                        }
-                    });
+                    thread::spawn(move || trocar_perfil_codex(perfil));
                 }
             }
         }
@@ -3439,21 +3582,7 @@ fn render_codex_accounts(
                                             {
                                                 let perfil = perfil.to_owned();
                                                 thread::spawn(move || {
-                                                    let Some(home) = home_directory() else {
-                                                        eprintln!("setx CODEX_HOME: diretorio home nao encontrado");
-                                                        return;
-                                                    };
-                                                    let path = home.join(perfil);
-                                                    if let Err(error) = Command::new("setx")
-                                                        .arg("CODEX_HOME")
-                                                        .arg(&path)
-                                                        .output()
-                                                    {
-                                                        eprintln!(
-                                                            "setx CODEX_HOME {}: {error}",
-                                                            path.display()
-                                                        );
-                                                    }
+                                                    trocar_perfil_codex(perfil)
                                                 });
                                             }
                                         }
@@ -3562,6 +3691,9 @@ fn show_codex(
     poke_mode: bool,
 ) {
     section_frame(ui, "CODEX", content_width, |ui, content_width| {
+        if let Some(error) = action_error(&CODEX_ACTION_ERROR) {
+            error_label(ui, content_width, &format!("Troca de perfil falhou: {error}"));
+        }
         let value = match status {
             None => {
                 dim_label(ui, content_width, "carregando…");
@@ -4291,28 +4423,64 @@ fn quota_at(account: &Value, index: usize) -> Option<&Value> {
     account.get("quotas")?.as_array()?.get(index)
 }
 
-// Leio o registro, nao env::var, pois setx nao atualiza este processo; expando o caminho para nao literalizar %USERPROFILE%.
-fn read_codex_active_profile() -> Option<String> {
-    let output = Command::new("reg")
-        .args(["query", "HKCU\\Environment", "/v", "CODEX_HOME"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return Some(".codex".to_owned());
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let value = stdout.lines().find_map(|line| {
+/// Extrai o valor de CODEX_HOME de uma saida de
+/// `reg query HKCU\Environment /v CODEX_HOME`. None quando a linha esperada
+/// nao aparece (formato mudou, chave sem esse valor, ou saida vazia).
+fn parse_codex_home_reg_output(stdout: &str) -> Option<&str> {
+    stdout.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("CODEX_HOME")?.trim_start();
         let rest = rest
             .strip_prefix("REG_SZ")
             .or_else(|| rest.strip_prefix("REG_EXPAND_SZ"))?
             .trim();
         (!rest.is_empty()).then_some(rest)
-    })?;
-    Path::new(value)
-        .file_name()
+    })
+}
+
+// Leio o registro, nao env::var, pois setx nao atualiza este processo; expando o caminho para nao literalizar %USERPROFILE%.
+fn read_codex_active_profile() -> Option<String> {
+    let mut cmd = Command::new("reg");
+    cmd.args(["query", "HKCU\\Environment", "/v", "CODEX_HOME"]);
+    let output = saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO).ok()?;
+    if !output.status.success() {
+        return Some(".codex".to_owned());
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_codex_home_reg_output(&stdout)
+        .and_then(|value| Path::new(value).file_name())
         .and_then(|name| name.to_str())
         .map(str::to_owned)
+}
+
+/// CODEX_HOME completo, so quando o registro tem mesmo um valor gravado por
+/// um `setx` anterior (deste painel ou de fora). None quando a chave nao
+/// existe ou o comando falhou/nao respondeu -- quem chama entao NAO deve
+/// setar a env var, pra preservar o comportamento de hoje (env herdada do
+/// processo que abriu o painel). Diferente de read_codex_active_profile:
+/// aqui None e "sem info", nunca o fallback ".codex" -- read_status precisa
+/// distinguir "sem valor gravado" de "valor gravado e literalmente .codex".
+/// Uso o valor bruto do registro direto quando da: e o que qualquer outro
+/// processo veria se herdasse a env var, e bate com o que trocar_perfil_codex
+/// grava (confirmado ao vivo: `reg query` retornou
+/// "C:\Users\vinicius.oshima\.codex-b", igual a home.join(".codex-b")). So
+/// reconstruo via home.join(nome-da-pasta) se o valor vier com "%" (setx
+/// manual via System Properties grava REG_EXPAND_SZ tipo "%USERPROFILE%\...")
+/// -- nem este painel nem o status.py expandem %VAR% sozinhos, entao passar
+/// isso adiante quebraria em vez de ajudar.
+fn read_codex_home_path() -> Option<PathBuf> {
+    let mut cmd = Command::new("reg");
+    cmd.args(["query", "HKCU\\Environment", "/v", "CODEX_HOME"]);
+    let output = saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let raw = parse_codex_home_reg_output(&stdout)?;
+    if !raw.contains('%') && Path::new(raw).is_absolute() {
+        return Some(PathBuf::from(raw));
+    }
+    let name = Path::new(raw).file_name().and_then(|n| n.to_str())?;
+    Some(home_directory()?.join(name))
 }
 
 fn quota_percent_at(account: &Value, index: usize) -> Option<f64> {
@@ -4509,9 +4677,12 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        antigravity_email_from_text, bob_offset, column_widths, merge_poll_result,
-        read_config_scalar, set_config_scalar, MAX_TRANSIENT_ERR_STREAK,
+        action_error, antigravity_email_from_text, bob_offset, clear_action_error,
+        column_widths, merge_poll_result, parse_codex_home_reg_output, read_config_scalar,
+        saida_com_timeout, set_action_error, set_config_scalar, CODEX_ACTION_ERROR,
+        MAX_TRANSIENT_ERR_STREAK,
     };
+    use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
 
@@ -4607,5 +4778,85 @@ mod tests {
         let recuperado = merge_poll_result(estado_apos_teto, &mut streak, bom.clone());
         assert!(matches!(recuperado, Some(Ok(_))));
         assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn saida_com_timeout_mata_processo_que_nao_responde() {
+        let inicio = Instant::now();
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "6", "127.0.0.1"]);
+        let resultado = saida_com_timeout(&mut cmd, Duration::from_secs(1));
+        assert!(resultado.is_err(), "esperava timeout, veio {resultado:?}");
+        assert!(
+            inicio.elapsed() < Duration::from_secs(2),
+            "demorou demais pra desistir: {:?}",
+            inicio.elapsed()
+        );
+    }
+
+    /// Mesmo cenario acima, mas atras de um `cmd /C`: cmd.exe (filho direto)
+    /// morre com kill(), mas ping.exe (neto) herdou o pipe e continua
+    /// segurando aberto por ~5s. Se saida_com_timeout esperasse as threads
+    /// leitoras terminarem antes de devolver o timeout, este teste travaria
+    /// ate o ping morrer sozinho -- e exatamente o bug que motivou nao
+    /// juntar (join) as threads no caminho de timeout.
+    #[test]
+    fn saida_com_timeout_nao_trava_atras_de_shell_wrapper() {
+        let inicio = Instant::now();
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 6 127.0.0.1"]);
+        let resultado = saida_com_timeout(&mut cmd, Duration::from_secs(1));
+        assert!(resultado.is_err(), "esperava timeout, veio {resultado:?}");
+        assert!(
+            inicio.elapsed() < Duration::from_secs(2),
+            "o neto (ping.exe) segurando o pipe nao pode travar o timeout: {:?}",
+            inicio.elapsed()
+        );
+    }
+
+    #[test]
+    fn saida_com_timeout_retorna_stdout_de_comando_rapido() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "echo ok"]);
+        let saida = saida_com_timeout(&mut cmd, Duration::from_secs(5))
+            .expect("comando rapido nao deveria falhar nem estourar o timeout");
+        assert!(saida.status.success());
+        let texto = String::from_utf8_lossy(&saida.stdout);
+        assert!(
+            texto.trim().eq_ignore_ascii_case("ok"),
+            "stdout inesperado: {texto:?}"
+        );
+    }
+
+    #[test]
+    fn parse_codex_home_reg_output_le_reg_sz_e_ignora_o_resto() {
+        let saida = "\r\nHKEY_CURRENT_USER\\Environment\r\n    CODEX_HOME    REG_SZ    C:\\Users\\bruno\\.codex-b\r\n\r\n";
+        assert_eq!(
+            parse_codex_home_reg_output(saida),
+            Some("C:\\Users\\bruno\\.codex-b")
+        );
+        // REG_EXPAND_SZ tambem e aceito (setx manual via System Properties usa isso).
+        let com_expand = "HKEY_CURRENT_USER\\Environment\r\n    CODEX_HOME    REG_EXPAND_SZ    %USERPROFILE%\\.codex-b\r\n";
+        assert_eq!(
+            parse_codex_home_reg_output(com_expand),
+            Some("%USERPROFILE%\\.codex-b")
+        );
+        // chave ausente (saida de erro do reg query, sem a linha CODEX_HOME).
+        assert_eq!(
+            parse_codex_home_reg_output("HKEY_CURRENT_USER\\Environment\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn action_error_grava_e_limpa() {
+        // Usa o slot do Codex pra nao colidir com outro teste no mesmo slot
+        // (cargo test roda em threads paralelas; cada teste aqui usa um
+        // static diferente ou nao toca em nenhum).
+        assert_eq!(action_error(&CODEX_ACTION_ERROR), None);
+        set_action_error(&CODEX_ACTION_ERROR, "falhou X".to_owned());
+        assert_eq!(action_error(&CODEX_ACTION_ERROR).as_deref(), Some("falhou X"));
+        clear_action_error(&CODEX_ACTION_ERROR);
+        assert_eq!(action_error(&CODEX_ACTION_ERROR), None);
     }
 }
