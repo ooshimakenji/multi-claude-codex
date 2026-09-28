@@ -25,7 +25,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
@@ -317,21 +317,60 @@ def jobs_ativos():
     agora = time.time()
     corte = agora - 90
     encontrados = []
-    arqs = glob.glob(os.path.join(CODEX_HOME, "sessions", "**", "*.jsonl"),
-                     recursive=True)
+    sessions = os.path.join(CODEX_HOME, "sessions")
+    hoje = datetime.now().date()
+    pastas = []
+    for deslocamento in (0, 1):
+        dia = hoje - timedelta(days=deslocamento)
+        pastas.append(os.path.join(sessions, "{:04d}".format(dia.year),
+                                   "{:02d}".format(dia.month),
+                                   "{:02d}".format(dia.day)))
+
+    # O painel consulta isto a cada poucos segundos: nao percorra o historico.
+    # A janela de mtime continua sendo uma protecao para arquivos recentes que
+    # estejam fora do padrao de pastas, mas a data do rollout e o candidato
+    # principal porque NTFS pode nao atualizar mtime enquanto o arquivo esta aberto.
+    candidatos = set()
+    for pasta in pastas:
+        candidatos.update(glob.glob(os.path.join(pasta, "*.jsonl")))
     recentes = []
-    for arq in arqs:
+    for arq in candidatos:
         try:
             mtime = os.path.getmtime(arq)
         except OSError:
             continue
-        if mtime < corte:
-            continue
         recentes.append((mtime, arq))
 
-    # O filtro vem antes de abrir: rollouts antigos nao podem custar I/O aqui.
     for mtime, arq in sorted(recentes, reverse=True):
         try:
+            linhas = tail(arq, 8192)
+            ultimo = None
+            for linha in reversed(linhas):
+                try:
+                    evento = json.loads(linha)
+                except ValueError:
+                    continue
+                if isinstance(evento, dict):
+                    ultimo = evento
+                    break
+            if not ultimo:
+                continue
+            payload = ultimo.get("payload") or {}
+            if ultimo.get("type") == "task_complete" or (
+                    isinstance(payload, dict) and payload.get("type") == "task_complete"):
+                continue
+            ultimo_ts = _epoch(ultimo.get("timestamp"))
+            idade = agora - ultimo_ts if ultimo_ts is not None else None
+            pendente = (
+                ultimo.get("type") == "response_item" and
+                isinstance(payload, dict) and
+                payload.get("type") in ("function_call", "custom_tool_call",
+                                          "local_shell_call"))
+            if not ((idade is not None and 0 <= idade <= 90) or
+                    (pendente and idade is not None and 0 <= idade < 30 * 60)):
+                continue
+
+            # So agora vale a pena buscar cabecalho, contexto e tokens.
             linhas = tail(arq, 65536)
             primeiro = contexto = None
             # O cabecalho basta para inicio e contexto; limita a leitura de casos
@@ -347,22 +386,6 @@ def jobs_ativos():
                 if indice >= 127:
                     break
         except (OSError, ValueError):
-            continue
-
-        ultimo = None
-        for linha in reversed(linhas):
-            try:
-                evento = json.loads(linha)
-            except ValueError:
-                continue
-            if isinstance(evento, dict):
-                ultimo = evento
-                break
-        if not ultimo:
-            continue
-        payload = ultimo.get("payload") or {}
-        if ultimo.get("type") == "task_complete" or (
-                isinstance(payload, dict) and payload.get("type") == "task_complete"):
             continue
 
         uso = _ultimo_token_count(linhas)
@@ -691,7 +714,9 @@ def selftest():
             }}, fh)
 
     d = tempfile.mkdtemp()
-    roll = os.path.join(d, "sessions", "2026", "01", "01")
+    hoje = datetime.now().date()
+    roll = os.path.join(d, "sessions", "{:04d}".format(hoje.year),
+                        "{:02d}".format(hoje.month), "{:02d}".format(hoje.day))
     proj = os.path.join(d, "projects", "algum-projeto")
     os.makedirs(roll)
     os.makedirs(proj)
@@ -813,6 +838,10 @@ def selftest():
     ativo = os.path.join(roll, "rollout-active.jsonl")
     concluido = os.path.join(roll, "rollout-done.jsonl")
     antigo = os.path.join(roll, "rollout-old.jsonl")
+    mtime_old = os.path.join(roll, "rollout-old-mtime.jsonl")
+    pendente_10 = os.path.join(roll, "rollout-pending-10m.jsonl")
+    pendente_40 = os.path.join(roll, "rollout-pending-40m.jsonl")
+    stale_5 = os.path.join(roll, "rollout-stale-5m.jsonl")
     for caminho, eventos in (
         (ativo, [
             {"timestamp": agora - 12, "type": "turn_context", "payload": {
@@ -831,16 +860,44 @@ def selftest():
             {"timestamp": agora - 120, "type": "turn_context", "payload": {
                 "model": "gpt-5.6-luna", "cwd": proj}},
         ]),
+        (mtime_old, [
+            {"timestamp": agora - 1, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+        ]),
+        (pendente_10, [
+            {"timestamp": agora - 600, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+            {"timestamp": agora - 600, "type": "response_item", "payload": {
+                "type": "function_call", "name": "exec"}},
+        ]),
+        (pendente_40, [
+            {"timestamp": agora - 2400, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+            {"timestamp": agora - 2400, "type": "response_item", "payload": {
+                "type": "function_call", "name": "exec"}},
+        ]),
+        (stale_5, [
+            {"timestamp": agora - 300, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-luna", "cwd": proj}},
+            {"timestamp": agora - 300, "type": "response_item", "payload": {
+                "type": "reasoning"}},
+        ]),
     ):
         with open(caminho, "w", encoding="utf-8") as fh:
             for evento in eventos:
                 fh.write(json.dumps(evento) + "\n")
     os.utime(antigo, (agora - 100, agora - 100))
+    for caminho in (mtime_old, pendente_10, pendente_40, stale_5):
+        os.utime(caminho, (agora - 2 * 3600, agora - 2 * 3600))
     jobs = jobs_ativos()
     por_arquivo = {job["arquivo"]: job for job in jobs}
     assert "rollout-active.jsonl" in por_arquivo, jobs
     assert "rollout-done.jsonl" not in por_arquivo, jobs
     assert "rollout-old.jsonl" not in por_arquivo, jobs
+    assert "rollout-old-mtime.jsonl" in por_arquivo, jobs
+    assert "rollout-pending-10m.jsonl" in por_arquivo, jobs
+    assert "rollout-pending-40m.jsonl" not in por_arquivo, jobs
+    assert "rollout-stale-5m.jsonl" not in por_arquivo, jobs
     job = por_arquivo["rollout-active.jsonl"]
     assert job["modelo"] == "gpt-5.6-luna" and job["cwd"] == proj, job
     assert job["projeto"] == "algum-projeto" and job["tokens"] == 1234, job
