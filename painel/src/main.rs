@@ -1725,7 +1725,23 @@ fn show_command_center(
                 egui::vec2(content_width, arena_height(poke_mode, stacked, agy_visible)),
                 egui::Sense::hover(),
             );
-            let painter = ui.painter().with_clip_rect(arena);
+            let arena_clip = egui::Rect::from_min_max(
+                egui::pos2(arena.left(), arena.top() - 3.0),
+                arena.right_bottom(),
+            );
+            let painter = ui.painter().with_clip_rect(arena_clip);
+            let time = context.input(|input| input.time);
+            let has_codex_job = codex_job_running(status);
+            let claude_offset = bob_offset(time, 0.0, 2.0);
+            let codex_offset = if has_codex_job {
+                bob_offset(time, 0.25, 2.0)
+            } else {
+                0.0
+            };
+            let agy_offset = antigravity
+                .is_some_and(|snapshot| snapshot.logged_in)
+                .then(|| bob_offset(time * 0.625, 0.0, 3.0))
+                .unwrap_or(0.0);
 
             let claude_account = cswap
                 .and_then(|result| result.as_ref().ok())
@@ -1827,6 +1843,7 @@ fn show_command_center(
                     true,
                     poke_mode,
                     ArenaSideLayout::Stacked,
+                    claude_offset,
                 );
                 draw_arena_delegation(
                     &painter,
@@ -1851,6 +1868,7 @@ fn show_command_center(
                     false,
                     poke_mode,
                     ArenaSideLayout::Stacked,
+                    codex_offset,
                 );
                 if let Some(label) = agy_label.as_deref() {
                     draw_arena_antigravity_band(
@@ -1886,6 +1904,7 @@ fn show_command_center(
                     false,
                     true,
                     codex_layout,
+                    codex_offset,
                 );
                 if let Some(label) = agy_label.as_deref() {
                     draw_arena_antigravity_wide(
@@ -1896,6 +1915,7 @@ fn show_command_center(
                         ),
                         agy_texture,
                         label,
+                        agy_offset,
                     );
                 }
                 draw_arena_delegation(
@@ -1924,6 +1944,7 @@ fn show_command_center(
                     true,
                     true,
                     ArenaSideLayout::WideBottom,
+                    claude_offset,
                 );
             } else {
                 let side_width =
@@ -1957,6 +1978,7 @@ fn show_command_center(
                     true,
                     false,
                     ArenaSideLayout::Sober,
+                    0.0,
                 );
                 draw_arena_delegation(&painter, ui, delegation_rect, status);
                 draw_arena_side(
@@ -1970,6 +1992,7 @@ fn show_command_center(
                     false,
                     false,
                     ArenaSideLayout::Sober,
+                    0.0,
                 );
                 if let Some(label) = agy_label.as_deref() {
                     draw_arena_antigravity_band(
@@ -2038,6 +2061,7 @@ fn draw_arena_side(
     player: bool,
     poke_mode: bool,
     layout: ArenaSideLayout,
+    sprite_offset: f32,
 ) {
     let sprite_size = ARENA_SPRITE_SIZE;
     let sprite_zone = if player {
@@ -2117,7 +2141,7 @@ fn draw_arena_side(
     if let Some(texture) = texture {
         painter.image(
             texture,
-            sprite_rect,
+            sprite_rect.translate(egui::vec2(0.0, sprite_offset)),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
@@ -2159,6 +2183,7 @@ fn draw_arena_antigravity_wide(
     rect: egui::Rect,
     texture: Option<egui::TextureId>,
     label: &str,
+    sprite_offset: f32,
 ) {
     let sprite_rect = egui::Rect::from_center_size(
         egui::pos2(
@@ -2170,7 +2195,7 @@ fn draw_arena_antigravity_wide(
     if let Some(texture) = texture {
         painter.image(
             texture,
-            sprite_rect,
+            sprite_rect.translate(egui::vec2(0.0, sprite_offset)),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
@@ -2367,10 +2392,42 @@ fn fnv1a(text: &str) -> u64 {
     })
 }
 
+fn bob_offset(time: f64, phase: f64, amplitude: f32) -> f32 {
+    if (((time + phase) * 2.0).floor() as i64).rem_euclid(2) == 0 {
+        0.0
+    } else {
+        -amplitude
+    }
+}
+
 fn job_type_label(job: &Value) -> &'static str {
     match job.get("tipo").and_then(Value::as_str) {
         Some("claude") => "CLAUDE",
         _ => "CODEX",
+    }
+}
+
+fn codex_job_running(status: Option<&Result<Value, String>>) -> bool {
+    status
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|value| value.get("jobs"))
+        .and_then(Value::as_array)
+        .is_some_and(|jobs| jobs.iter().any(|job| job_type_label(job) == "CODEX"))
+}
+
+fn draw_wild_sprite(ui: &mut egui::Ui, texture: Option<egui::TextureId>, time: f64, phase: f64) {
+    let (slot, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
+    if let Some(texture) = texture {
+        let sprite_rect = egui::Rect::from_min_size(
+            slot.min + egui::vec2(0.0, bob_offset(time, phase, 2.0)),
+            slot.size(),
+        );
+        ui.painter().image(
+            texture,
+            sprite_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
     }
 }
 
@@ -2382,6 +2439,7 @@ fn show_running_jobs(
     context: &egui::Context,
     poke_mode: bool,
 ) {
+    let time = context.input(|input| input.time);
     section_frame(ui, "RODANDO AGORA", content_width, |ui, content_width| {
         let value = match status {
             None => {
@@ -2410,7 +2468,7 @@ fn show_running_jobs(
                     let wild = pokemon.selvagens[index].clone();
                     let texture = pokemon
                         .texture_by_number_cropped(context, wild.number, false)
-                        .map(|texture| (texture.id(), texture.size_vec2()));
+                        .map(|texture| texture.id());
                     Some((wild.name.to_ascii_uppercase(), texture))
                 } else {
                     None
@@ -2435,6 +2493,7 @@ fn show_running_jobs(
             for (index, job) in jobs.iter().enumerate() {
                 let wild = wild_rows[index].clone();
                 if let Some(widths) = widths.as_ref() {
+                    let wild_phase = (fnv1a(&string_field(job, "arquivo")) % 1000) as f64 / 1000.0;
                     ui.horizontal(|ui| {
                         let mut offset = 0;
                         if show_wild {
@@ -2443,14 +2502,13 @@ fn show_running_jobs(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     if let Some((name, texture)) = wild.as_ref() {
-                                        if let Some((texture, size)) = texture {
-                                            ui.add_sized(
-                                                [40.0, 40.0],
-                                                egui::Image::new((*texture, *size))
-                                                    .fit_to_exact_size(egui::vec2(40.0, 40.0)),
-                                            );
-                                            ui.add_space(spacing);
-                                        }
+                                        draw_wild_sprite(
+                                            ui,
+                                            texture.as_ref().copied(),
+                                            time,
+                                            wild_phase,
+                                        );
+                                        ui.add_space(spacing);
                                         ui.add(
                                             egui::Label::new(data_text(format!("{name} selvagem")))
                                                 .truncate(true),
@@ -2484,16 +2542,12 @@ fn show_running_jobs(
                     });
                 } else {
                     if show_wild {
+                        let wild_phase =
+                            (fnv1a(&string_field(job, "arquivo")) % 1000) as f64 / 1000.0;
                         ui.horizontal(|ui| {
                             if let Some((name, texture)) = wild.as_ref() {
-                                if let Some((texture, size)) = texture {
-                                    ui.add_sized(
-                                        [40.0, 40.0],
-                                        egui::Image::new((*texture, *size))
-                                            .fit_to_exact_size(egui::vec2(40.0, 40.0)),
-                                    );
-                                    ui.add_space(spacing);
-                                }
+                                draw_wild_sprite(ui, texture.as_ref().copied(), time, wild_phase);
+                                ui.add_space(spacing);
                                 ui.label(data_text(format!("{name} selvagem")));
                             }
                         });
@@ -4455,8 +4509,8 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        antigravity_email_from_text, column_widths, merge_poll_result, read_config_scalar,
-        set_config_scalar, MAX_TRANSIENT_ERR_STREAK,
+        antigravity_email_from_text, bob_offset, column_widths, merge_poll_result,
+        read_config_scalar, set_config_scalar, MAX_TRANSIENT_ERR_STREAK,
     };
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
@@ -4476,6 +4530,17 @@ mod tests {
             ),
             Some("conta@gmail.com".to_owned())
         );
+    }
+
+    #[test]
+    fn bob_offset_alterna_em_degraus_e_respeita_a_fase() {
+        assert_eq!(bob_offset(0.0, 0.0, 2.0), 0.0);
+        assert_eq!(bob_offset(0.499, 0.0, 2.0), 0.0);
+        assert_eq!(bob_offset(0.5, 0.0, 2.0), -2.0);
+        assert_eq!(bob_offset(0.999, 0.0, 2.0), -2.0);
+        assert_eq!(bob_offset(1.0, 0.0, 2.0), 0.0);
+        assert_eq!(bob_offset(0.249, 0.25, 2.0), 0.0);
+        assert_eq!(bob_offset(0.25, 0.25, 2.0), -2.0);
     }
 
     #[test]
