@@ -315,33 +315,38 @@ def _epoch(valor):
 def jobs_ativos():
     """Lista rollouts que ainda estao escrevendo e nao terminaram."""
     agora = time.time()
-    corte = agora - 90
     encontrados = []
-    sessions = os.path.join(CODEX_HOME, "sessions")
     hoje = datetime.now().date()
-    pastas = []
-    for deslocamento in (0, 1):
-        dia = hoje - timedelta(days=deslocamento)
-        pastas.append(os.path.join(sessions, "{:04d}".format(dia.year),
-                                   "{:02d}".format(dia.month),
-                                   "{:02d}".format(dia.day)))
 
     # O painel consulta isto a cada poucos segundos: nao percorra o historico.
-    # A janela de mtime continua sendo uma protecao para arquivos recentes que
-    # estejam fora do padrao de pastas, mas a data do rollout e o candidato
-    # principal porque NTFS pode nao atualizar mtime enquanto o arquivo esta aberto.
-    candidatos = set()
-    for pasta in pastas:
-        candidatos.update(glob.glob(os.path.join(pasta, "*.jsonl")))
+    # Candidatos vem SO das pastas de hoje/ontem, uma vez por perfil Codex
+    # (~/.codex, ~/.codex-b, ...) -- sem isso um "codex exec" rodando num
+    # perfil que nao e o CODEX_HOME do painel fica invisivel. Nao ha varredura
+    # de mtime fora desse padrao (custaria stat() em centenas de arquivos a
+    # cada poll); mtime so decide a ORDEM de leitura e serve de ultimo recurso
+    # para "inicio" quando o rollout nunca chega a gravar um timestamp -- quem
+    # decide ativo/inativo e o timestamp do ULTIMO EVENTO dentro do arquivo
+    # (idade/pendente abaixo), porque o NTFS pode nao atualizar mtime enquanto
+    # o arquivo esta aberto.
+    candidatos = {}
+    for home in codex_profile_homes():
+        sessions = os.path.join(home, "sessions")
+        for deslocamento in (0, 1):
+            dia = hoje - timedelta(days=deslocamento)
+            pasta = os.path.join(sessions, "{:04d}".format(dia.year),
+                                 "{:02d}".format(dia.month),
+                                 "{:02d}".format(dia.day))
+            for arq in glob.glob(os.path.join(pasta, "*.jsonl")):
+                candidatos[arq] = home
     recentes = []
-    for arq in candidatos:
+    for arq, home in candidatos.items():
         try:
             mtime = os.path.getmtime(arq)
         except OSError:
             continue
-        recentes.append((mtime, arq))
+        recentes.append((mtime, arq, home))
 
-    for mtime, arq in sorted(recentes, reverse=True):
+    for mtime, arq, home in sorted(recentes, reverse=True):
         try:
             linhas = tail(arq, 8192)
             ultimo = None
@@ -400,6 +405,7 @@ def jobs_ativos():
             "tokens": total,
             "segundos": max(0, agora - (inicio if inicio is not None else mtime)),
             "arquivo": os.path.basename(arq),
+            "perfil": os.path.basename(home),
         })
 
     subagentes = glob.glob(os.path.join(
@@ -410,15 +416,62 @@ def jobs_ativos():
             mtime = os.path.getmtime(arq)
         except OSError:
             continue
-        if mtime < corte:
+        if mtime < agora - 30 * 60:
             continue
         recentes.append((mtime, arq))
 
-    # O mtime e o unico criterio confiavel encontrado nos arquivos atuais de
-    # subagente; sinais de termino explicitos, quando presentes, tambem valem.
+    # mtime so filtra candidatos (uma tool longa grava pouco por ate ~30min);
+    # quem decide ativo e o timestamp do ULTIMO EVENTO, igual ao Codex acima.
+    # _subagente_terminou pega marcador explicito de fim; sem ele, um bloco
+    # pendente (ver abaixo) ainda conta como ativo por ate 30min. So texto
+    # sem nenhum sinal pendente, com mais de 90s, e fim de verdade.
     for mtime, arq in sorted(recentes, reverse=True):
         try:
             linhas = tail(arq, 65536)
+        except OSError:
+            continue
+        if _subagente_terminou(linhas):
+            continue
+        ultimo = ultimo_msg = None
+        for linha in reversed(linhas):
+            try:
+                evento = json.loads(linha)
+            except ValueError:
+                continue
+            if not isinstance(evento, dict):
+                continue
+            if ultimo is None:
+                ultimo = evento
+            if ultimo_msg is None and evento.get("type") in ("assistant", "user"):
+                ultimo_msg = evento
+            if ultimo is not None and ultimo_msg is not None:
+                break
+        if not ultimo:
+            continue
+        ultimo_ts = _epoch(ultimo.get("timestamp"))
+        idade = agora - ultimo_ts if ultimo_ts is not None else None
+        msg = ultimo_msg.get("message") if isinstance(ultimo_msg, dict) else None
+        blocos = msg.get("content") if isinstance(msg, dict) else None
+        blocos = blocos if isinstance(blocos, list) else []
+        # tool_use/tool_result (cliente OU server-side: "server_tool_use",
+        # "<nome>_tool_result", por isso substring) e thinking sempre
+        # continuam para outro bloco -- so texto sozinho pode ser fim de
+        # verdade. stop_reason="tool_use" e reforco (a API para so pra
+        # chamar ferramenta); stop_reason None NAO entra aqui -- medido em
+        # 241 transcripts encerrados, 27 terminam com texto e stop_reason
+        # None sem nunca mais escrever nada, entao None nao prova pendencia.
+        tipos = [b.get("type") for b in blocos
+                 if isinstance(b, dict) and isinstance(b.get("type"), str)]
+        pendente = any("tool_use" in t or "tool_result" in t or "thinking" in t
+                       for t in tipos)
+        if not pendente and isinstance(ultimo_msg, dict) and ultimo_msg.get("type") == "assistant":
+            stop_reason = msg.get("stop_reason") if isinstance(msg, dict) else None
+            pendente = stop_reason == "tool_use"
+        if not ((idade is not None and 0 <= idade <= 90) or
+                (pendente and idade is not None and 0 <= idade < 30 * 60)):
+            continue
+
+        try:
             primeiro = None
             for indice, evento in enumerate(_loads(arq)):
                 if isinstance(evento, dict):
@@ -426,19 +479,14 @@ def jobs_ativos():
                     break
                 if indice >= 127:
                     break
-            if _subagente_terminou(linhas):
-                continue
+        except OSError:
+            primeiro = None
+        try:
             meta_path = os.path.splitext(arq)[0] + ".meta.json"
             with open(meta_path, encoding="utf-8") as fh:
                 meta = json.load(fh)
         except (OSError, ValueError, TypeError):
             meta = {}
-            try:
-                linhas = tail(arq, 65536)
-                primeiro = next((evento for evento in _loads(arq)
-                                 if isinstance(evento, dict)), None)
-            except (OSError, ValueError):
-                continue
 
         inicio = _epoch(primeiro.get("timestamp")) if isinstance(primeiro, dict) else None
         if inicio is None:
@@ -922,6 +970,63 @@ def selftest():
     assert "agent-stopped.jsonl" not in por_arquivo, jobs
     assert all("tipo" in job for job in jobs), jobs
 
+    # P2 (bug real, medido em transcript ao vivo): gap de tool call longa
+    # (bash, build, thinking estendido) nao pode derrubar o job do painel --
+    # so o EVENTO final decide, nao o corte fixo de 90s no candidato.
+    tool_use = os.path.join(subagents, "agent-tooluse-3min.jsonl")
+    tool_result = os.path.join(subagents, "agent-toolresult-2min.jsonl")
+    texto_so = os.path.join(subagents, "agent-textonly-3min.jsonl")
+    tool_use_40 = os.path.join(subagents, "agent-tooluse-40min.jsonl")
+    qualquer_30s = os.path.join(subagents, "agent-any-30s.jsonl")
+    gerando_3min = os.path.join(subagents, "agent-gerando-3min.jsonl")
+    attach_depois = os.path.join(subagents, "agent-attach-depois.jsonl")
+    server_tool = os.path.join(subagents, "agent-server-tool.jsonl")
+    agora_p = time.time()
+    for caminho, eventos in (
+        (tool_use, [{"timestamp": agora_p - 180, "type": "assistant",
+                     "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}]),
+        (tool_result, [{"timestamp": agora_p - 120, "type": "user",
+                        "message": {"content": [{"type": "tool_result", "content": "ok"}]}}]),
+        (texto_so, [{"timestamp": agora_p - 180, "type": "assistant",
+                     "message": {"content": [{"type": "text", "text": "pronto"}]}}]),
+        (tool_use_40, [{"timestamp": agora_p - 2400, "type": "assistant",
+                        "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}]),
+        (qualquer_30s, [{"timestamp": agora_p - 30, "type": "attachment"}]),
+        # thinking nunca e o ultimo bloco de um turno -- cobre o gap de
+        # "thinking estendido" citado no bug, que nao tem tool_use/tool_result.
+        (gerando_3min, [{"timestamp": agora_p - 180, "type": "assistant",
+                         "message": {"content": [{"type": "thinking", "thinking": "..."}]}}]),
+        # tool_result seguido de attachment (o proprio harness grava um logo
+        # apos) -- o ULTIMO evento e o attachment, tem que andar pra tras.
+        (attach_depois, [
+            {"timestamp": agora_p - 120, "type": "user",
+             "message": {"content": [{"type": "tool_result", "content": "ok"}]}},
+            {"timestamp": agora_p - 119, "type": "attachment"},
+        ]),
+        # ferramenta server-side (advisor, ...): tudo dentro de mensagens
+        # assistant, sem par user/tool_result.
+        (server_tool, [{"timestamp": agora_p - 150, "type": "assistant",
+                        "message": {"content": [{"type": "server_tool_use",
+                                                  "name": "advisor"}]}}]),
+    ):
+        with open(caminho, "w", encoding="utf-8") as fh:
+            for evento in eventos:
+                fh.write(json.dumps(evento) + "\n")
+    # grava recente (entra como candidato) com evento antigo dentro -- e o
+    # corte de 30min pelo EVENTO, nao a selecao por mtime, que tem que excluir.
+    os.utime(tool_use_40, (agora_p - 60, agora_p - 60))
+
+    jobs = jobs_ativos()
+    por_arquivo = {job["arquivo"]: job for job in jobs}
+    assert "agent-tooluse-3min.jsonl" in por_arquivo, jobs
+    assert "agent-toolresult-2min.jsonl" in por_arquivo, jobs
+    assert "agent-textonly-3min.jsonl" not in por_arquivo, jobs
+    assert "agent-tooluse-40min.jsonl" not in por_arquivo, jobs
+    assert "agent-any-30s.jsonl" in por_arquivo, jobs
+    assert "agent-gerando-3min.jsonl" in por_arquivo, jobs
+    assert "agent-attach-depois.jsonl" in por_arquivo, jobs
+    assert "agent-server-tool.jsonl" in por_arquivo, jobs
+
     # o contrato que importa: --line NAO pode gravar o marco
     global MARK
     MARK = os.path.join(d, "mark.json")
@@ -943,6 +1048,37 @@ def selftest():
     assert set(json_saida) == {"codex", "claude", "free_tier", "jobs", "ts"}, json_saida
     marca_depois = (open(MARK, "rb").read(), os.stat(MARK).st_mtime_ns)
     assert marca_depois == marca_antes, "--json alterou o marco"
+
+    # P1 (bug real: so um perfil Codex era varrido): rollout que existe SO num
+    # segundo perfil (~/.codex-b) tem que aparecer, com o "perfil" certo.
+    familia = tempfile.mkdtemp()
+    perfil_a = os.path.join(familia, ".codex")
+    perfil_b = os.path.join(familia, ".codex-b")
+    pasta_b = os.path.join(perfil_b, "sessions", "{:04d}".format(hoje.year),
+                           "{:02d}".format(hoje.month), "{:02d}".format(hoje.day))
+    os.makedirs(perfil_a)
+    os.makedirs(pasta_b)
+    agora_b = time.time()
+    with open(os.path.join(pasta_b, "rollout-b.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"timestamp": agora_b - 5, "type": "turn_context", "payload": {
+            "model": "gpt-5.6-sol", "cwd": proj}}) + "\n")
+        fh.write(json.dumps({"timestamp": agora_b - 1, "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {"total_tokens": 42}}}}) + "\n")
+
+    global HOME
+    home_original, codex_home_original = HOME, CODEX_HOME
+    HOME, CODEX_HOME = familia, perfil_a
+    try:
+        perfis_achados = {os.path.normcase(p) for p in codex_profile_homes()}
+        assert perfis_achados == {os.path.normcase(perfil_a),
+                                   os.path.normcase(perfil_b)}, perfis_achados
+        jobs_b = jobs_ativos()
+    finally:
+        HOME, CODEX_HOME = home_original, codex_home_original
+
+    por_arquivo_b = {job["arquivo"]: job for job in jobs_b}
+    assert "rollout-b.jsonl" in por_arquivo_b, jobs_b
+    assert por_arquivo_b["rollout-b.jsonl"]["perfil"] == ".codex-b", jobs_b
 
     assert humano(999) == "999" and humano(20455411) == "20.5M", humano(20455411)
     print("selftest ok")
