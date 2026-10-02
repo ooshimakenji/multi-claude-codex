@@ -32,6 +32,13 @@ NVIDIA juntos, então mais um deles no fim da fila não seria fallback nenhum.
 | `normal` | `gpt-5.6-terra` | default geral |
 | `pesado` | `gpt-5.6-sol` | difícil ou ambíguo; aceita `model_reasoning_effort` até `ultra` |
 
+### Roteador (Laya, local)
+
+Antes de delegar, rode `C:/Users/vinicius.oshima/lv/Scripts/python.exe skills/codex/rotear.py "<briefing>"`.
+A saída é uma sugestão em modo sombra: o Claude ainda declara o modelo/effort e pode discordar;
+anote quando discordar. O log fica em `~/.claude/rotear-log.jsonl`.
+A venv do Laya é `C:/Users/vinicius.oshima/lv`.
+
 `git push` e `git pull` não precisam de modelo nenhum — são Bash direto. A camada
 `trivial` serve para tarefa de texto, não para operação de shell.
 
