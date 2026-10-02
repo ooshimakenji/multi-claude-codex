@@ -34,10 +34,11 @@ NVIDIA juntos, então mais um deles no fim da fila não seria fallback nenhum.
 
 ### Roteador (Laya, local)
 
-Antes de delegar, rode `C:/Users/vinicius.oshima/lv/Scripts/python.exe skills/codex/rotear.py "<briefing>"`.
-A saída é uma sugestão em modo sombra: o Claude ainda declara o modelo/effort e pode discordar;
-anote quando discordar. O log fica em `~/.claude/rotear-log.jsonl`.
+Modo sombra: colete os rollouts com `rotear.py --coletar --dias 7`.
+Após revisar cada delegação, rode `rotear.py --desfecho ultimo ok|refez|exagero`.
+Use `rotear.py --relatorio` para o placar; os dados ficam em `~/.claude/rotear-sombra.jsonl`.
 A venv do Laya é `C:/Users/vinicius.oshima/lv`.
+Reavalie em ~1 mês; fine-tune só vale se bater `regra+terra`.
 
 `git push` e `git pull` não precisam de modelo nenhum — são Bash direto. A camada
 `trivial` serve para tarefa de texto, não para operação de shell.
