@@ -910,8 +910,9 @@ fn show_title_bar(context: &egui::Context, poke_mode: &mut bool) {
         )
         .show(context, |ui| {
             ui.horizontal(|ui| {
-                let controls_width = 68.0 + 24.0 + 24.0 + ui.spacing().item_spacing.x * 2.0;
-                let drag_width = (ui.available_width() - controls_width).max(40.0);
+                let usable_width = context.screen_rect().width() / context.pixels_per_point() - 20.0;
+                let controls_width = 68.0 + 24.0 + 24.0 + ui.spacing().item_spacing.x * 3.0;
+                let drag_width = (usable_width - controls_width).max(40.0);
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(drag_width, 24.0),
                     egui::Sense::click_and_drag(),
@@ -2780,6 +2781,30 @@ fn show_claude(
         ];
         match column_widths(content_width, CLAUDE_GRID_GAPS, &cols) {
             Some(widths) => {
+                // Pré-calcula o layout das barras de uso para as duas colunas de quota
+                let percentages_5h: Vec<_> = accounts.iter().map(|a| usage_percent(a, "fiveHour")).collect();
+                let percentages_7d: Vec<_> = accounts.iter().map(|a| usage_percent(a, "sevenDay")).collect();
+                let ages: Vec<_> = accounts.iter().map(|a| usage_age(a)).collect();
+                let ages_refs: Vec<_> = ages.iter().map(|a| a.as_deref()).collect();
+                let countdowns_5h: Vec<_> = accounts.iter().map(|a| usage_text(a, "fiveHour", "countdown")).collect();
+                let countdowns_7d: Vec<_> = accounts.iter().map(|a| usage_text(a, "sevenDay", "countdown")).collect();
+                let clocks_5h: Vec<_> = accounts.iter().map(|a| usage_clock(a, "fiveHour")).collect();
+                let clocks_7d: Vec<_> = accounts.iter().map(|a| usage_clock(a, "sevenDay")).collect();
+                let layout_5h = UsageBarLayout::calculate(
+                    widths[1],
+                    &percentages_5h,
+                    &ages_refs,
+                    &countdowns_5h,
+                    &clocks_5h,
+                );
+                let layout_7d = UsageBarLayout::calculate(
+                    widths[2],
+                    &percentages_7d,
+                    &ages_refs,
+                    &countdowns_7d,
+                    &clocks_7d,
+                );
+
                 egui::Grid::new("claude_accounts")
                     .num_columns(3)
                     .min_col_width(0.0)
@@ -3000,6 +3025,7 @@ fn show_claude(
                                 five_hour_countdown,
                                 five_hour_clock,
                                 cache_age.as_deref(),
+                                layout_5h,
                             )
                         },
                     );
@@ -3013,6 +3039,7 @@ fn show_claude(
                                 seven_day_countdown,
                                 seven_day_clock,
                                 cache_age.as_deref(),
+                                layout_7d,
                             )
                         },
                     );
@@ -3049,7 +3076,16 @@ fn column_widths(available: f32, gaps: f32, cols: &[(f32, f32)]) -> Option<Vec<f
     if available < min + gaps {
         return None;
     }
-    let scale = ((available - gaps - min) / (ideal - min)).clamp(0.0, 1.0);
+    let content_available = available - gaps;
+    if content_available >= ideal {
+        // Se temos espaço extra além do ideal, adiciona à primeira coluna
+        let mut widths: Vec<f32> = cols.iter().map(|(_, i)| *i).collect();
+        if !widths.is_empty() {
+            widths[0] += content_available - ideal;
+        }
+        return Some(widths);
+    }
+    let scale = ((content_available - min) / (ideal - min)).clamp(0.0, 1.0);
     Some(cols.iter().map(|(m, i)| m + (i - m) * scale).collect())
 }
 
@@ -3187,6 +3223,13 @@ fn render_claude_account_stacked(
         }
     });
 
+    let layout = UsageBarLayout::calculate(
+        width - 34.0 - 4.0, // 4px gap
+        &[five_hour, seven_day],
+        &[cache_age.as_deref(), cache_age.as_deref()],
+        &[five_hour_countdown.clone(), seven_day_countdown.clone()],
+        &[five_hour_clock.clone(), seven_day_clock.clone()],
+    );
     ui.horizontal(|ui| {
         ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("5h", 10.0)));
         usage_bar_aged(
@@ -3195,6 +3238,7 @@ fn render_claude_account_stacked(
             five_hour_countdown,
             five_hour_clock,
             cache_age.as_deref(),
+            layout,
         );
     });
     ui.horizontal(|ui| {
@@ -3205,6 +3249,7 @@ fn render_claude_account_stacked(
             seven_day_countdown,
             seven_day_clock,
             cache_age.as_deref(),
+            layout,
         );
     });
 }
@@ -3358,6 +3403,13 @@ fn render_codex_account_stacked(
         }
     });
 
+    let layout = UsageBarLayout::calculate(
+        width - 42.0 - 4.0, // 4px gap
+        &[primeira, segunda],
+        &[primeira_age.as_deref(), segunda_age.as_deref()],
+        &[primeira_countdown.clone(), segunda_countdown.clone()],
+        &[primeira_clock.clone(), segunda_clock.clone()],
+    );
     ui.horizontal(|ui| {
         ui.add_sized([42.0, 20.0], egui::Label::new(pixel_text("cota", 10.0)));
         usage_bar_aged(
@@ -3366,6 +3418,7 @@ fn render_codex_account_stacked(
             primeira_countdown,
             primeira_clock,
             primeira_age.as_deref(),
+            layout,
         );
     });
     ui.horizontal(|ui| {
@@ -3376,6 +3429,7 @@ fn render_codex_account_stacked(
             segunda_countdown,
             segunda_clock,
             segunda_age.as_deref(),
+            layout,
         );
     });
 }
@@ -3417,6 +3471,32 @@ fn render_codex_accounts(
         return;
     }
     let widths = widths.expect("larguras do grid do Codex");
+
+    // Pré-calcula o layout das barras de uso para as duas colunas de quota
+    let percentages_primeira: Vec<_> = accounts.iter().map(|a| quota_percent_at(a, 0)).collect();
+    let percentages_segunda: Vec<_> = accounts.iter().map(|a| quota_percent_at(a, 1)).collect();
+    let ages_primeira: Vec<_> = accounts.iter().map(|a| quota_window_at(a, 0).map(window_label)).collect();
+    let ages_segunda: Vec<_> = accounts.iter().map(|a| quota_window_at(a, 1).map(window_label)).collect();
+    let ages_primeira_refs: Vec<_> = ages_primeira.iter().map(|a| a.as_deref()).collect();
+    let ages_segunda_refs: Vec<_> = ages_segunda.iter().map(|a| a.as_deref()).collect();
+    let countdowns_primeira: Vec<_> = accounts.iter().map(|a| quota_countdown_at(a, 0)).collect();
+    let countdowns_segunda: Vec<_> = accounts.iter().map(|a| quota_countdown_at(a, 1)).collect();
+    let clocks_primeira: Vec<_> = accounts.iter().map(|a| quota_clock_at(a, 0)).collect();
+    let clocks_segunda: Vec<_> = accounts.iter().map(|a| quota_clock_at(a, 1)).collect();
+    let layout_primeira = UsageBarLayout::calculate(
+        widths[4],
+        &percentages_primeira,
+        &ages_primeira_refs,
+        &countdowns_primeira,
+        &clocks_primeira,
+    );
+    let layout_segunda = UsageBarLayout::calculate(
+        widths[5],
+        &percentages_segunda,
+        &ages_segunda_refs,
+        &countdowns_segunda,
+        &clocks_segunda,
+    );
 
     egui::Grid::new("codex_accounts")
         .num_columns(6)
@@ -3658,6 +3738,7 @@ fn render_codex_accounts(
                             primeira_countdown,
                             primeira_clock,
                             primeira_age.as_deref(),
+                            layout_primeira,
                         )
                     },
                 );
@@ -3671,6 +3752,7 @@ fn render_codex_accounts(
                             segunda_countdown,
                             segunda_clock,
                             segunda_age.as_deref(),
+                            layout_segunda,
                         )
                     },
                 );
@@ -3757,28 +3839,37 @@ fn render_opencodex_account_stacked(
             ui.add(egui::Label::new(data_text(&account.id)).wrap(true));
         });
     });
+    let short_countdown = account.short_reset_at.and_then(format_reset_countdown);
+    let short_clock = account.short_reset_at.and_then(format_reset_clock);
+    let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
+    let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
+    let layout = UsageBarLayout::calculate(
+        width - 34.0 - 4.0, // 4px gap
+        &[account.short_percent, account.weekly_percent],
+        &[None, None],
+        &[short_countdown.clone(), weekly_countdown.clone()],
+        &[short_clock.clone(), weekly_clock.clone()],
+    );
     ui.horizontal(|ui| {
         ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("5h", 10.0)));
-        let short_countdown = account.short_reset_at.and_then(format_reset_countdown);
-        let short_clock = account.short_reset_at.and_then(format_reset_clock);
         usage_bar_aged(
             ui,
             account.short_percent,
             short_countdown,
             short_clock,
             None,
+            layout,
         );
     });
     ui.horizontal(|ui| {
         ui.add_sized([34.0, 20.0], egui::Label::new(pixel_text("7d", 10.0)));
-        let weekly_countdown = account.weekly_reset_at.and_then(format_reset_countdown);
-        let weekly_clock = account.weekly_reset_at.and_then(format_reset_clock);
         usage_bar_aged(
             ui,
             account.weekly_percent,
             weekly_countdown,
             weekly_clock,
             None,
+            layout,
         );
     });
 }
@@ -3866,6 +3957,29 @@ fn show_opencodex(ui: &mut egui::Ui, content_width: f32, snapshot: &OpenCodexSna
         ];
         match column_widths(content_width, OPENCODEX_GRID_GAPS, &cols) {
             Some(widths) => {
+                // Pré-calcula o layout das barras de uso
+                let percentages_short: Vec<_> = snapshot.accounts.iter().map(|a| a.short_percent).collect();
+                let percentages_weekly: Vec<_> = snapshot.accounts.iter().map(|a| a.weekly_percent).collect();
+                let countdowns_short: Vec<_> = snapshot.accounts.iter().map(|a| a.short_reset_at.and_then(format_reset_countdown)).collect();
+                let countdowns_weekly: Vec<_> = snapshot.accounts.iter().map(|a| a.weekly_reset_at.and_then(format_reset_countdown)).collect();
+                let clocks_short: Vec<_> = snapshot.accounts.iter().map(|a| a.short_reset_at.and_then(format_reset_clock)).collect();
+                let clocks_weekly: Vec<_> = snapshot.accounts.iter().map(|a| a.weekly_reset_at.and_then(format_reset_clock)).collect();
+                let ages_refs: Vec<Option<&str>> = vec![None; snapshot.accounts.len()];
+                let layout_short = UsageBarLayout::calculate(
+                    widths[1],
+                    &percentages_short,
+                    &ages_refs,
+                    &countdowns_short,
+                    &clocks_short,
+                );
+                let layout_weekly = UsageBarLayout::calculate(
+                    widths[2],
+                    &percentages_weekly,
+                    &ages_refs,
+                    &countdowns_weekly,
+                    &clocks_weekly,
+                );
+
                 egui::Grid::new("opencodex_accounts")
                     .num_columns(3)
                     .min_col_width(0.0)
@@ -3916,6 +4030,7 @@ fn show_opencodex(ui: &mut egui::Ui, content_width: f32, snapshot: &OpenCodexSna
                                         short_countdown,
                                         short_clock,
                                         None,
+                                        layout_short,
                                     )
                                 },
                             );
@@ -3932,6 +4047,7 @@ fn show_opencodex(ui: &mut egui::Ui, content_width: f32, snapshot: &OpenCodexSna
                                         weekly_countdown,
                                         weekly_clock,
                                         None,
+                                        layout_weekly,
                                     )
                                 },
                             );
@@ -4079,6 +4195,52 @@ fn error_label(ui: &mut egui::Ui, width: f32, error: &str) {
     );
 }
 
+/// Dados pré-calculados para as barras de uso de uma tabela (Claude, Codex, etc).
+/// Calculados uma vez por frame para todas as linhas, garantindo alinhamento.
+#[derive(Clone, Copy)]
+struct UsageBarLayout {
+    bar_width: f32,
+    label_width: f32,
+    reset_width: f32,
+}
+
+impl UsageBarLayout {
+    /// Calcula o layout ideal para barras de uso em uma coluna.
+    /// Itera sobre os dados para medir os textos máximos, depois distribui o espaço.
+    fn calculate(
+        col_width: f32,
+        percentages: &[Option<f64>],
+        ages: &[Option<&str>],
+        countdowns: &[Option<String>],
+        clocks: &[Option<String>],
+    ) -> Self {
+        let gap = 4.0; // ui.spacing().item_spacing.x em modo 0
+        // Calcula o label_width máximo entre todas as linhas
+        let mut max_label_width = PERCENT_WIDTH;
+        for (&percentage, &age) in percentages.iter().zip(ages.iter()) {
+            let label = match (percentage, age) {
+                (Some(value), Some(age)) => format!("{value:.0}% {age}"),
+                (Some(value), None) => format!("{value:.0}%"),
+                (None, _) => "—".to_owned(),
+            };
+            max_label_width = max_label_width.max(text_width(&label));
+        }
+        // Calcula o reset_width máximo (countdown + clock)
+        let max_reset_budget = (col_width - 2.0 * gap - max_label_width - MIN_BAR_WIDTH).max(0.0);
+        let mut max_reset_width: f32 = 0.0;
+        for (countdown, clock) in countdowns.iter().zip(clocks.iter()) {
+            let reset = reset_details_width_for(countdown.as_deref(), clock.as_deref(), max_reset_budget);
+            max_reset_width = max_reset_width.max(reset);
+        }
+        let bar_width = (col_width - 2.0 * gap - max_label_width - max_reset_width).max(MIN_BAR_WIDTH);
+        UsageBarLayout {
+            bar_width,
+            label_width: max_label_width,
+            reset_width: max_reset_width,
+        }
+    }
+}
+
 /// Igual a usage_bar, mas anexa a idade quando o valor veio de lastGoodUsage.
 ///
 /// Dado velho nao pode parecer fresco: uma conta em relogin_required tem cache de dias, e
@@ -4089,8 +4251,9 @@ fn usage_bar_aged(
     countdown: Option<String>,
     clock: Option<String>,
     age: Option<&str>,
+    layout: UsageBarLayout,
 ) {
-    usage_bar_inner(ui, value, countdown, clock, age);
+    usage_bar_inner(ui, value, countdown, clock, age, layout);
 }
 
 fn usage_bar_inner(
@@ -4099,8 +4262,9 @@ fn usage_bar_inner(
     countdown: Option<String>,
     clock: Option<String>,
     age: Option<&str>,
+    layout: UsageBarLayout,
 ) {
-    let gap = ui.spacing().item_spacing.x;
+    let gap = 4.0; // ui.spacing().item_spacing.x; mas fixado em 0 no horizontal abaixo
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let label = match (value, age) {
@@ -4108,23 +4272,16 @@ fn usage_bar_inner(
             (Some(value), None) => format!("{value:.0}%"),
             (None, _) => "—".to_owned(),
         };
-        let label_width = PERCENT_WIDTH.max(text_width(&label));
-        // A largura do rotulo entra no orcamento porque cresce quando ha age.
-        let fixed_width = gap + label_width;
-        let reset_budget = (ui.available_width() - fixed_width - MIN_BAR_WIDTH).max(0.0);
-        let reset_width =
-            reset_details_width_for(countdown.as_deref(), clock.as_deref(), reset_budget);
-        let bar_width = (ui.available_width() - fixed_width - reset_width).max(MIN_BAR_WIDTH);
         discrete_blocks(
             ui,
-            bar_width,
+            layout.bar_width,
             value.map(normalized_percent),
             value.map(hp_color),
         );
         ui.add_space(gap);
-        ui.add_sized([label_width, 20.0], egui::Label::new(data_text(label)));
-        if reset_width > 0.0 {
-            add_reset_details(ui, countdown.as_deref(), clock.as_deref(), reset_width);
+        ui.add_sized([layout.label_width, 20.0], egui::Label::new(data_text(label)));
+        if layout.reset_width > 0.0 {
+            add_reset_details(ui, countdown.as_deref(), clock.as_deref(), layout.reset_width);
         }
     });
 }
@@ -4745,9 +4902,12 @@ mod tests {
         let at_min = column_widths(min + gaps, gaps, &cols).expect("cabem no minimo");
         let at_ideal = column_widths(ideal + gaps, gaps, &cols).expect("cabem no ideal");
         let intermediate = column_widths(7.5 + gaps, gaps, &cols).expect("cabem no intermediario");
+        let at_extra = column_widths(15.0 + gaps, gaps, &cols).expect("cabe com espaço extra");
 
         assert!((at_min.iter().sum::<f32>() - min).abs() < f32::EPSILON);
         assert!((at_ideal.iter().sum::<f32>() - ideal).abs() < f32::EPSILON);
+        // Com espaço extra acima do ideal, a primeira coluna recebe o leftover
+        assert!((at_extra.iter().sum::<f32>() - 15.0).abs() < f32::EPSILON);
         assert!(column_widths(min + gaps - 1.0, gaps, &cols).is_none());
         assert!(intermediate.iter().sum::<f32>() <= 7.5 + f32::EPSILON);
     }
