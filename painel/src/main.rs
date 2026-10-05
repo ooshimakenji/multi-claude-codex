@@ -34,7 +34,11 @@ use winapi::{
     },
 };
 
-const PANEL_TITLE: &str = "CENTRO DE COMANDO // HERMES";
+// Override via PAINEL_TITULO para testes (evita confundir com painel do usuário)
+fn get_panel_title() -> String {
+    env::var("PAINEL_TITULO")
+        .unwrap_or_else(|_| "CENTRO DE COMANDO // HERMES".to_string())
+}
 static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 
 // These are layout measurements, not arbitrary viewport defaults.  The
@@ -663,11 +667,15 @@ impl eframe::App for PanelApp {
             // que tem 700 pontos numa janela de 700 px e estoura 25% em toda largura.
             // Nao usar clip_rect: quando o conteudo nao cabe, a ScrollArea o infla e a
             // realimentacao impede as secoes de encolher.
-            let content_width = (context.screen_rect().width() / context.pixels_per_point()
-                - central_panel_margin
-                - SECTION_HORIZONTAL_OVERHEAD
-                - ui.spacing().scroll.allocated_width())
-            .max(0.0);
+            let ppp = context.pixels_per_point();
+            let screen_px = context.screen_rect().width();
+            let screen_pt = screen_px / ppp;
+            let scroll_w = ui.spacing().scroll.allocated_width();
+            let content_width = (screen_pt - central_panel_margin - SECTION_HORIZONTAL_OVERHEAD - scroll_w).max(0.0);
+            if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
+                eprintln!(">>> update: screen={:.0}px (÷{:.2})={:.1}pt - margin={:.1} - overhead={:.1} - scroll={:.1} = content={:.1}",
+                    screen_px, ppp, screen_pt, central_panel_margin, SECTION_HORIZONTAL_OVERHEAD, scroll_w, content_width);
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -948,7 +956,7 @@ fn show_title_bar(context: &egui::Context, poke_mode: &mut bool) {
                 ui.painter().text(
                     rect.left_center(),
                     egui::Align2::LEFT_CENTER,
-                    PANEL_TITLE,
+                    &get_panel_title(),
                     pixel_font(11.0),
                     text_color(),
                 );
@@ -2757,26 +2765,34 @@ fn show_running_jobs(
                             );
                             offset = 1;
                         }
-                        ui.add_sized(
-                            [widths[offset], 20.0],
-                            egui::Label::new(data_text(format!(
-                                "{} · {}",
-                                job_type_label(job),
-                                string_field(job, "modelo")
-                            )))
-                            .truncate(true),
-                        );
-                        ui.add_sized(
-                            [widths[offset + 1], 20.0],
-                            egui::Label::new(data_text(string_field(job, "projeto")))
+                        // ponytail: usar ui.set_min_width em vez de add_sized para forçar alinhamento
+                        // entre linhas (allocate_ui_with_layout_dyn avança pelo min_rect)
+                        ui.scope(|ui| {
+                            ui.set_min_width(widths[offset]);
+                            ui.add(
+                                egui::Label::new(data_text(format!(
+                                    "{} · {}",
+                                    job_type_label(job),
+                                    string_field(job, "modelo")
+                                )))
                                 .truncate(true),
-                        );
-                        ui.add_sized(
-                            [widths[offset + 2], 20.0],
-                            egui::Label::new(data_text(format_duration(number_field(
-                                job, "segundos",
-                            )))),
-                        );
+                            );
+                        });
+                        ui.scope(|ui| {
+                            ui.set_min_width(widths[offset + 1]);
+                            ui.add(
+                                egui::Label::new(data_text(string_field(job, "projeto")))
+                                    .truncate(true),
+                            );
+                        });
+                        ui.scope(|ui| {
+                            ui.set_min_width(widths[offset + 2]);
+                            ui.add(
+                                egui::Label::new(data_text(format_duration(number_field(
+                                    job, "segundos",
+                                )))),
+                            );
+                        });
                         loading_blocks(ui);
                     });
                 } else {
@@ -2959,10 +2975,12 @@ fn show_claude(
                     let species = poke_mode
                         .then(|| pokemon.info("claude", &email).map(|info| info.name))
                         .flatten();
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(widths[0], 40.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
+                    ui.scope(|ui| {
+                        // ponytail: força largura máxima da célula para evitar overflow
+                        // quando poke_mode=1 e há sprite (Layout::centered_and_justified expande)
+                        ui.set_max_width(widths[0]);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
                             if let Some(texture) = texture.as_ref() {
                                 ui.add(
                                         egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
@@ -3106,8 +3124,8 @@ fn show_claude(
                                     });
                                 });
                             });
-                        },
-                    );
+                        });
+                    });
                     ui.allocate_ui_with_layout(
                         egui::vec2(widths[1], 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
@@ -3684,10 +3702,11 @@ fn render_codex_accounts(
                     });
                 let model = settings.and_then(|(_, model, _)| model.as_deref());
                 let effort = settings.and_then(|(_, _, effort)| effort.as_deref());
-                ui.allocate_ui_with_layout(
-                    egui::vec2(widths[0], 40.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
+                ui.scope(|ui| {
+                    // ponytail: força largura máxima para evitar overflow na célula de conta
+                    ui.set_max_width(widths[0]);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
                         if let Some(texture) = texture.as_ref() {
                             ui.add(
                                 egui::Image::new((texture.id(), egui::vec2(40.0, 40.0)))
@@ -3780,8 +3799,8 @@ fn render_codex_accounts(
                                 });
                             });
                         });
-                    },
-                );
+                    });
+                });
                 ui.add_sized(
                     [widths[1], 40.0],
                     egui::Label::new(data_text(plan)).truncate(true),
@@ -4992,7 +5011,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        PANEL_TITLE,
+        &get_panel_title(),
         options,
         Box::new(|creation_context| Box::new(PanelApp::new(creation_context))),
     )
