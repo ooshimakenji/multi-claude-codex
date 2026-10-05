@@ -656,8 +656,10 @@ impl eframe::App for PanelApp {
         show_title_bar(context, &mut self.poke_mode);
 
         egui::CentralPanel::default().show(context, |ui| {
-            let central_panel_margin =
-                ui.spacing().window_margin.left + ui.spacing().window_margin.right;
+            // Use symmetric margins for balanced layout on all widths
+            let left_margin = ui.spacing().window_margin.left;
+            let right_margin = left_margin; // Match left margin for visual balance
+            let central_panel_margin = left_margin + right_margin;
             // A largura vem do screen_rect, nao do clip_rect: quando o conteudo nao
             // cabe, a ScrollArea infla o clip_rect e o layout passa a acreditar que
             // tem MAIS espaco justo quando tem menos — realimentacao que impedia as
@@ -671,6 +673,7 @@ impl eframe::App for PanelApp {
             let screen_px = context.screen_rect().width();
             let screen_pt = screen_px / ppp;
             let scroll_w = ui.spacing().scroll.allocated_width();
+            // Content width accounting for CentralPanel margins and section frame overhead
             let content_width = (screen_pt - central_panel_margin - SECTION_HORIZONTAL_OVERHEAD - scroll_w).max(0.0);
             if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
                 eprintln!(">>> update: screen={:.0}px (÷{:.2})={:.1}pt - margin={:.1} - overhead={:.1} - scroll={:.1} = content={:.1}",
