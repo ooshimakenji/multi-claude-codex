@@ -3078,11 +3078,17 @@ fn column_widths(available: f32, gaps: f32, cols: &[(f32, f32)]) -> Option<Vec<f
     }
     let content_available = available - gaps;
     if content_available >= ideal {
-        // Quando há espaço extra além do ideal, usa apenas os tamanhos ideais.
-        // Isso mantém as molduras das seções com a mesma largura entre tabelas.
-        // ponytail: se for necessário mostrar conteúdo completo (ex: e-mail inteiro),
-        // aumentar MIN_CLAUDE_ACCOUNT_WIDTH, CODEX_ACCOUNT_WIDTH ou similar nas constantes.
-        let widths: Vec<f32> = cols.iter().map(|(_, i)| *i).collect();
+        // Se temos espaço extra além do ideal, adiciona à primeira coluna,
+        // mas limita para não ultrapassar o espaço do frame.
+        let mut widths: Vec<f32> = cols.iter().map(|(_, i)| *i).collect();
+        if !widths.is_empty() {
+            // Adiciona espaço extra à primeira coluna, mas deixa 8px de margem
+            // para arredondamento/padding internos do Grid+Frame, evitando que
+            // as molduras das seções expandam além das irmãs.
+            let extra_gross = content_available - ideal;
+            let extra = (extra_gross - 8.0).max(0.0);
+            widths[0] += extra;
+        }
         return Some(widths);
     }
     let scale = ((content_available - min) / (ideal - min)).clamp(0.0, 1.0);
@@ -4128,7 +4134,7 @@ fn section_frame(
     content_width: f32,
     add_contents: impl FnOnce(&mut egui::Ui, f32),
 ) {
-    let response = egui::Frame::none()
+    egui::Frame::none()
         .fill(panel())
         .stroke(egui::Stroke::new(2.0_f32, border()))
         .rounding(egui::Rounding::same(0.0))
@@ -4142,12 +4148,6 @@ fn section_frame(
             ui.add_space(10.0);
             add_contents(ui, content_width);
         });
-
-    // Debug: imprimir a borda direita do frame se PAINEL_DEBUG_LAYOUT=1
-    if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
-        let frame_right = (response.response.rect.right() / ui.ctx().pixels_per_point()).round();
-        eprintln!("[section_frame:{}] right_x={:.0}", title, frame_right);
-    }
 }
 
 fn metric_row(ui: &mut egui::Ui, content_width: f32, label: &str, used: String, limit: String) {
