@@ -3078,12 +3078,15 @@ fn column_widths(available: f32, gaps: f32, cols: &[(f32, f32)]) -> Option<Vec<f
     }
     let content_available = available - gaps;
     if content_available >= ideal {
-        // Se temos espaço extra além do ideal, adiciona à primeira coluna.
-        // Subtrai 5px de margem de segurança para evitar que a moldura da seção
-        // expanda além do esperado (arredondamento/padding internos do Grid+Frame).
+        // Se temos espaço extra além do ideal, adiciona à primeira coluna,
+        // mas limita para não ultrapassar o espaço do frame.
         let mut widths: Vec<f32> = cols.iter().map(|(_, i)| *i).collect();
         if !widths.is_empty() {
-            let extra = (content_available - ideal - 5.0).max(0.0);
+            // Adiciona espaço extra à primeira coluna, mas deixa 8px de margem
+            // para arredondamento/padding internos do Grid+Frame, evitando que
+            // as molduras das seções expandam além das irmãs.
+            let extra_gross = content_available - ideal;
+            let extra = (extra_gross - 8.0).max(0.0);
             widths[0] += extra;
         }
         return Some(widths);
