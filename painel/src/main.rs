@@ -1887,6 +1887,14 @@ fn process_output_message(output: &std::process::Output) -> String {
 }
 
 fn load_poke_mode() -> bool {
+    // Override via PAINEL_MODO_POKE para testes (não salva em painel-config.json)
+    if let Ok(override_val) = env::var("PAINEL_MODO_POKE") {
+        match override_val.as_str() {
+            "1" | "true" | "yes" => return true,
+            "0" | "false" | "no" => return false,
+            _ => {}
+        }
+    }
     claude_config_dir()
         .and_then(|directory| fs::read_to_string(directory.join("painel-config.json")).ok())
         .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
@@ -2869,19 +2877,25 @@ fn show_claude(
                 let countdowns_7d: Vec<_> = accounts.iter().map(|a| usage_text(a, "sevenDay", "countdown")).collect();
                 let clocks_5h: Vec<_> = accounts.iter().map(|a| usage_clock(a, "fiveHour")).collect();
                 let clocks_7d: Vec<_> = accounts.iter().map(|a| usage_clock(a, "sevenDay")).collect();
-                let layout_5h = UsageBarLayout::calculate(
-                    widths[1],
-                    &percentages_5h,
-                    &ages_refs,
-                    &countdowns_5h,
-                    &clocks_5h,
-                );
-                let layout_7d = UsageBarLayout::calculate(
-                    widths[2],
-                    &percentages_7d,
-                    &ages_refs,
-                    &countdowns_7d,
-                    &clocks_7d,
+                // ponytail: usar um único layout para ambas as colunas 5H e 7D, calculado sobre a união dos dados.
+                // Isso garante que as barras tenham a mesma largura em ambas as colunas, eliminando desalinhamentos
+                // causados por reset_width divergente (ex: 5H tem reset=116 e 7D tem reset=172).
+                let mut all_percentages = percentages_5h.clone();
+                all_percentages.extend(percentages_7d);
+                let mut all_countdowns = countdowns_5h.clone();
+                all_countdowns.extend(countdowns_7d);
+                let mut all_clocks = clocks_5h.clone();
+                all_clocks.extend(clocks_7d);
+                // ages se repete (uma por linha), então junta duas cópias
+                let mut all_ages = ages_refs.clone();
+                all_ages.extend(ages_refs.iter());
+                let col_width = (widths[1] + widths[2] + 10.0) / 2.0; // média das duas colunas + gap
+                let layout = UsageBarLayout::calculate(
+                    col_width,
+                    &all_percentages,
+                    &all_ages,
+                    &all_countdowns,
+                    &all_clocks,
                 );
 
                 egui::Grid::new("claude_accounts")
@@ -3104,7 +3118,7 @@ fn show_claude(
                                 five_hour_countdown,
                                 five_hour_clock,
                                 cache_age.as_deref(),
-                                layout_5h,
+                                layout,
                             )
                         },
                     );
@@ -3118,7 +3132,7 @@ fn show_claude(
                                 seven_day_countdown,
                                 seven_day_clock,
                                 cache_age.as_deref(),
-                                layout_7d,
+                                layout,
                             )
                         },
                     );
@@ -3167,10 +3181,16 @@ fn column_widths(available: f32, gaps: f32, cols: &[(f32, f32)]) -> Option<Vec<f
             let extra_gross = content_available - ideal;
             let extra = (extra_gross - 8.0).max(0.0);
             widths[0] += extra;
+            if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
+                eprintln!("  column_widths(extra): avail={:.1}, gaps={:.1}, ideal={:.1}, extra={:.1}", available, gaps, ideal, extra);
+            }
         }
         return Some(widths);
     }
     let scale = ((content_available - min) / (ideal - min)).clamp(0.0, 1.0);
+    if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
+        eprintln!("  column_widths(scale={:.3}): avail={:.1}, gaps={:.1}, min={:.1}, ideal={:.1}", scale, available, gaps, min, ideal);
+    }
     Some(cols.iter().map(|(m, i)| m + (i - m) * scale).collect())
 }
 
@@ -3568,19 +3588,24 @@ fn render_codex_accounts(
     let countdowns_segunda: Vec<_> = accounts.iter().map(|a| quota_countdown_at(a, 1)).collect();
     let clocks_primeira: Vec<_> = accounts.iter().map(|a| quota_clock_at(a, 0)).collect();
     let clocks_segunda: Vec<_> = accounts.iter().map(|a| quota_clock_at(a, 1)).collect();
-    let layout_primeira = UsageBarLayout::calculate(
-        widths[4],
-        &percentages_primeira,
-        &ages_primeira_refs,
-        &countdowns_primeira,
-        &clocks_primeira,
-    );
-    let layout_segunda = UsageBarLayout::calculate(
-        widths[5],
-        &percentages_segunda,
-        &ages_segunda_refs,
-        &countdowns_segunda,
-        &clocks_segunda,
+    // ponytail: usar um único layout para ambas as colunas de quota, calculado sobre a união dos dados.
+    // Garante alinhamento das barras entre as duas colunas (primeira e segunda).
+    let mut all_percentages = percentages_primeira.clone();
+    all_percentages.extend(percentages_segunda);
+    let mut all_countdowns = countdowns_primeira.clone();
+    all_countdowns.extend(countdowns_segunda);
+    let mut all_clocks = clocks_primeira.clone();
+    all_clocks.extend(clocks_segunda);
+    // ages são diferentes (primeira vs segunda), então junta ambas
+    let mut all_ages_refs = ages_primeira_refs.clone();
+    all_ages_refs.extend(ages_segunda_refs);
+    let col_width = (widths[4] + widths[5] + 10.0) / 2.0; // média das duas colunas + gap
+    let layout = UsageBarLayout::calculate(
+        col_width,
+        &all_percentages,
+        &all_ages_refs,
+        &all_countdowns,
+        &all_clocks,
     );
 
     egui::Grid::new("codex_accounts")
@@ -3823,7 +3848,7 @@ fn render_codex_accounts(
                             primeira_countdown,
                             primeira_clock,
                             primeira_age.as_deref(),
-                            layout_primeira,
+                            layout,
                         )
                     },
                 );
@@ -3837,7 +3862,7 @@ fn render_codex_accounts(
                             segunda_countdown,
                             segunda_clock,
                             segunda_age.as_deref(),
-                            layout_segunda,
+                            layout,
                         )
                     },
                 );
@@ -4318,6 +4343,11 @@ impl UsageBarLayout {
             max_reset_width = max_reset_width.max(reset);
         }
         let bar_width = (col_width - 2.0 * gap - max_label_width - max_reset_width).max(MIN_BAR_WIDTH);
+        if std::env::var("PAINEL_DEBUG_LAYOUT").is_ok() {
+            eprintln!("    UsageBarLayout: col={:.1}, bar={:.1}, label={:.1}, reset={:.1}, total={:.1}",
+                col_width, bar_width, max_label_width, max_reset_width,
+                bar_width + 2.0 * gap + max_label_width + max_reset_width);
+        }
         UsageBarLayout {
             bar_width,
             label_width: max_label_width,
