@@ -518,6 +518,8 @@ def jobs_ativos():
             continue
         if _subagente_terminou(linhas):
             continue
+        if _subagente_handback_encerrado(linhas):
+            continue
         ultimo = ultimo_msg = None
         for linha in reversed(linhas):
             try:
@@ -608,6 +610,55 @@ def _subagente_terminou(linhas):
         payload = evento.get("payload") or {}
         if isinstance(payload, dict) and payload.get("type") in (
                 "result", "subagent_stop", "task_complete"):
+            return True
+    return False
+
+
+def _subagente_handback_encerrado(linhas):
+    """Reconhece a entrega final quando ela fecha o transcrito."""
+    eventos = []
+    for linha in linhas:
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        if isinstance(evento, dict):
+            eventos.append(evento)
+    if not eventos:
+        return False
+
+    ultimo_tool_use = None
+    for indice, evento in enumerate(eventos):
+        mensagem = evento.get("message") or {}
+        blocos = mensagem.get("content") if isinstance(mensagem, dict) else None
+        if not isinstance(blocos, list):
+            continue
+        for bloco in blocos:
+            if (isinstance(bloco, dict) and bloco.get("type") == "tool_use" and
+                    isinstance(bloco.get("name"), str)):
+                ultimo_tool_use = (indice, bloco)
+
+    if ultimo_tool_use is None:
+        return False
+    indice, handback = ultimo_tool_use
+    nome = handback["name"]
+    if nome != "SubagentHandback" and not (
+            nome.startswith("mcp__") and nome.endswith("__SubagentHandback")):
+        return False
+
+    if indice == len(eventos) - 1:
+        return True
+
+    tool_id = handback.get("id")
+    ultimo = eventos[-1]
+    mensagem = ultimo.get("message") or {}
+    blocos = mensagem.get("content") if isinstance(mensagem, dict) else None
+    if not isinstance(blocos, list):
+        return False
+    for bloco in blocos:
+        if not isinstance(bloco, dict) or bloco.get("type") != "tool_result":
+            continue
+        if tool_id is None or bloco.get("tool_use_id") == tool_id:
             return True
     return False
 
@@ -1089,6 +1140,42 @@ def selftest():
     assert por_arquivo["agent-active.jsonl"]["projeto"] == "confere asfalto", jobs
     assert "agent-stopped.jsonl" not in por_arquivo, jobs
     assert all("tipo" in job for job in jobs), jobs
+
+    # Handback concluido encerra o subagente; atividade posterior reabre-o.
+    handback = os.path.join(subagents, "agent-handback.jsonl")
+    tool_recente = os.path.join(subagents, "agent-tool-recente.jsonl")
+    retomado = os.path.join(subagents, "agent-retomado.jsonl")
+    agora_h = time.time()
+    transcritos_handback = {
+        handback: [
+            {"timestamp": agora_h - 20, "type": "assistant", "message": {
+                "content": [{"type": "tool_use", "name": "SubagentHandback",
+                              "id": "handback-1"}]}},
+            {"timestamp": agora_h - 19, "type": "user", "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "handback-1",
+                              "content": "entregue"}]}}],
+        tool_recente: [
+            {"timestamp": agora_h - 20, "type": "assistant", "message": {
+                "content": [{"type": "tool_use", "name": "Bash"}]} }],
+        retomado: [
+            {"timestamp": agora_h - 20, "type": "assistant", "message": {
+                "content": [{"type": "tool_use", "name": "mcp__hermes__SubagentHandback",
+                              "id": "handback-2"}]}},
+            {"timestamp": agora_h - 19, "type": "user", "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "handback-2",
+                              "content": "entregue"}]}},
+            {"timestamp": agora_h - 2, "type": "assistant", "message": {
+                "content": [{"type": "tool_use", "name": "SendMessage"}]}}],
+    }
+    for caminho, eventos in transcritos_handback.items():
+        with open(caminho, "w", encoding="utf-8") as fh:
+            for evento in eventos:
+                fh.write(json.dumps(evento) + "\n")
+    jobs = jobs_ativos()
+    por_arquivo = {job["arquivo"]: job for job in jobs}
+    assert "agent-handback.jsonl" not in por_arquivo, jobs
+    assert "agent-tool-recente.jsonl" in por_arquivo, jobs
+    assert "agent-retomado.jsonl" in por_arquivo, jobs
 
     # P2 (bug real, medido em transcript ao vivo): gap de tool call longa
     # (bash, build, thinking estendido) nao pode derrubar o job do painel --
