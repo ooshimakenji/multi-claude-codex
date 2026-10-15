@@ -14,6 +14,7 @@ Fontes (tudo local, tudo read-only):
 
 Uso:  python status.py            imprime estado + delta
       python status.py --line      uma linha, para statusline (leve, read-only)
+      python status.py --jobs      lista jobs ativos, sem varrer rollouts
       python status.py --json      snapshot para consumidores de maquina
       python status.py --reset     esquece o marco anterior
       python status.py --selftest  roda os asserts
@@ -21,6 +22,7 @@ Uso:  python status.py            imprime estado + delta
 import base64
 import binascii
 import glob
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +33,10 @@ HOME = os.path.expanduser("~")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 MARK = os.path.join(CLAUDE_HOME, "codex-status-mark.json")
+CACHE_VERSION = 1
+_CACHE = None
+_CACHE_PATH = None
+_CACHE_DIRTY = False
 
 # Limite de free tier muda; numero velho SEM DATA vira mentira silenciosa.
 # Por isso a data anda junto do numero e precisa ser atualizada quando conferido.
@@ -68,6 +74,107 @@ def _ultimo_token_count(linhas):
         if isinstance(payload, dict) and payload.get("type") == "token_count":
             return (payload.get("info") or {}).get("total_token_usage")
     return None
+
+
+def _cache_path():
+    return os.path.join(os.path.dirname(MARK), "codex-status-cache.json")
+
+
+def _cache():
+    global _CACHE, _CACHE_PATH, _CACHE_DIRTY
+    caminho = _cache_path()
+    if _CACHE_PATH == caminho and _CACHE is not None:
+        return _CACHE
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            cache = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        cache = {}
+    if not isinstance(cache, dict) or cache.get("version") != CACHE_VERSION:
+        cache = {}
+    cache.setdefault("rollouts", {})
+    cache.setdefault("claude", {})
+    cache["version"] = CACHE_VERSION
+    _CACHE_PATH = caminho
+    _CACHE = cache
+    _CACHE_DIRTY = False
+    return cache
+
+
+def _save_cache():
+    global _CACHE_DIRTY
+    if not _CACHE_DIRTY:
+        return
+    cache = _cache()
+    caminho = _cache_path()
+    temporario = caminho + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(caminho), exist_ok=True)
+        with open(temporario, "w", encoding="utf-8") as fh:
+            json.dump(cache, fh, separators=(",", ":"))
+        os.replace(temporario, caminho)
+        _CACHE_DIRTY = False
+    except OSError:
+        try:
+            os.remove(temporario)
+        except OSError:
+            pass
+
+
+def _arquivo_assinatura(path):
+    stat = os.stat(path)
+    with open(path, "rb") as fh:
+        prefixo = hashlib.sha256(fh.read(256)).hexdigest()
+    return stat.st_size, stat.st_mtime_ns, prefixo
+
+
+def _rollout_cached(path):
+    """Extrai uma vez o acumulado e os metadados do rollout imutavel."""
+    try:
+        tamanho, mtime, prefixo = _arquivo_assinatura(path)
+    except OSError:
+        raise
+    chave = os.path.abspath(path)
+    registro = _cache()["rollouts"].get(chave)
+    assinatura = (tamanho, mtime, prefixo)
+    if isinstance(registro, dict) and tuple(registro.get("assinatura", ())) == assinatura:
+        return registro
+
+    modelo = None
+    quotas = None
+    linhas = tail(path, 65536)
+    uso = _ultimo_token_count(linhas)
+    for linha in linhas:
+        try:
+            ev = json.loads(linha)
+        except ValueError:
+            continue
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if ev.get("type") == "turn_context" and payload.get("model"):
+            sandbox = payload.get("sandbox_policy") or {}
+            modelo = [payload["model"],
+                      payload.get("effort") or payload.get("reasoning_effort"),
+                      sandbox.get("type") if isinstance(sandbox, dict) else sandbox]
+        if payload.get("type") == "token_count":
+            rate_limits = payload.get("rate_limits") or {}
+            janelas = [{"janela": janela.get("window_minutes"),
+                        "pct": janela.get("used_percent"),
+                        "reseta_em": janela.get("resets_at")}
+                       for janela in (rate_limits.get("primary"),
+                                      rate_limits.get("secondary"))
+                       if isinstance(janela, dict) and "used_percent" in janela]
+            if janelas:
+                quotas = janelas
+    registro = {"assinatura": list(assinatura),
+                "tokens": (uso or {}).get("total_tokens", 0),
+                "modelo": modelo,
+                "quotas": quotas}
+    _cache()["rollouts"][chave] = registro
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
+    return registro
 
 
 def codex_profile_homes():
@@ -113,11 +220,11 @@ def codex_tokens_total(home=None):
     total = 0
     for arq in _rollouts(home or CODEX_HOME):
         try:
-            uso = _ultimo_token_count(tail(arq, 65536))
+            uso = _rollout_cached(arq)
         except OSError:
             continue
-        if uso:
-            total += uso.get("total_tokens", 0)
+        total += uso.get("tokens", 0)
+    _save_cache()
     return total
 
 
@@ -136,11 +243,11 @@ def codex_janela(minutos, home=None):
         try:
             if os.path.getmtime(arq) < corte:
                 continue
-            uso = _ultimo_token_count(tail(arq, 65536))
+            uso = _rollout_cached(arq)
         except OSError:
             continue
-        if uso:
-            total += uso.get("total_tokens", 0)
+        total += uso.get("tokens", 0)
+    _save_cache()
     return total
 
 
@@ -154,34 +261,12 @@ def _codex_side_profile(home):
     if arqs:
         out["idade_s"] = max(0, time.time() - os.path.getmtime(arqs[0]))
     for arq in arqs[:10]:
-        modelo = quotas = None
-        # O statusline nao pode varrer rollouts inteiros; o rabo contem as
-        # leituras mais recentes de modelo e quota.
-        for linha in tail(arq):
-            try:
-                ev = json.loads(linha)
-            except ValueError:
-                continue
-            payload = ev.get("payload") or {}
-            if not isinstance(payload, dict):
-                continue
-            # dentro de um rollout, vale sempre a ULTIMA leitura: a primeira e o
-            # estado ANTES da sessao gastar qualquer coisa.
-            if ev.get("type") == "turn_context" and payload.get("model"):
-                sandbox = payload.get("sandbox_policy") or {}
-                modelo = (payload["model"],
-                          payload.get("effort") or payload.get("reasoning_effort"),
-                          sandbox.get("type") if isinstance(sandbox, dict) else sandbox)
-            if payload.get("type") == "token_count":
-                rl = payload.get("rate_limits") or {}
-                # a API devolve primary (5h) e secondary (semanal); as vezes so uma
-                janelas = [{"janela": j.get("window_minutes"),
-                            "pct": j.get("used_percent"),
-                            "reseta_em": j.get("resets_at")}
-                           for j in (rl.get("primary"), rl.get("secondary"))
-                           if isinstance(j, dict) and "used_percent" in j]
-                if janelas:
-                    quotas = janelas
+        try:
+            registro = _rollout_cached(arq)
+        except OSError:
+            continue
+        modelo = registro.get("modelo")
+        quotas = registro.get("quotas")
         if modelo and "modelo" not in out:
             out["modelo"], out["effort"], out["sandbox"] = modelo
         if quotas and "quotas" not in out:
@@ -190,6 +275,7 @@ def _codex_side_profile(home):
             out["janela_tokens"] = codex_janela(quotas[0]["janela"], home)
         if "modelo" in out and "quotas" in out:
             break
+    _save_cache()
     return out
 
 
@@ -531,12 +617,45 @@ def claude_side():
     out = {"arquivo": os.path.basename(path) if path else None, "tokens": 0}
     if not path:
         return out
-    for ev in _loads(path):
-        usage = (ev.get("message") or {}).get("usage")
-        if not isinstance(usage, dict):
-            continue
-        # cache_read e barato mas nao e gratis: conta tudo que entrou/saiu.
-        out["tokens"] += sum(v for v in usage.values() if isinstance(v, int))
+    try:
+        tamanho, mtime, prefixo = _arquivo_assinatura(path)
+    except OSError:
+        return out
+    chave = os.path.abspath(path)
+    cache = _cache()["claude"]
+    registro = cache.get(chave)
+    reiniciar = not isinstance(registro, dict)
+    if not reiniciar:
+        reiniciar = (tamanho < registro.get("tamanho", 0) or
+                     (tamanho == registro.get("tamanho") and
+                      mtime != registro.get("mtime")) or
+                     prefixo != registro.get("prefixo"))
+    inicio = 0 if reiniciar else min(registro.get("offset", 0), tamanho)
+    total = 0 if reiniciar else registro.get("tokens", 0)
+    if inicio < tamanho:
+        with open(path, "rb") as fh:
+            fh.seek(inicio)
+            dados = fh.read()
+        consumido = 0
+        for linha in dados.splitlines(keepends=True):
+            if not linha.endswith((b"\n", b"\r")):
+                break
+            consumido += len(linha)
+            try:
+                ev = json.loads(linha.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            usage = (ev.get("message") or {}).get("usage")
+            if isinstance(usage, dict):
+                # cache_read e barato mas nao e gratis: conta tudo que entrou/saiu.
+                total += sum(v for v in usage.values() if isinstance(v, int))
+        inicio += consumido
+    cache[chave] = {"tamanho": tamanho, "mtime": mtime, "prefixo": prefixo,
+                    "offset": inicio, "tokens": total}
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
+    out["tokens"] = total
+    _save_cache()
     return out
 
 
@@ -804,8 +923,9 @@ def selftest():
         fh.write(json.dumps({"message": {"usage": {
             "input_tokens": 100, "output_tokens": 50, "service_tier": "x"}}}) + "\n")
 
-    global CODEX_HOME, CLAUDE_HOME
+    global CODEX_HOME, CLAUDE_HOME, MARK
     CODEX_HOME = CLAUDE_HOME = d
+    MARK = os.path.join(d, "mark.json")
     snap = snapshot()
     assert snap["codex"]["modelo"] == "gpt-5.6-luna", snap
     assert snap["codex"]["sandbox"] == "read-only", snap
@@ -1028,8 +1148,6 @@ def selftest():
     assert "agent-server-tool.jsonl" in por_arquivo, jobs
 
     # o contrato que importa: --line NAO pode gravar o marco
-    global MARK
-    MARK = os.path.join(d, "mark.json")
     line({"transcript_path": transcript})
     assert not os.path.exists(MARK), "--line gravou o marco e zerou o delta"
 
@@ -1103,6 +1221,8 @@ if __name__ == "__main__":
         now["jobs"] = jobs_ativos()
         now["ts"] = time.time()
         print(json.dumps(now))
+    elif "--jobs" in sys.argv:
+        print(json.dumps({"jobs": jobs_ativos()}))
     elif "--selftest" in sys.argv:
         selftest()
     elif "--reset" in sys.argv:

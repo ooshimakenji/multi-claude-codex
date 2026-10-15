@@ -230,14 +230,15 @@ fn icone() -> egui::IconData {
 }
 
 struct Snapshot {
-    status: Result<Value, String>,
-    cswap: Result<Value, String>,
-    fixacao: Option<Value>,
-    codex_last_used_profile: Option<String>,
-    codex_active_profile: Option<String>,
-    codex_profile_settings: Vec<(String, Option<String>, Option<String>)>,
-    opencodex: Option<OpenCodexSnapshot>,
-    antigravity: Option<AntigravitySnapshot>,
+    status: Option<Result<Value, String>>,
+    jobs: Result<Value, String>,
+    cswap: Option<Result<Value, String>>,
+    fixacao: Option<Option<Value>>,
+    codex_last_used_profile: Option<Option<String>>,
+    codex_active_profile: Option<Option<String>>,
+    codex_profile_settings: Option<Vec<(String, Option<String>, Option<String>)>>,
+    opencodex: Option<Option<OpenCodexSnapshot>>,
+    antigravity: Option<Option<AntigravitySnapshot>>,
 }
 
 struct OpenCodexSnapshot {
@@ -266,6 +267,7 @@ struct AntigravitySnapshot {
 struct PanelApp {
     receiver: Receiver<Snapshot>,
     status: Option<Result<Value, String>>,
+    jobs: Option<Result<Value, String>>,
     cswap: Option<Result<Value, String>>,
     status_err_streak: u32,
     cswap_err_streak: u32,
@@ -518,13 +520,15 @@ impl PanelApp {
         configure_context(&creation_context.egui_ctx);
         let (sender, receiver) = mpsc::channel();
         let repo = find_repo();
-        thread::spawn(move || refresh_loop(sender, repo));
+        let context = creation_context.egui_ctx.clone();
+        thread::spawn(move || refresh_loop(sender, repo, context));
         let hwnd = native_window_handle(creation_context);
         set_taskbar_icon(hwnd);
 
         Self {
             receiver,
             status: None,
+            jobs: None,
             cswap: None,
             status_err_streak: 0,
             cswap_err_streak: 0,
@@ -542,14 +546,31 @@ impl PanelApp {
 
     fn receive_latest(&mut self) {
         while let Ok(snapshot) = self.receiver.try_recv() {
-            self.status = merge_poll_result(self.status.take(), &mut self.status_err_streak, snapshot.status);
-            self.cswap = merge_poll_result(self.cswap.take(), &mut self.cswap_err_streak, snapshot.cswap);
-            self.fixacao = snapshot.fixacao;
-            self.codex_last_used_profile = snapshot.codex_last_used_profile;
-            self.codex_active_profile = snapshot.codex_active_profile;
-            self.codex_profile_settings = snapshot.codex_profile_settings;
-            self.opencodex = snapshot.opencodex;
-            self.antigravity = snapshot.antigravity;
+            self.jobs = Some(snapshot.jobs);
+            if let Some(status) = snapshot.status {
+                self.status = merge_poll_result(self.status.take(), &mut self.status_err_streak, status);
+            }
+            if let Some(cswap) = snapshot.cswap {
+                self.cswap = merge_poll_result(self.cswap.take(), &mut self.cswap_err_streak, cswap);
+            }
+            if let Some(fixacao) = snapshot.fixacao {
+                self.fixacao = fixacao;
+            }
+            if let Some(profile) = snapshot.codex_last_used_profile {
+                self.codex_last_used_profile = profile;
+            }
+            if let Some(profile) = snapshot.codex_active_profile {
+                self.codex_active_profile = profile;
+            }
+            if let Some(settings) = snapshot.codex_profile_settings {
+                self.codex_profile_settings = settings;
+            }
+            if let Some(opencodex) = snapshot.opencodex {
+                self.opencodex = opencodex;
+            }
+            if let Some(antigravity) = snapshot.antigravity {
+                self.antigravity = antigravity;
+            }
         }
     }
 }
@@ -620,7 +641,13 @@ impl eframe::App for PanelApp {
         // o eframe reimpoe a escala nativa e sobrescreve o ajuste feito na inicializacao.
 
         self.receive_latest();
-        context.request_repaint_after(Duration::from_millis(100));
+        let repaint_interval = if self.poke_mode {
+            // O modo POKE mantém os sprites em animação contínua.
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(1000)
+        };
+        context.request_repaint_after(repaint_interval);
 
         show_title_bar(context, &mut self.poke_mode);
 
@@ -648,6 +675,7 @@ impl eframe::App for PanelApp {
                         ui,
                         content_width,
                         self.status.as_ref(),
+                        self.jobs.as_ref(),
                         self.cswap.as_ref(),
                         self.codex_active_profile.as_deref(),
                         &self.codex_profile_settings,
@@ -660,7 +688,7 @@ impl eframe::App for PanelApp {
                     show_running_jobs(
                         ui,
                         content_width,
-                        self.status.as_ref(),
+                        self.jobs.as_ref(),
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
@@ -957,32 +985,56 @@ fn show_title_bar(context: &egui::Context, poke_mode: &mut bool) {
         });
 }
 
-fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
+fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf, context: egui::Context) {
+    let mut ultimo_pesado = Instant::now() - Duration::from_secs(60);
     loop {
-        let status = read_status(&repo);
-        let cswap = read_cswap();
-        let fixacao = claude_config_dir()
-            .map(|directory| directory.join("cswap-fixada.json"))
-            .and_then(|path| read_json_file(&path));
-        let codex_last_used_profile = read_latest_codex_profile();
-        let codex_active_profile = read_codex_active_profile();
-        let codex_profile_settings = codex_profile_directories()
-            .into_iter()
-            .filter_map(|directory| {
-                let profile = directory.file_name()?.to_str()?.to_owned();
-                let config = fs::read_to_string(directory.join("config.toml")).ok()?;
-                Some((
-                    profile,
-                    read_config_scalar(&config, "model"),
-                    read_config_scalar(&config, "model_reasoning_effort"),
-                ))
-            })
-            .collect();
-        let opencodex = read_opencodex();
-        let antigravity = read_antigravity();
+        let pesado = if ultimo_pesado.elapsed() >= Duration::from_secs(60) {
+            ultimo_pesado = Instant::now();
+            Some((
+                read_status(&repo),
+                read_cswap(),
+                claude_config_dir()
+                    .map(|directory| directory.join("cswap-fixada.json"))
+                    .and_then(|path| read_json_file(&path)),
+                read_latest_codex_profile(),
+                read_codex_active_profile(),
+                codex_profile_directories()
+                    .into_iter()
+                    .filter_map(|directory| {
+                        let profile = directory.file_name()?.to_str()?.to_owned();
+                        let config = fs::read_to_string(directory.join("config.toml")).ok()?;
+                        Some((
+                            profile,
+                            read_config_scalar(&config, "model"),
+                            read_config_scalar(&config, "model_reasoning_effort"),
+                        ))
+                    })
+                    .collect(),
+                read_opencodex(),
+                read_antigravity(),
+            ))
+        } else {
+            None
+        };
+        let jobs = read_jobs(&repo);
+        let (status, cswap, fixacao, codex_last_used_profile, codex_active_profile,
+            codex_profile_settings, opencodex, antigravity) = match pesado {
+            Some((status, cswap, fixacao, last_used, active, settings, opencodex, antigravity)) => (
+                Some(status),
+                Some(cswap),
+                Some(fixacao),
+                Some(last_used),
+                Some(active),
+                Some(settings),
+                Some(opencodex),
+                Some(antigravity),
+            ),
+            None => (None, None, None, None, None, None, None, None),
+        };
         if sender
             .send(Snapshot {
                 status,
+                jobs,
                 cswap,
                 fixacao,
                 codex_last_used_profile,
@@ -995,6 +1047,7 @@ fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf) {
         {
             break;
         }
+        context.request_repaint();
         thread::sleep(Duration::from_secs(2));
     }
 }
@@ -1124,6 +1177,29 @@ fn read_status(repo: &Path) -> Result<Value, String> {
     };
     serde_json::from_str(&stdout)
         .map_err(|error| format!("status.py retornou JSON inválido: {error}"))
+}
+
+fn read_jobs(repo: &Path) -> Result<Value, String> {
+    let script = repo.join("skills").join("codex").join("status.py");
+    let mut cmd = Command::new("python");
+    cmd.arg(&script).arg("--jobs").current_dir(repo);
+    if let Some(codex_home) = read_codex_home_path() {
+        cmd.env("CODEX_HOME", codex_home);
+    }
+    let output = match saida_com_timeout(&mut cmd, TIMEOUT_COMANDO_EXTERNO) {
+        Ok(output) => output,
+        Err(error) => return Err(format!("status.py jobs: {error}")),
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "status.py jobs saiu com erro: {}",
+            process_output_message(&output)
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("status.py jobs retornou UTF-8 inválido: {error}"))?;
+    serde_json::from_str(&stdout)
+        .map_err(|error| format!("status.py jobs retornou JSON inválido: {error}"))
 }
 
 fn read_cswap() -> Result<Value, String> {
@@ -1858,6 +1934,7 @@ fn show_command_center(
     ui: &mut egui::Ui,
     content_width: f32,
     status: Option<&Result<Value, String>>,
+    jobs: Option<&Result<Value, String>>,
     cswap: Option<&Result<Value, String>>,
     active_profile: Option<&str>,
     profile_settings: &[(String, Option<String>, Option<String>)],
@@ -1883,7 +1960,7 @@ fn show_command_center(
             );
             let painter = ui.painter().with_clip_rect(arena_clip);
             let time = context.input(|input| input.time);
-            let has_codex_job = codex_job_running(status);
+            let has_codex_job = codex_job_running(jobs);
             let claude_offset = bob_offset(time, 0.0, 2.0);
             let codex_offset = if has_codex_job {
                 bob_offset(time, 0.25, 2.0)
@@ -2004,7 +2081,7 @@ fn show_command_center(
                         egui::pos2(arena.left(), arena.top() + row_height),
                         egui::vec2(arena.width(), 38.0),
                     ),
-                    status,
+                    jobs,
                 );
                 draw_arena_side(
                     &painter,
@@ -2077,7 +2154,7 @@ fn show_command_center(
                         egui::pos2(arena.left(), arena.top() + row_height),
                         egui::vec2(arena.width(), ARENA_DELEGATION_HEIGHT),
                     ),
-                    status,
+                    jobs,
                 );
                 draw_arena_side(
                     &painter,
@@ -2132,7 +2209,7 @@ fn show_command_center(
                     ArenaSideLayout::Sober,
                     0.0,
                 );
-                draw_arena_delegation(&painter, ui, delegation_rect, status);
+                draw_arena_delegation(&painter, ui, delegation_rect, jobs);
                 draw_arena_side(
                     &painter,
                     ui,
