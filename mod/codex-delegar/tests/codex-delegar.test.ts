@@ -1,12 +1,100 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { formatQuotaWindows, selectQuotaAccount } from '../hooks/register'
+import {
+  fnv1a64,
+  formatQuotaWindows,
+  cacheIsFresh,
+  jobsPollingInterval,
+  mergeCache,
+  mergeSessionJobs,
+  mergePokeConfig,
+  selectQuotaAccount,
+  spriteNumber,
+  trainerSpriteKey,
+  usageColor,
+} from '../hooks/register'
 
 const options = { repoPath: 'C:/repo' }
+
+test('FNV-1a 64-bit matches the known vectors', { options }, () => {
+  expect(fnv1a64('')).toBe(0xcbf29ce484222325n)
+  expect(fnv1a64('hello')).toBe(0xa430d84680aabd0bn)
+})
+
+test('usage color follows the panel bands', { options }, () => {
+  expect(usageColor(59)).toBe('success')
+  expect(usageColor(60)).toBe('warning')
+  expect(usageColor(85)).toBe('warning')
+  expect(usageColor(86)).toBe('error')
+})
+
+test('sprites use only the mapa.json number, never the cswap slot', { options }, () => {
+  const map = {
+    'claude:a@x': { numero: 25, nome: 'A' },
+    'codex:b@x': { numero: 26, nome: 'B' },
+  }
+  expect(spriteNumber('claude', 'a@x', map)).toBe(25)
+  expect(spriteNumber('codex', 'b@x', map)).toBe(26)
+  expect(spriteNumber('claude', 'missing@x', map)).toBeUndefined()
+})
+
+test('shared cache has a 60 second TTL and preserves the other provider', { options }, () => {
+  const cache = mergeCache({ cswap: { ts: 900, data: { accounts: [] } } }, 'status', { codex: {} }, 1000)
+  expect(cacheIsFresh(cache.cswap, 59900)).toBe(true)
+  expect(cacheIsFresh(cache.cswap, 60900)).toBe(false)
+  expect(cache.cswap?.data).toEqual({ accounts: [] })
+})
+
+test('job polling is adaptive and trainer uses the compact sprite by default', { options }, () => {
+  expect(jobsPollingInterval(true)).toBe(3000)
+  expect(jobsPollingInterval(false)).toBe(15000)
+  expect(trainerSpriteKey(29)).toBe('treinador-p')
+  expect(trainerSpriteKey(30)).toBe('treinador-g')
+})
+
+test('session agents include only active agents and use the matched job duration', { options }, () => {
+  const jobs = [
+    { tipo: 'claude' as const, modelo: 'opus', projeto: 'old', segundos: 4, arquivo: 'session-abc-agent-1.jsonl' },
+    { tipo: 'claude' as const, modelo: 'opus', projeto: 'other', segundos: 5, arquivo: 'session-abc-agent-2.jsonl' },
+  ]
+  const merged = mergeSessionJobs(jobs, [
+    { id: 'agent-1', description: 'first', type: 'Explore', status: 'waiting' as const },
+  ], 'session-abc')
+  expect(merged[0]?.agentStatus).toBe('waiting')
+  expect(merged[0]?.segundos).toBe(4)
+  expect(merged.filter(job => job.arquivo === 'session-abc-agent-1.jsonl')).toHaveLength(1)
+  expect(merged[1]?.arquivo).toBe('session-abc-agent-2.jsonl')
+})
+
+test('completed agents and their matched status jobs are not shown', { options }, () => {
+  const merged = mergeSessionJobs([
+    { tipo: 'claude' as const, modelo: 'opus', projeto: 'done', segundos: 9, arquivo: 'session-abc-agent-done.jsonl' },
+    { tipo: 'claude' as const, modelo: 'opus', projeto: 'live', segundos: 7, arquivo: 'session-abc-agent-live.jsonl' },
+  ], [
+    { id: 'agent-done', description: 'done', type: 'Explore', status: 'completed' as const },
+    { id: 'agent-live', description: 'live', type: 'Explore', status: 'running' as const },
+  ], 'session-abc')
+  expect(merged.some(job => job.agentId === 'agent-done')).toBe(false)
+  expect(merged.some(job => job.arquivo.includes('agent-done'))).toBe(false)
+  expect(merged.find(job => job.agentId === 'agent-live')?.segundos).toBe(7)
+})
+
+test('poke toggle preserves unrelated config keys', { options }, () => {
+  expect(JSON.parse(mergePokeConfig({ tema: 'escuro', modo_poke: false }, true))).toEqual({
+    tema: 'escuro',
+    modo_poke: true,
+  })
+})
 
 test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
   let request: { argv: readonly string[]; input?: string } | undefined
-  on('process.run', () => ({ value: { exitCode: 128, stdout: '', stderr: 'not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', () => ({ value: {
+    exitCode: 128,
+    stdout: '',
+    stderr: 'not a git repository',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
   on('process.spawn', async function* (_$, e) {
     request = e
     yield { stream: 'stdout', text: 'started' }
@@ -14,7 +102,11 @@ test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { opti
   })
   on('fs.exists', () => ({ value: false }))
   on('ui.toast', () => ({ value: undefined }))
-  const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'linha 1\nlinha 2', cwd: 'C:/fora' })
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'linha 1\nlinha 2',
+    cwd: 'C:/fora',
+  })
   await Promise.resolve()
   await Promise.resolve()
   await Promise.resolve()
@@ -31,7 +123,13 @@ test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { opti
 
 test('exit 0 sem arquivo de saída deixa o job falhou', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', () => ({ value: {
+    exitCode: 0,
+    stdout: '',
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
   on('process.spawn', async function* () {
     yield { stream: 'stdout', text: 'started' }
     return { value: { code: 0, signal: null } }
@@ -65,7 +163,13 @@ test('sugestao aparece uma vez no terceiro arquivo do turno', { options }, async
 
 test('capacity in process diagnostics marks the job to retry', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', () => ({ value: {
+    exitCode: 0,
+    stdout: '',
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
   on('process.spawn', async function* () {
     yield { stream: 'stderr', text: 'Selected model is at capacity' }
     return { value: { code: 1, signal: null } }
@@ -82,7 +186,13 @@ test('capacity in process diagnostics marks the job to retry', { options }, asyn
 test('preexisting PERGUNTA.md does not turn the job into a question', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
   let existsCalls = 0
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', () => ({ value: {
+    exitCode: 0,
+    stdout: '',
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
   on('process.spawn', async function* () {
     yield { stream: 'stdout', text: 'started' }
     return { value: { code: 0, signal: null } }
@@ -131,7 +241,13 @@ test('Pane uses active tokens and formats numeric windows', { options }, async (
 test('job created question file is reported as a question', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
   let existsCalls = 0
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', () => ({ value: {
+    exitCode: 0,
+    stdout: '',
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
   on('process.spawn', async function* () {
     yield { stream: 'stdout', text: 'started' }
     return { value: { code: 0, signal: null } }
