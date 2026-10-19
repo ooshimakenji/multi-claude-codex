@@ -33,7 +33,7 @@ HOME = os.path.expanduser("~")
 CODEX_HOME = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
 CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
 MARK = os.path.join(CLAUDE_HOME, "codex-status-mark.json")
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 _CACHE = None
 _CACHE_PATH = None
 _CACHE_DIRTY = False
@@ -142,8 +142,19 @@ def _rollout_cached(path):
 
     modelo = None
     quotas = None
+    source = None
     linhas = tail(path, 65536)
     uso = _ultimo_token_count(linhas)
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            cabecalho = json.loads(fh.readline())
+    except (OSError, ValueError, TypeError):
+        cabecalho = None
+    if (isinstance(cabecalho, dict) and
+            cabecalho.get("type") == "session_meta"):
+        payload = cabecalho.get("payload") or {}
+        if isinstance(payload, dict) and "source" in payload:
+            source = payload.get("source")
     for linha in linhas:
         try:
             ev = json.loads(linha)
@@ -152,6 +163,8 @@ def _rollout_cached(path):
         payload = ev.get("payload") or {}
         if not isinstance(payload, dict):
             continue
+        if ev.get("type") == "session_meta" and "source" in payload:
+            source = payload.get("source")
         if ev.get("type") == "turn_context" and payload.get("model"):
             sandbox = payload.get("sandbox_policy") or {}
             modelo = [payload["model"],
@@ -170,7 +183,8 @@ def _rollout_cached(path):
     registro = {"assinatura": list(assinatura),
                 "tokens": (uso or {}).get("total_tokens", 0),
                 "modelo": modelo,
-                "quotas": quotas}
+                "quotas": quotas,
+                "source": source}
     _cache()["rollouts"][chave] = registro
     global _CACHE_DIRTY
     _CACHE_DIRTY = True
@@ -207,6 +221,11 @@ def codex_profile_homes():
 
 def _rollouts(home):
     return glob.glob(os.path.join(home, "sessions", "**", "*.jsonl"), recursive=True)
+
+
+def _rollout_guardian(registro):
+    source = registro.get("source") if isinstance(registro, dict) else None
+    return isinstance(source, dict) and "subagent" in source
 
 
 def codex_tokens_total(home=None):
@@ -256,11 +275,18 @@ def _codex_side_profile(home):
     os tenha: um job curto pode nao gravar turn_context, e ficar sem modelo no
     display so porque foi o ultimo a rodar seria pior que olhar um pouco atras."""
     arqs = sorted(_rollouts(home), key=os.path.getmtime, reverse=True)
-    out = {"arquivo": os.path.basename(arqs[0]) if arqs else None,
+    validos = []
+    for arq in arqs:
+        try:
+            if not _rollout_guardian(_rollout_cached(arq)):
+                validos.append(arq)
+        except OSError:
+            continue
+    out = {"arquivo": os.path.basename(validos[0]) if validos else None,
            "tokens": codex_tokens_total(home)}
-    if arqs:
-        out["idade_s"] = max(0, time.time() - os.path.getmtime(arqs[0]))
-    for arq in arqs[:10]:
+    if validos:
+        out["idade_s"] = max(0, time.time() - os.path.getmtime(validos[0]))
+    for arq in validos[:10]:
         try:
             registro = _rollout_cached(arq)
         except OSError:
@@ -460,7 +486,11 @@ def jobs_ativos():
             if not ((idade is not None and 0 <= idade <= 90) or
                     (pendente and idade is not None and 0 <= idade < 30 * 60)):
                 continue
-
+            try:
+                if _rollout_guardian(_rollout_cached(arq)):
+                    continue
+            except OSError:
+                continue
             # So agora vale a pena buscar cabecalho, contexto e tokens.
             linhas = tail(arq, 65536)
             primeiro = contexto = None
@@ -1055,6 +1085,7 @@ def selftest():
     # --- jobs ativos: janela, evento final e inicio sao criterios separados ---
     agora = time.time()
     ativo = os.path.join(roll, "rollout-active.jsonl")
+    guardian = os.path.join(roll, "rollout-guardian.jsonl")
     concluido = os.path.join(roll, "rollout-done.jsonl")
     antigo = os.path.join(roll, "rollout-old.jsonl")
     mtime_old = os.path.join(roll, "rollout-old-mtime.jsonl")
@@ -1068,6 +1099,15 @@ def selftest():
             {"timestamp": agora - 1, "type": "event_msg", "payload": {
                 "type": "token_count", "info": {"total_token_usage": {
                     "total_tokens": 1234}}}},
+        ]),
+        (guardian, [
+            {"timestamp": agora - 2, "type": "session_meta", "payload": {
+                "source": {"subagent": {"other": "guardian"}}}},
+            {"timestamp": agora - 2, "type": "turn_context", "payload": {
+                "model": "codex-auto-review", "cwd": proj}},
+            {"timestamp": agora - 1, "type": "event_msg", "payload": {
+                "type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": 2345}}}},
         ]),
         (concluido, [
             {"timestamp": agora - 8, "type": "turn_context", "payload": {
@@ -1111,6 +1151,7 @@ def selftest():
     jobs = jobs_ativos()
     por_arquivo = {job["arquivo"]: job for job in jobs}
     assert "rollout-active.jsonl" in por_arquivo, jobs
+    assert "rollout-guardian.jsonl" not in por_arquivo, jobs
     assert "rollout-done.jsonl" not in por_arquivo, jobs
     assert "rollout-old.jsonl" not in por_arquivo, jobs
     assert "rollout-old-mtime.jsonl" in por_arquivo, jobs
@@ -1121,6 +1162,8 @@ def selftest():
     assert job["modelo"] == "gpt-5.6-luna" and job["cwd"] == proj, job
     assert job["projeto"] == "algum-projeto" and job["tokens"] == 1234, job
     assert 10 <= job["segundos"] <= 20, job
+    side = codex_side(contas=False)
+    assert side["modelo"] == "gpt-5.6-luna", side
     subagents = os.path.join(d, "projects", "claude-projeto", "sessao", "subagents")
     os.makedirs(subagents)
     claude_active = os.path.join(subagents, "agent-active.jsonl")
