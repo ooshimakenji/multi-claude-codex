@@ -986,7 +986,9 @@ fn show_title_bar(context: &egui::Context, poke_mode: &mut bool) {
 }
 
 fn refresh_loop(sender: Sender<Snapshot>, repo: PathBuf, context: egui::Context) {
-    let mut ultimo_pesado = Instant::now() - Duration::from_secs(60);
+    let mut ultimo_pesado = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
     loop {
         let pesado = if ultimo_pesado.elapsed() >= Duration::from_secs(60) {
             ultimo_pesado = Instant::now();
@@ -4898,6 +4900,58 @@ fn format_number(number: f64) -> String {
 }
 
 fn main() -> eframe::Result<()> {
+    let hook_anterior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs_f64())
+            .ok()
+            .and_then(local_date_time)
+            .map(|date_time| {
+                format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}",
+                    date_time.year,
+                    date_time.month,
+                    date_time.day,
+                    date_time.hour,
+                    date_time.minute,
+                )
+            })
+            .unwrap_or_else(|| "data/hora indisponível".to_owned());
+        let local_app_data = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        if let Some(local_app_data) = local_app_data {
+            let directory = local_app_data.join("painel-claude");
+            let _ = (|| -> std::io::Result<()> {
+                fs::create_dir_all(&directory)?;
+                let mut log = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join("panic.log"))?;
+                let location = panic_info
+                    .location()
+                    .map(|location| {
+                        format!(
+                            "{}:{}:{}",
+                            location.file(),
+                            location.line(),
+                            location.column()
+                        )
+                    })
+                    .unwrap_or_else(|| "local desconhecido".to_owned());
+                writeln!(
+                    log,
+                    "[{timestamp}] mensagem={} local={} backtrace={}",
+                    panic_info,
+                    location,
+                    std::backtrace::Backtrace::force_capture(),
+                )
+            })();
+        }
+        hook_anterior(panic_info);
+    }));
+    if env::var("PAINEL_PANIC_TESTE").as_deref() == Ok("1") {
+        panic!("teste de panic.log");
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([INITIAL_INNER_WIDTH, INITIAL_INNER_HEIGHT])
