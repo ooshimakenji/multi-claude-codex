@@ -1,0 +1,14 @@
+{
+  "name": "codex-delegar",
+  "version": "0.1.0",
+  "description": "Delega leituras e investigações ao Codex CLI em background.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "repoPath": {
+      "title": "Repositório do Codex",
+      "type": "string",
+      "description": "Raiz usada para ler a cota do Codex.",
+      "default": "C:/Users/vinicius.oshima/Downloads/github/multi-claude-codex"
+    }
+  }
+}
