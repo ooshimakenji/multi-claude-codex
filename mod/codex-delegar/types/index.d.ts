@@ -49,6 +49,7 @@ export type ClaudeAccount = {
 export type DashboardJob = {
   tipo: 'claude' | 'codex'
   modelo: string
+  effort?: string
   projeto: string
   segundos?: number
   arquivo: string

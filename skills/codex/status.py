@@ -924,7 +924,9 @@ def line(stdin_json=None):
                        for q in cx.get("quotas", [])]
             identidade = _codex_auth(CODEX_HOME)
             marcador = " [relogar]" if identidade.get("status") != "ok" else ""
-            partes.append("codex " + " ".join(campos) + marcador)
+            ativos = len(jobs_ativos())
+            jobs = " · codex {} rodando".format(ativos) if ativos else ""
+            partes.append("codex " + " ".join(campos) + marcador + jobs)
     except OSError:
         pass
     try:

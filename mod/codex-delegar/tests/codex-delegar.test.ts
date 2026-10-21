@@ -102,6 +102,7 @@ test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { opti
   })
   on('fs.exists', () => ({ value: false }))
   on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
   const call = await $.tool.call({
     tool: 'mcp__codex-delegar__delegar_codex',
     prompt: 'linha 1\nlinha 2',
@@ -121,6 +122,66 @@ test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { opti
   expect(request?.input).toBe('linha 1\nlinha 2')
 })
 
+test('saida relativa usa o cwd no arquivo e no argv', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming' })
+  let request: { argv: readonly string[] } | undefined
+  on('process.run', () => ({ value: {
+    exitCode: 128,
+    stdout: '',
+    stderr: 'not a git repository',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
+  on('process.spawn', async function* (_$, e) {
+    request = e
+    yield { stream: 'stdout', text: 'started' }
+    return { value: { code: 0, signal: null } }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+    saida: 'analise/codex-job4-cenario.log',
+  })
+  const delegation = JSON.parse(String(call.result)) as { saida: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  expect(delegation.saida).toBe('C:/outro/analise/codex-job4-cenario.log')
+  expect(request?.argv).toContain(delegation.saida)
+})
+
+test('resposta substancial vence capacidade', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
+  const response = 'resposta completa '.repeat(30)
+  on('process.run', () => ({ value: {
+    exitCode: 0,
+    stdout: '',
+    stderr: '',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
+  on('process.spawn', async function* () {
+    yield { stream: 'stderr', text: 'Selected model is at capacity' }
+    return { value: { code: 1, signal: null } }
+  })
+  on('fs.exists', () => ({ value: true }))
+  on('fs.read', () => ({ value: response }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+  })
+  const job = JSON.parse(String(call.result)) as { job_id: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  const status = await $.tool.call({ tool: 'mcp__codex-delegar__codex_job', job_id: job.job_id })
+  expect(status.result).toContain('"status":"ok"')
+  expect(status.result).not.toContain('modelo sem capacidade')
+})
+
 test('exit 0 sem arquivo de saída deixa o job falhou', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
   on('process.run', () => ({ value: {
@@ -136,7 +197,12 @@ test('exit 0 sem arquivo de saída deixa o job falhou', { options }, async ($, o
   })
   on('fs.exists', () => ({ value: false }))
   on('ui.toast', () => ({ value: undefined }))
-  const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+  })
   const job = JSON.parse(String(call.result)) as { job_id: string }
   await Promise.resolve()
   await Promise.resolve()
@@ -176,11 +242,58 @@ test('capacity in process diagnostics marks the job to retry', { options }, asyn
   })
   on('fs.exists', () => ({ value: false }))
   on('ui.toast', () => ({ value: undefined }))
-  const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+    modelo: 'gpt-5.6-terra',
+  })
   const job = JSON.parse(String(call.result)) as { job_id: string }
   await new Promise(resolve => setTimeout(resolve, 25))
   const status = await $.tool.call({ tool: 'mcp__codex-delegar__codex_job', job_id: job.job_id })
-  expect(status.result).toContain('modelo sem capacidade')
+  expect(status.result).toContain('gpt-5.6-luna')
+})
+
+test('job criado aparece no running antes de terminar', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming' })
+  let release: (() => void) | undefined
+  on('process.run', () => ({ value: {
+    exitCode: 128,
+    stdout: '',
+    stderr: 'not a git repository',
+    isStdoutTruncated: false,
+    isStderrTruncated: false,
+  } }))
+  on('process.spawn', async function* () {
+    await new Promise<void>(resolve => { release = resolve })
+    return { value: { code: 0, signal: null } }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+  })
+  const tree = await $.ui.render({
+    plugin: 'codex-delegar',
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'codex',
+    props: {
+      title: 'Codex',
+      isFocused: false,
+      bodyColumns: 80,
+      placement: 'inline',
+      scroll: { offset: 0, bodyRows: 12 },
+      view: {},
+    },
+  })
+  expect(JSON.stringify(tree)).toContain('outro')
+  release?.()
+  await new Promise(resolve => setTimeout(resolve, 25))
 })
 
 test('preexisting PERGUNTA.md does not turn the job into a question', { options }, async ($, on) => {
@@ -199,6 +312,7 @@ test('preexisting PERGUNTA.md does not turn the job into a question', { options 
   })
   on('fs.exists', () => ({ value: ++existsCalls === 1 || existsCalls === 3 }))
   on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
   const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
   const job = JSON.parse(String(call.result)) as { job_id: string }
   await new Promise(resolve => setTimeout(resolve, 25))
@@ -255,6 +369,7 @@ test('job created question file is reported as a question', { options }, async (
   on('fs.exists', () => ({ value: ++existsCalls === 3 }))
   on('fs.read', () => ({ value: 'need clarification' }))
   on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
   const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
   const job = JSON.parse(String(call.result)) as { job_id: string }
   await new Promise(resolve => setTimeout(resolve, 25))
