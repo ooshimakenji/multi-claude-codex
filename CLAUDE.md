@@ -26,6 +26,15 @@
   (é ferramenta padrão de subagente em background) e nunca o usou — nenhum dos 5
   agentes da sessão de 2026-09-17 pausou pra perguntar por conta própria; só param
   se o briefing pedir. Isolamento contém o dano; isto tenta evitar que aconteça.
+- **Paralelizar é autorizado (usuário, 2026-10-26): "quantos precisar" para ganhar agilidade.**
+  Dividir em vários `codex exec` simultâneos sempre que as partes forem separáveis:
+  - escrita em paralelo só com **arquivos disjuntos** ou **um worktree por job** (motor / tela /
+    testes, juntando no fim); **nunca dois escritores no mesmo arquivo ou worktree** — um
+    sobrescreve o outro;
+  - revisão **só-leitura** pode rodar ao lado da escrita (ex.: `sol` revisando enquanto `luna`
+    escreve), cada uma com seu arquivo de saída;
+  - limite prático pela RAM livre: ~1 GB por job (com ~4 GB livres, 3–4 jobs);
+  - a revisão final e o `verificar` continuam com o Claude, rodados por ele.
 
 ### Quando o Codex CLI está indisponível
 
