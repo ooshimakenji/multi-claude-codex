@@ -724,7 +724,8 @@ SILENCIO_S = 10 * 60      # sem evento novo ha mais que isso: travado (pendente)
 TERMINADO_S = 2 * 3600    # terminados ficam ~2h na lista, com estado
 JOBS_TTL_S = 2            # o painel le a cada 2s e o pane a cada 3s: um escritor so, este script
 # O mod (e um "codex exec" direto com o mesmo cabecalho) abre o 1o prompt com isto.
-MARCADOR = re.compile(r"<!--\s*job:(\S+)\s+tarefa:(.*?)\s+papel:(.*?)\s*-->", re.S)
+# tarefa e papel sao opcionais: sem tarefa o mod grava so <!-- job:ID papel:Y -->.
+MARCADOR = re.compile(r"<!--\s*job:(\S+)(?:\s+tarefa:(.*?))?(?:\s+papel:(.*?))?\s*-->", re.S)
 # Convencao do Agent tool: description = "tarefa/papel: ..."
 DESCRICAO = re.compile(r"^\s*([^/:]+?)\s*/\s*([^:]+?)\s*:")
 PENDENTES_CODEX = ("function_call", "custom_tool_call", "local_shell_call")
@@ -821,7 +822,7 @@ def _extrai_codex(arq):
             viu_prompt = True
             achado = MARCADOR.match(str(payload.get("message") or "").lstrip())
             if achado:
-                dados["marcador"] = [parte.strip() for parte in achado.groups()]
+                dados["marcador"] = [(parte or "").strip() or None for parte in achado.groups()]
 
     linhas = tail(arq, 65536)
     uso = _ultimo_token_count(linhas)
@@ -966,7 +967,9 @@ def tarefas_agora():
             nome, worktree = _tarefa_do_cwd(dados["cwd"])
             id_agente, papel = dados["id"] or os.path.basename(arq), None
             if dados["marcador"]:
-                id_agente, nome, papel = dados["marcador"]
+                # Sem tarefa no marcador, o nome continua vindo do worktree/pasta.
+                id_agente, tarefa_marcada, papel = dados["marcador"]
+                nome = tarefa_marcada or nome
             agente = _agente("codex", id_agente, dados, papel, conta, agora)
             linhas.append((nome, worktree, agente, dados["ultimo"]))
         for quota in (quota_nova[1] if quota_nova else []):
@@ -990,9 +993,11 @@ def tarefas_agora():
         except (OSError, ValueError, TypeError):
             meta = {}
         meta = meta if isinstance(meta, dict) else {}
-        # Texto sozinho parado ha mais de 90s e fim de verdade (ver jobs_ativos).
-        dados["concluido"] = bool(meta.get("finished") or dados["terminou"] or (
-            not dados["pendente"] and agora - dados["ultimo"] > 90))
+        # Fim so por sinal explicito (meta.finished, handback, evento final). Texto sozinho parado
+        # NAO e fim aqui: o subagente que espera um job em background fica assim por muitos minutos.
+        # Sem sinal, o silencio longo vira travado (nunca falhou nem concluido por adivinhacao).
+        dados["concluido"] = bool(meta.get("finished") or dados["terminou"])
+        dados["pendente"] = True
         descricao = meta.get("description") if isinstance(meta.get("description"), str) else None
         nome, worktree = _tarefa_do_cwd(dados["cwd"])
         papel = descricao or (meta.get("agentType") if isinstance(meta.get("agentType"), str) else None)
@@ -1722,6 +1727,13 @@ def selftest():
         {"timestamp": agora_t - 60, "type": "event_msg", "payload": {
             "type": "task_complete", "last_agent_message": "Feito: 3 commits\nsegunda linha"}}],
         agora_t - 300, "<!-- job:J1 tarefa:Centro de comando papel:status.py -->\nO resto do briefing.")
+    # o mod omite tarefa (ou papel) quando nao vem: o que faltar cai no fallback.
+    rollout("so-papel", worktree_t, [
+        {"timestamp": agora_t - 5, "type": "response_item", "payload": {"type": "reasoning"}}],
+        agora_t - 20, "<!-- job:J2 papel:revisao -->\nbriefing")
+    rollout("so-tarefa", solto, [
+        {"timestamp": agora_t - 5, "type": "response_item", "payload": {"type": "reasoning"}}],
+        agora_t - 20, "<!-- job:J3 tarefa:Lote outubro -->\nbriefing")
     rollout("pendente-15m", solto, [
         {"timestamp": agora_t - 900, "type": "response_item", "payload": {
             "type": "function_call", "name": "exec"}}], agora_t - 950)
@@ -1760,6 +1772,14 @@ def selftest():
             "model": "claude-sonnet-4-6", "content": [{"type": "tool_use", "name": "Read"}]}}) + "\n")
     with open(os.path.join(subagentes_t, "agent-rev.meta.json"), "w", encoding="utf-8") as fh:
         json.dump({"agentType": "general-purpose", "description": "Centro de comando/revisor: confere diff"}, fh)
+    # texto sozinho parado 5 min: sem meta.finished e espera de background, nao fim; com finished, fim.
+    for nome_agente, meta_agente in (("agent-ocioso", {"description": "espera job"}),
+                                     ("agent-feito", {"description": "entregou", "finished": True})):
+        with open(os.path.join(subagentes_t, nome_agente + ".jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"timestamp": agora_t - 300, "type": "assistant", "message": {
+                "model": "claude-opus-4-6", "content": [{"type": "text", "text": "Aguardando o job."}]}}) + "\n")
+        with open(os.path.join(subagentes_t, nome_agente + ".meta.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta_agente, fh)
 
     saida_t = tarefas_agora()
     agentes_t = {agente["id"]: (tarefa, agente) for tarefa in saida_t["tarefas"]
@@ -1783,7 +1803,12 @@ def selftest():
     assert agente["tipo"] == "claude" and agente["modelo"] == "claude-sonnet-4-6", agente
     assert tarefa["nome"] == "Centro de comando" and agente["papel"] == "revisor", agentes_t["agent-rev"]
     assert agente["estado"] == "rodando", agente
-    assert saida_t["resumo"]["rodando"] == 2, saida_t["resumo"]
+    assert agentes_t["J2"][0]["nome"] == "centro-x" and agentes_t["J2"][1]["papel"] == "revisao", agentes_t["J2"]
+    assert agentes_t["J3"][0]["nome"] == "Lote outubro" and agentes_t["J3"][1]["papel"] is None, agentes_t["J3"]
+    assert agentes_t["agent-ocioso"][1]["estado"] == "rodando", agentes_t["agent-ocioso"]
+    assert agentes_t["agent-feito"][1]["estado"] == "concluido", agentes_t["agent-feito"]
+    assert agentes_t["agent-feito"][1]["resultado"] == "Aguardando o job.", agentes_t["agent-feito"]
+    assert saida_t["resumo"]["rodando"] == 5, saida_t["resumo"]
     assert agentes_t["sess-rodando"][1]["tokens"] == 77, agentes_t["sess-rodando"]
     assert saida_t["cotas"] == [{"conta": os.path.basename(t), "janela": 300, "pct": 4.0,
                                  "resetaEm": _iso(1787759175)}], saida_t["cotas"]
@@ -1798,15 +1823,20 @@ def selftest():
                               env=dict(os.environ, CODEX_HOME=t, CLAUDE_CONFIG_DIR=t),
                               capture_output=True, text=True, check=True)
     json_saida = json.loads(processo.stdout)
-    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fixtures",
-                           "tarefas.json"), encoding="utf-8") as fh:
-        fixture = json.load(fh)
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fixtures",
+                               "tarefas.json"), encoding="utf-8") as fh:
+            fixture = json.load(fh)
+    except OSError:
+        fixture = None   # copia instalada fora do repo: valida so tipos e estados
     assert json_saida["tarefas"], json_saida
-    assert set(json_saida["resumo"]) == set(fixture["resumo"]), json_saida["resumo"]
+    assert fixture is None or set(json_saida["resumo"]) == set(fixture["resumo"]), json_saida["resumo"]
     assert all(isinstance(v, int) for v in json_saida["resumo"].values()), json_saida["resumo"]
-    chaves_agente = set(fixture["tarefas"][0]["agentes"][0])
+    chaves_agente = set(fixture["tarefas"][0]["agentes"][0]) if fixture else set(_agente(
+        "codex", "x", {"inicio": None, "ultimo": None}, None, None, time.time()))
     for tarefa in json_saida["tarefas"]:
-        assert set(tarefa) == set(fixture["tarefas"][0]), tarefa
+        assert set(tarefa) == ({"nome", "worktree", "agentes"} if fixture is None
+                               else set(fixture["tarefas"][0])), tarefa
         assert isinstance(tarefa["nome"], str) and isinstance(tarefa["agentes"], list), tarefa
         for agente in tarefa["agentes"]:
             assert set(agente) == chaves_agente, agente
@@ -1820,7 +1850,7 @@ def selftest():
                 assert agente[chave] is None or isinstance(agente[chave], str), agente
             datetime.fromisoformat(agente["inicio"])
     for cota in json_saida["cotas"]:
-        assert set(cota) == set(fixture["cotas"][0]), cota
+        assert fixture is None or set(cota) == set(fixture["cotas"][0]), cota
         assert cota["resetaEm"] is None or datetime.fromisoformat(cota["resetaEm"]), cota
 
     assert humano(999) == "999" and humano(20455411) == "20.5M", humano(20455411)
