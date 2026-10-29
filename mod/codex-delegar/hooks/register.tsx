@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, RenderInput } from 'claude-code'
+import type { EngineInterface, Register, RenderInput } from 'claude-code'
 
 import type {
   ClaudeAccount,
@@ -7,6 +7,7 @@ import type {
   CodexQuota,
   DashboardData,
   DashboardJob,
+  FileSnapshot,
   RasterSprite,
 } from '../types'
 
@@ -31,7 +32,7 @@ const dashboard = atom({ plugin: 'codex-delegar', key: 'dashboard' } as const, {
 type DelegarInput = {
   prompt: string
   modelo?: string
-  effort?: 'low' | 'medium' | 'high'
+  effort?: CodexJob['effort']
   cwd?: string
   saida?: string
 }
@@ -39,28 +40,74 @@ type DelegarInput = {
 type QuotaJson = {
   model?: string
   effort?: string
+  ts?: number
   codex?: {
+    modelo?: string
+    effort?: string
     tokens?: number
     quota_pct?: number
-    quotas?: Array<{ janela: number; pct: number }>
+    quotas?: Array<{ janela: number; pct?: number; reseta_em?: number }>
     contas?: Array<{
       perfil: string
-      email: string
-      plano: string
-      status: 'ok' | 'expirado'
-      tokens: number
+      email?: string | null
+      plano?: string | null
+      status: 'ok' | 'expirado' | 'sem_login' | 'erro'
+      tokens?: number
+      quotas?: Array<{ janela: number; pct?: number; reseta_em?: number }>
       number?: number
     }>
   }
 }
 
+export const parseStatusSnapshot = (parsed: QuotaJson, activeProfile: string): CodexQuota => ({
+  model: parsed.codex?.modelo ?? parsed.model,
+  effort: parsed.codex?.effort ?? parsed.effort,
+  activeProfile,
+  quotaPct: parsed.codex?.quota_pct,
+  tokens: parsed.codex?.tokens,
+  windows: parsed.codex?.quotas ?? [],
+  contas: parsed.codex?.contas ?? [],
+  fetchedAt: parsed.ts ? parsed.ts * 1000 : undefined,
+})
+
 const tail = (text: string): string => text.trim().slice(-1000)
 
-const CONFIG = 'C:/Users/vinicius.oshima/.claude/painel-config.json'
-const POKE = 'C:/Users/vinicius.oshima/.claude/poke-cache'
-const CSWAP = 'C:/Users/vinicius.oshima/.local/bin/cswap.exe'
-const SHARED_CACHE = 'C:/Users/vinicius.oshima/.claude/codex-delegar-cache.json'
 const CACHE_TTL_MS = 60000
+const MAX_JOB_HISTORY = 50
+const WINDOWS_HOME_FALLBACK = 'C:/Users/Default'
+
+type RuntimePaths = {
+  config: string
+  poke: string
+  cswap: string
+  sharedCache: string
+  codex: string
+}
+
+const pathWithoutTrailingSlash = (value: string): string => value.replace(/[\\/]$/, '')
+
+const runtimePaths = async ($: EngineInterface): Promise<RuntimePaths> => {
+  const home = pathWithoutTrailingSlash(
+    (await $.env.get('USERPROFILE'))
+      ?? (await $.env.get('HOME'))
+      ?? WINDOWS_HOME_FALLBACK,
+  )
+  const claudeConfig = pathWithoutTrailingSlash(
+    (await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`,
+  )
+  const appData = pathWithoutTrailingSlash((await $.env.get('APPDATA')) ?? `${home}/AppData/Roaming`)
+  return {
+    config: (await $.env.get('PANEL_CONFIG')) ?? `${claudeConfig}/painel-config.json`,
+    poke: (await $.env.get('POKE_CACHE')) ?? `${claudeConfig}/poke-cache`,
+    cswap: (await $.env.get('CSWAP_EXE')) ?? `${home}/.local/bin/cswap.exe`,
+    sharedCache: (await $.env.get('CODEX_DELEGAR_CACHE')) ?? `${claudeConfig}/codex-delegar-cache.json`,
+    codex: (await $.env.get('CODEX_CLI')) ?? `${appData}/npm/codex.cmd`,
+  }
+}
+
+const activeCodexProfile = async ($: EngineInterface): Promise<string> => pathWithoutTrailingSlash(
+  (await $.env.get('CODEX_HOME')) ?? `${(await $.env.get('USERPROFILE')) ?? WINDOWS_HOME_FALLBACK}/.codex`,
+).split(/[\\/]/).pop() ?? '.codex'
 
 type JobsJson = { jobs?: DashboardJob[] }
 type CacheEntry<T> = { ts: number; data: T }
@@ -87,7 +134,7 @@ const emptyDashboard = (): DashboardData => ({
   errors: [],
 })
 
-const readJson = async <T,>($: Parameters<typeof read>[0], path: string): Promise<T | undefined> => {
+const readJson = async <T,>($: EngineInterface, path: string): Promise<T | undefined> => {
   try {
     return JSON.parse(await $.fs.read(path)) as T
   } catch {
@@ -95,8 +142,8 @@ const readJson = async <T,>($: Parameters<typeof read>[0], path: string): Promis
   }
 }
 
-const readPokeMode = async ($: Parameters<typeof read>[0]): Promise<boolean> => {
-  const config = await readJson<Record<string, unknown>>($, CONFIG)
+const readPokeMode = async ($: EngineInterface, configPath: string): Promise<boolean> => {
+  const config = await readJson<Record<string, unknown>>($, configPath)
   return typeof config?.modo_poke === 'boolean' ? config.modo_poke : true
 }
 
@@ -114,19 +161,20 @@ export const mergeCache = (
 })
 
 const runCachedJson = async <T,>(
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   key: 'cswap' | 'status',
   argv: string[],
   cwd?: string,
 ): Promise<T> => {
-  const cache = await readJson<SharedCache>($, SHARED_CACHE)
+  const paths = await runtimePaths($)
+  const cache = await readJson<SharedCache>($, paths.sharedCache)
   const cached = cache?.[key]
-  if (cacheIsFresh(cached, Date.now())) return cached.data as T
+  if (cached !== undefined && cacheIsFresh(cached, Date.now())) return cached.data as T
   const result = await $.process.run(argv, { ...(cwd === undefined ? {} : { cwd }), timeoutMs: 30000 })
   if (result.exitCode !== 0) throw new Error(result.stderr || `${key} exit ${result.exitCode}`)
   const data = JSON.parse(result.stdout) as T
   try {
-    await $.fs.write(SHARED_CACHE, JSON.stringify(mergeCache(cache, key, data, Date.now())))
+    await $.fs.write(paths.sharedCache, JSON.stringify(mergeCache(cache, key, data, Date.now())))
   } catch {
     // The dashboard still works when the shared cache is not writable.
   }
@@ -136,9 +184,10 @@ const runCachedJson = async <T,>(
 export const mergePokeConfig = (config: Record<string, unknown>, value: boolean): string =>
   `${JSON.stringify({ ...config, modo_poke: value }, null, 2)}\n`
 
-export const setPokeMode = async ($: Parameters<typeof read>[0], value: boolean): Promise<void> => {
-  const current = (await readJson<Record<string, unknown>>($, CONFIG)) ?? {}
-  await $.fs.write(CONFIG, mergePokeConfig(current, value))
+export const setPokeMode = async ($: EngineInterface, value: boolean): Promise<void> => {
+  const paths = await runtimePaths($)
+  const current = (await readJson<Record<string, unknown>>($, paths.config)) ?? {}
+  await $.fs.write(paths.config, mergePokeConfig(current, value))
   await update($, dashboard, state => ({ ...state, poke: value }))
 }
 
@@ -153,8 +202,8 @@ export const fnv1a64 = (value: string): bigint => {
 export const usageColor = (pct: number | undefined): 'success' | 'warning' | 'error' =>
   (pct ?? 0) > 85 ? 'error' : (pct ?? 0) >= 60 ? 'warning' : 'success'
 
-const usageOf = (account: ClaudeAccount, window: 'fiveHour' | 'sevenDay') =>
-  account.usage?.[window] ?? account.lastGoodUsage?.[window]
+const usageOf = (account: ClaudeAccount | undefined, window: 'fiveHour' | 'sevenDay') =>
+  account?.usage?.[window] ?? account?.lastGoodUsage?.[window]
 
 const compactClock = (clock: string | undefined): string | undefined => {
   if (!clock) return undefined
@@ -164,7 +213,7 @@ const compactClock = (clock: string | undefined): string | undefined => {
     Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
     Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
   }
-  return `${match[2].padStart(2, '0')}/${months[match[1]] ?? match[1]} ${match[3]}`
+  return `${(match[2] ?? '').padStart(2, '0')}/${months[match[1] ?? ''] ?? match[1] ?? ''} ${match[3] ?? ''}`
 }
 
 const percent = (value: number | undefined): string => value === undefined ? '—' : `${Math.round(value)}%`
@@ -188,12 +237,13 @@ const localJobs = (list: CodexJob[], now: number): DashboardJob[] => list
     arquivo: job.saida,
   }))
 
-const readSprite = async ($: Parameters<typeof read>[0], path: string): Promise<RasterSprite | undefined> => {
+const readSprite = async ($: EngineInterface, path: string): Promise<RasterSprite | undefined> => {
   return await readJson<RasterSprite>($, path)
 }
 
 export const selectQuotaAccount = (currentQuota: CodexQuota): CodexQuota['contas'][number] | undefined =>
-  currentQuota.contas.find(item => item.tokens === currentQuota.tokens)
+  currentQuota.contas.find(item => item.perfil === currentQuota.activeProfile)
+    ?? currentQuota.contas.find(item => item.tokens === currentQuota.tokens)
     ?? currentQuota.contas.find(item => item.status === 'ok')
     ?? currentQuota.contas[0]
 
@@ -205,7 +255,7 @@ export const formatQuotaWindows = (currentQuota: CodexQuota): string => currentQ
       : item.janela === 43200
         ? '30d'
         : `${item.janela}min`
-  return `${label} ${item.pct}%`
+  return `${label} ${item.pct === undefined ? '—' : `${item.pct}%`}`
 }).join(' | ') || 'cota indisponível'
 
 export const mergeSessionJobs = (
@@ -239,22 +289,77 @@ const duration = (job: CodexJob, now: number): number =>
   Math.max(0, Math.round(((job.finishedAt ?? now) - job.startedAt) / 1000))
 
 const updateJob = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   id: string,
   change: (job: CodexJob) => CodexJob,
 ): Promise<void> => {
-  await update($, jobs, list => list.map(job => job.id === id ? change(job) : job))
+  await update($, jobs, list => trimJobHistory(list.map(job => job.id === id ? change(job) : job)))
 }
 
-const readOutput = async ($: Parameters<typeof read>[0], path: string): Promise<string | undefined> => {
+const trimJobHistory = (list: CodexJob[]): CodexJob[] => {
+  const running = list.filter(job => job.status === 'rodando')
+  const finished = list.filter(job => job.status !== 'rodando').slice(-MAX_JOB_HISTORY)
+  return [...running, ...finished].slice(-MAX_JOB_HISTORY)
+}
+
+const readOutput = async ($: EngineInterface, path: string): Promise<string | undefined> => {
   if (!(await $.fs.exists(path))) {
     return undefined
   }
   return await $.fs.read(path)
 }
 
+const fileSnapshot = async ($: EngineInterface, path: string): Promise<FileSnapshot> => {
+  if (!(await $.fs.exists(path))) return { existe: false }
+  const content = await $.fs.read(path)
+  const escaped = path.replace(/'/g, "''")
+  try {
+    const result = await $.process.run([
+      'powershell',
+      '-NoProfile',
+      '-Command',
+      `$item = Get-Item -LiteralPath '${escaped}'; `
+        + '[Console]::Write("$($item.Length)|$($item.LastWriteTimeUtc.Ticks)")',
+    ], { timeoutMs: 10000 })
+    const [size, ticks] = result.stdout.trim().split('|').map(Number)
+    if (Number.isFinite(size) && Number.isFinite(ticks)) {
+      return { existe: true, tamanho: size, mtimeMs: (ticks ?? 0) / 10000 }
+    }
+  } catch {
+    // A API de testes não expõe metadados; o tamanho continua sendo um fallback seguro.
+  }
+  return { existe: true, tamanho: content.length }
+}
+
+const fileChanged = (before: FileSnapshot, after: FileSnapshot): boolean => {
+  if (!after.existe) return false
+  if (!before.existe) return true
+  return before.tamanho !== after.tamanho
+    || (before.mtimeMs !== undefined && after.mtimeMs !== undefined && before.mtimeMs !== after.mtimeMs)
+}
+
+const parentDirectory = (path: string): string => {
+  const normalized = path.replace(/[\\/]+$/, '')
+  const index = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'))
+  return index > 0 ? normalized.slice(0, index) : '.'
+}
+
+const ensureOutputDirectory = async ($: EngineInterface, path: string): Promise<void> => {
+  const directory = parentDirectory(path)
+  if (await $.fs.exists(directory)) return
+  const result = await $.process.run(['cmd', '/d', '/c', 'mkdir', directory], { timeoutMs: 10000 })
+  if (result.exitCode !== 0 && !(await $.fs.exists(directory))) {
+    throw new Error(`diretório de saída não existe: ${directory}`)
+  }
+}
+
+const resolveOutputPath = (cwd: string, output: string): string =>
+  /^(?:[A-Za-z]:[\\/]|[\\/])/.test(output)
+    ? output
+    : `${cwd.replace(/[\\/]$/, '')}/${output.replace(/^[\\/]+/, '')}`
+
 const finishJob = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   job: CodexJob,
   exitCode: number | null,
   output: string,
@@ -263,19 +368,22 @@ const finishJob = async (
   const now = Date.now()
   const answer = await readOutput($, job.saida)
   const questionPath = `${job.cwd}/PERGUNTA.md`
-  const hasQuestion = await $.fs.exists(questionPath)
+  const questionAfter = await fileSnapshot($, questionPath)
+  const hasQuestion = fileChanged(job.perguntaAntes ?? { existe: job.perguntaExistia }, questionAfter)
   const question = hasQuestion ? await $.fs.read(questionPath) : ''
+  const outputAfter = await fileSnapshot($, job.saida)
+  const outputChanged = fileChanged(job.saidaAntes ?? { existe: false }, outputAfter)
   let status: CodexJob['status'] = 'falhou'
   let motivo = tail(diagnostics || output || `exit code ${exitCode}`)
 
-  if (`${output}\n${diagnostics}`.includes('Selected model is at capacity')) {
-    motivo = 'modelo sem capacidade, relançar em gpt-5.6-terra'
-  } else if (!job.perguntaExistia && hasQuestion) {
-    status = 'pergunta'
-    motivo = question
-  } else if (answer !== undefined && answer.length > 200) {
+  if (answer !== undefined && answer.length > 200 && outputChanged) {
     status = 'ok'
     motivo = ''
+  } else if (`${output}\n${diagnostics}`.includes('Selected model is at capacity')) {
+    motivo = 'modelo sem capacidade, relance com outro modelo'
+  } else if (hasQuestion) {
+    status = 'pergunta'
+    motivo = question
   }
 
   await updateJob($, job.id, current => ({
@@ -288,13 +396,12 @@ const finishJob = async (
 }
 
 const startJob = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   job: CodexJob,
   prompt: string,
   isGitRepo: boolean,
+  codex: string,
 ): Promise<void> => {
-  const appData = (await $.env.get('APPDATA')) ?? ''
-  const codex = `${appData.replace(/[\\/]$/, '')}/npm/codex.cmd`
   const argv = [
     codex,
     'exec',
@@ -331,13 +438,31 @@ const startJob = async (
   }
 }
 
-const createOutputPath = async ($: Parameters<typeof read>[0], id: string): Promise<string> => {
+const runPreflight = async (
+  $: EngineInterface,
+  paths: RuntimePaths,
+  repoPath: string,
+): Promise<void> => {
+  const version = await $.process.run([paths.codex, '--version'], { timeoutMs: 15000 })
+  if (version.exitCode !== 0) throw new Error(version.stderr || 'codex --version falhou')
+  const login = await $.process.run([paths.codex, 'login', 'status'], { timeoutMs: 15000 })
+  if (login.exitCode !== 0) throw new Error(login.stderr || 'Codex sem login')
+  const line = await $.process.run([
+    'python',
+    `${pathWithoutTrailingSlash(repoPath)}/skills/codex/status.py`,
+    '--line',
+  ], { cwd: repoPath, timeoutMs: 30000 })
+  if (line.exitCode !== 0) throw new Error(line.stderr || 'status.py --line falhou')
+  if (line.stdout.includes('[relogar]')) throw new Error('sessão do Codex expirada')
+}
+
+const createOutputPath = async ($: EngineInterface, id: string): Promise<string> => {
   const temp = (await $.env.get('TEMP')) ?? (await $.env.get('TMP')) ?? '.'
   return `${temp.replace(/[\\/]$/, '')}/codex-delegar-${id}.md`
 }
 
 const isGitRepository = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   cwd: string,
   sessionCwd: string,
 ): Promise<boolean> => {
@@ -352,7 +477,7 @@ const isGitRepository = async (
   return result.exitCode === 0
 }
 
-const loadQuota = async ($: Parameters<typeof read>[0], repoPath: string): Promise<void> => {
+const loadQuota = async ($: EngineInterface, repoPath: string): Promise<void> => {
   const script = `${repoPath.replace(/[\\/]$/, '')}/skills/codex/status.py`
 
   try {
@@ -361,14 +486,8 @@ const loadQuota = async ($: Parameters<typeof read>[0], repoPath: string): Promi
       timeoutMs: 30000,
     })
     const parsed = JSON.parse(result.stdout) as QuotaJson
-    const codex = parsed.codex ?? {}
-    await update($, quota, () => ({
-      quotaPct: codex.quota_pct,
-      tokens: codex.tokens,
-      windows: codex.quotas ?? [],
-      contas: codex.contas ?? [],
-      fetchedAt: Date.now(),
-    }))
+    const activeProfile = await activeCodexProfile($)
+    await update($, quota, () => ({ ...parseStatusSnapshot(parsed, activeProfile), fetchedAt: Date.now() }))
   } catch {
     await update($, quota, current => ({ ...current, fetchedAt: Date.now() }))
   }
@@ -388,19 +507,20 @@ export const trainerSpriteKey = (bodyRows: number): 'treinador-p' | 'treinador-g
 export const jobsPollingInterval = (panePlaced: boolean): number => panePlaced ? 3000 : 15000
 
 const jobsForSession = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   source: DashboardJob[],
 ): Promise<DashboardJob[]> => mergeSessionJobs(source, await $.agent.list() as SessionAgent[], await $.session.id())
 
 const loadSprites = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   accounts: ClaudeAccount[],
-  codexAccounts: Array<{ email: string; number?: number }>,
+  codexAccounts: Array<{ email?: string | null; number?: number }>,
   wild: Array<{ numero: number }>,
   map: DashboardData['map'],
+  pokePath: string,
 ): Promise<Record<string, RasterSprite>> => {
   const requests = new Map<string, string>()
-  const add = (key: string, file: string) => requests.set(key, `${POKE}/terminal/${file}`)
+  const add = (key: string, file: string) => requests.set(key, `${pokePath}/terminal/${file}`)
   for (const account of accounts) {
     const number = spriteNumber('claude', account.email, map)
     if (number !== undefined) {
@@ -409,6 +529,7 @@ const loadSprites = async (
     }
   }
   for (const account of codexAccounts) {
+    if (!account.email) continue
     const number = spriteNumber('codex', account.email, map)
     if (number !== undefined) {
       add(`codex:${account.email}:front-p`, `${number}-frente-p.json`)
@@ -428,14 +549,16 @@ const loadSprites = async (
   return loaded
 }
 
-const refreshDashboard = async ($: Parameters<typeof read>[0], repoPath: string): Promise<void> => {
+const refreshDashboard = async ($: EngineInterface, repoPath: string): Promise<void> => {
+  const paths = await runtimePaths($)
   const current = await read($, dashboard)
   const next: DashboardData = { ...current, errors: [] }
   const errors: string[] = []
-  let codexAccounts: Array<{ email: string }> = []
+  let codexAccounts: Array<{ email?: string | null }> = []
+  const activeProfile = await activeCodexProfile($)
 
   try {
-    const parsed = await runCachedJson<{ accounts?: ClaudeAccount[] }>($, 'cswap', [CSWAP, 'list', '--json'])
+    const parsed = await runCachedJson<{ accounts?: ClaudeAccount[] }>($, 'cswap', [paths.cswap, 'list', '--json'])
     next.claude = parsed.accounts ?? []
   } catch (error) {
     errors.push(`cswap: ${shortError(error)}`)
@@ -451,15 +574,7 @@ const refreshDashboard = async ($: Parameters<typeof read>[0], repoPath: string)
     const codexWindows = parsed.codex?.quotas ?? []
     next.codexFiveHour = codexWindows.find(window => window.janela === 300)?.pct
     next.codexSevenDay = codexWindows.find(window => window.janela === 10080)?.pct
-    await update($, quota, () => ({
-      model: parsed.model,
-      effort: parsed.effort,
-      quotaPct: parsed.codex?.quota_pct,
-      tokens: parsed.codex?.tokens,
-      windows: parsed.codex?.quotas ?? [],
-      contas: parsed.codex?.contas ?? [],
-      fetchedAt: Date.now(),
-    }))
+    await update($, quota, () => ({ ...parseStatusSnapshot(parsed, activeProfile), fetchedAt: Date.now() }))
   } catch (error) {
     errors.push(`status: ${shortError(error)}`)
   }
@@ -481,14 +596,14 @@ const refreshDashboard = async ($: Parameters<typeof read>[0], repoPath: string)
   }
 
   try {
-    next.poke = await readPokeMode($)
-    const map = await readJson<DashboardData['map']>($, `${POKE}/mapa.json`)
-    const wild = await readJson<Array<{ numero: number; nome: string } | number>>($, `${POKE}/selvagens.json`)
+    next.poke = await readPokeMode($, paths.config)
+    const map = await readJson<DashboardData['map']>($, `${paths.poke}/mapa.json`)
+    const wild = await readJson<Array<{ numero: number; nome: string } | number>>($, `${paths.poke}/selvagens.json`)
     next.map = map ?? current.map
     next.wild = (wild ?? []).flatMap(item => typeof item === 'number'
       ? [{ numero: item, nome: `#${item}` }]
       : [item])
-    next.sprites = await loadSprites($, next.claude, codexAccounts, next.wild, next.map)
+    next.sprites = await loadSprites($, next.claude, codexAccounts, next.wild, next.map, paths.poke)
   } catch (error) {
     errors.push(`sprites: ${shortError(error)}`)
   }
@@ -500,7 +615,7 @@ const refreshDashboard = async ($: Parameters<typeof read>[0], repoPath: string)
   $.ui.status(summary)
 }
 
-const refreshJobs = async ($: Parameters<typeof read>[0], repoPath: string): Promise<void> => {
+const refreshJobs = async ($: EngineInterface, repoPath: string): Promise<void> => {
   const current = await read($, dashboard)
   try {
     const result = await $.process.run([
@@ -534,8 +649,8 @@ const refreshJobs = async ($: Parameters<typeof read>[0], repoPath: string): Pro
 
 const abovePromptText = (data: DashboardData): string => {
   const claude = data.claude.find(account => account.active) ?? data.claude[0]
-  const claudeFive = usageOf(claude ?? {}, 'fiveHour')?.pct
-  const claudeSeven = usageOf(claude ?? {}, 'sevenDay')?.pct
+  const claudeFive = usageOf(claude, 'fiveHour')?.pct
+  const claudeSeven = usageOf(claude, 'sevenDay')?.pct
   const first = data.running[0]
   const label = data.poke
     ? wildName(data, first)
@@ -640,7 +755,7 @@ const renderClaudeAccount = (
 }
 
 const renderDashboardPane = async (
-  $: Parameters<typeof read>[0],
+  $: EngineInterface,
   e: RenderInput<'Pane'>,
 ): Promise<unknown> => {
   const { Box, Text, Button, Raster } = $.ui.resolve(e)
@@ -690,7 +805,7 @@ const renderDashboardPane = async (
         </Box>
         <Text color="subtle">delegação atual · {currentLabel}</Text>
         <Box flexDirection="row" gap={1}>
-          {codex ? sprite(data, 'codex', codex.email, 'front-g', 'active-codex', terminal, Raster) : null}
+          {codex?.email ? sprite(data, 'codex', codex.email, 'front-g', 'active-codex', terminal, Raster) : null}
           <Text color="success">CODEX · {accountName(codex?.email ?? '—')} · {codexModel}/{codexEffort}</Text>
         </Box>
         <Text color="subtle">RODANDO AGORA</Text>
@@ -708,7 +823,7 @@ const renderDashboardPane = async (
         <Text color="subtle">CODEX</Text>
         <Text>
           {codex
-            ? `${accountName(codex.email)} · ${codex.plano} · ${codexModel}/${codexEffort}`
+            ? `${accountName(codex.email ?? '—')} · ${codex.plano} · ${codexModel}/${codexEffort}`
             : 'carregando…'}
         </Text>
         {errors}
@@ -743,7 +858,7 @@ const renderDashboardPane = async (
       <Text color="subtle">CODEX</Text>
       <Text>
         {codex
-          ? `${accountName(codex.email)} · ${codex.plano} · ${codexModel} · ${codexEffort}`
+          ? `${accountName(codex.email ?? '—')} · ${codex.plano} · ${codexModel} · ${codexEffort}`
           : 'carregando…'}
       </Text>
       {errors}
@@ -771,7 +886,7 @@ export const register: Register = (on, options) => {
         properties: {
           prompt: { type: 'string' },
           modelo: { type: 'string', default: 'gpt-5.6-luna' },
-          effort: { type: 'string', enum: ['low', 'medium', 'high'], default: 'medium' },
+          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], default: 'medium' },
           cwd: { type: 'string' },
           saida: { type: 'string' },
         },
@@ -806,30 +921,45 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'mcp__codex-delegar__delegar_codex' }, async ($, e) => {
-    const input = e as unknown as DelegarInput
-    const cwd = input.cwd ?? sessionCwd
-    const modelo = input.modelo ?? 'gpt-5.6-luna'
-    const effort = input.effort ?? 'medium'
-    const id = `${Date.now()}-${nextJob++}`
-    const saida = input.saida ?? await createOutputPath($, id)
-    const perguntaPath = `${cwd}/PERGUNTA.md`
-    const perguntaExistia = await $.fs.exists(perguntaPath)
-    const job: CodexJob = {
-      id,
-      modelo,
-      effort,
-      cwd,
-      saida,
-      status: 'rodando',
-      startedAt: Date.now(),
-      perguntaExistia,
-    }
-    await update($, jobs, list => [...list, job])
-    const isGitRepo = await isGitRepository($, cwd, sessionCwd)
-    void startJob($, job, input.prompt, isGitRepo)
+    try {
+      const input = e as unknown as DelegarInput
+      const paths = await runtimePaths($)
+      await runPreflight($, paths, String(options.repoPath))
+      const cwd = input.cwd ?? sessionCwd
+      const modelo = input.modelo ?? 'gpt-5.6-luna'
+      const effort = input.effort ?? 'medium'
+      const id = `${Date.now()}-${nextJob++}`
+      const saida = resolveOutputPath(cwd, input.saida ?? await createOutputPath($, id))
+      const existing = (await read($, jobs)).find(job => job.status === 'rodando' && job.saida === saida)
+      if (existing) {
+        return { result: JSON.stringify({ status: 'falhou', motivo: `saída já está em uso pelo job ${existing.id}` }) }
+      }
+      await ensureOutputDirectory($, saida)
+      const perguntaPath = `${cwd}/PERGUNTA.md`
+      const perguntaAntes = await fileSnapshot($, perguntaPath)
+      const saidaAntes = await fileSnapshot($, saida)
+      const job: CodexJob = {
+        id,
+        modelo,
+        effort,
+        cwd,
+        saida,
+        status: 'rodando',
+        startedAt: Date.now(),
+        perguntaExistia: perguntaAntes.existe,
+        perguntaAntes,
+        saidaAntes,
+      }
+      await update($, jobs, list => trimJobHistory([...list, job]))
+      const isGitRepo = await isGitRepository($, cwd, sessionCwd)
+      void startJob($, job, input.prompt, isGitRepo, paths.codex)
 
-    const result = { job_id: id, saida, mensagem: 'O resultado chega depois, em background.' }
-    return { result: JSON.stringify(result) }
+      const result = { job_id: id, saida, mensagem: 'O resultado chega depois, em background.' }
+      return { result: JSON.stringify(result) }
+    } catch (error) {
+      $.ui.toast(`delegação: ${shortError(error)}`)
+      return { result: JSON.stringify({ status: 'falhou', motivo: shortError(error) }) }
+    }
   })
 
   on('tool.call', { tool: 'mcp__codex-delegar__codex_job' }, async ($, e) => {
@@ -854,8 +984,12 @@ export const register: Register = (on, options) => {
     currentTurn += 1
     lastSuggestedTurn = currentTurn
     filesThisTurn.clear()
-    await update($, suggestionTurn, () => currentTurn)
-    await update($, suggestionCount, () => 0)
+    try {
+      await update($, suggestionTurn, () => currentTurn)
+      await update($, suggestionCount, () => 0)
+    } catch {
+      // A sugestão é só um aviso: falha de estado não pode segurar o prompt.
+    }
     return next(e)
   })
 
@@ -864,23 +998,25 @@ export const register: Register = (on, options) => {
       return next(e)
     }
 
-    const turn = currentTurn
-    if (turn !== lastSuggestedTurn) {
-      lastSuggestedTurn = turn
-      await update($, suggestionTurn, () => turn)
-      await update($, suggestionCount, () => 0)
-    }
-
     const input = e as unknown as { file_path?: string; path?: string }
     const filePath = input.file_path ?? input.path
-    if (filePath === undefined || filesThisTurn.has(filePath)) {
-      return next(e)
-    }
+    try {
+      const turn = currentTurn
+      if (turn !== lastSuggestedTurn) {
+        lastSuggestedTurn = turn
+        await update($, suggestionTurn, () => turn)
+        await update($, suggestionCount, () => 0)
+      }
 
-    filesThisTurn.add(filePath)
-    const count = await update($, suggestionCount, current => current + 1)
-    if (count === 3) {
-      $.ui.toast('3+ arquivos neste turno: considere delegar_codex')
+      if (filePath !== undefined && !filesThisTurn.has(filePath)) {
+        filesThisTurn.add(filePath)
+        const count = await update($, suggestionCount, current => current + 1)
+        if (count === 3) {
+          $.ui.toast('3+ arquivos neste turno: considere delegar_codex')
+        }
+      }
+    } catch {
+      // A sugestão é só um aviso: falha de estado não pode segurar a ferramenta.
     }
     return next(e)
   })

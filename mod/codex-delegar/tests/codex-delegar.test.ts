@@ -1,4 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
+
+declare function setTimeout(callback: (...args: any[]) => void, ms: number): unknown
 import {
   fnv1a64,
   formatQuotaWindows,
@@ -7,6 +9,7 @@ import {
   mergeCache,
   mergeSessionJobs,
   mergePokeConfig,
+  parseStatusSnapshot,
   selectQuotaAccount,
   spriteNumber,
   trainerSpriteKey,
@@ -14,6 +17,28 @@ import {
 } from '../hooks/register'
 
 const options = { repoPath: 'C:/repo' }
+
+const processResult = (exitCode: number, stdout = '', stderr = '') => ({ value: {
+  exitCode,
+  stdout,
+  stderr,
+  isStdoutTruncated: false,
+  isStderrTruncated: false,
+} })
+
+// git fora de repo, pré-voo ok e metadados do PowerShell; com changedOutput a saída muda depois do job.
+const installDelegationRun = (on: any, changedOutput = false): void => {
+  let metadataCall = 0
+  on('process.run', ($: unknown, e: { argv?: readonly string[] }) => {
+    const command = e.argv?.[0] ?? ''
+    if (command === 'git') return processResult(128, '', 'not a git repository')
+    if (command === 'powershell') {
+      metadataCall += 1
+      return processResult(0, changedOutput && metadataCall >= 4 ? '200|2' : '1|1')
+    }
+    return processResult(0)
+  })
+}
 
 test('FNV-1a 64-bit matches the known vectors', { options }, () => {
   expect(fnv1a64('')).toBe(0xcbf29ce484222325n)
@@ -88,13 +113,7 @@ test('poke toggle preserves unrelated config keys', { options }, () => {
 test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { options }, async ($, on) => {
   mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
   let request: { argv: readonly string[]; input?: string } | undefined
-  on('process.run', () => ({ value: {
-    exitCode: 128,
-    stdout: '',
-    stderr: 'not a git repository',
-    isStdoutTruncated: false,
-    isStderrTruncated: false,
-  } }))
+  installDelegationRun(on)
   on('process.spawn', async function* (_$, e) {
     request = e
     yield { stream: 'stdout', text: 'started' }
@@ -154,10 +173,11 @@ test('sugestao aparece uma vez no terceiro arquivo do turno', { options }, async
     toasts.push(e.text)
     return next(e)
   })
-  await $.prompt.submit({ text: 'novo turno' })
-  for (const tool of ['Read', 'Grep', 'Edit', 'Read']) {
-    await $.tool.call({ tool, file_path: `${tool}.md` })
-  }
+  await $.prompt.submit({ text: 'novo turno', wait: false, origin: { kind: 'composer' } })
+  await $.tool.call({ tool: 'Read', file_path: 'Read.md' })
+  await $.tool.call({ tool: 'Grep', pattern: 'Grep', path: 'Grep.md' })
+  await $.tool.call({ tool: 'Edit', file_path: 'Edit.md', old_string: 'old', new_string: 'new' })
+  await $.tool.call({ tool: 'Read', file_path: 'Read.md' })
   expect(toasts).toEqual(['3+ arquivos neste turno: considere delegar_codex'])
 })
 
@@ -197,7 +217,8 @@ test('preexisting PERGUNTA.md does not turn the job into a question', { options 
     yield { stream: 'stdout', text: 'started' }
     return { value: { code: 0, signal: null } }
   })
-  on('fs.exists', () => ({ value: ++existsCalls === 1 || existsCalls === 3 }))
+  on('fs.exists', () => ({ value: ++existsCalls === 2 || existsCalls === 5 }))
+  on('fs.read', () => ({ value: 'pergunta antiga' }))
   on('ui.toast', () => ({ value: undefined }))
   const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
   const job = JSON.parse(String(call.result)) as { job_id: string }
@@ -222,8 +243,8 @@ test('Pane uses active tokens and formats numeric windows', { options }, async (
     isStdoutTruncated: false,
     isStderrTruncated: false,
   } }))
-  on('tool.register', () => ({ value: undefined }))
-  on('command.register', () => ({ value: undefined }))
+  on('tool.register', () => ({ value: { tool: 'codex-delegar' } }))
+  on('command.register', () => ({ value: { command: 'codex' } }))
   on('clock.every', () => ({ value: undefined }))
   on('session.start', ($, e, next) => next(e))
   const quota = {
@@ -252,7 +273,7 @@ test('job created question file is reported as a question', { options }, async (
     yield { stream: 'stdout', text: 'started' }
     return { value: { code: 0, signal: null } }
   })
-  on('fs.exists', () => ({ value: ++existsCalls === 3 }))
+  on('fs.exists', () => ({ value: ++existsCalls === 5 }))
   on('fs.read', () => ({ value: 'need clarification' }))
   on('ui.toast', () => ({ value: undefined }))
   const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
@@ -275,3 +296,139 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(mounted.surface).toBe(surface)
   })
 }
+
+test('status.py JSON real keeps model, effort and every Codex login state', { options }, () => {
+  const quota = parseStatusSnapshot({
+    codex: {
+      modelo: 'gpt-5.6-luna',
+      effort: 'ultra',
+      quotas: [{ janela: 300, pct: 3, reseta_em: 1787759175 }],
+      contas: [
+        { perfil: '.codex', email: null, plano: null, status: 'sem_login' },
+        { perfil: '.codex-b', email: null, plano: null, status: 'erro' },
+      ],
+    },
+    ts: 100,
+  }, '.codex-b')
+  expect(quota.model).toBe('gpt-5.6-luna')
+  expect(quota.effort).toBe('ultra')
+  expect(quota.windows[0]?.reseta_em).toBe(1787759175)
+  expect(selectQuotaAccount(quota)?.perfil).toBe('.codex-b')
+  expect(quota.contas.map(account => account.status)).toEqual(['sem_login', 'erro'])
+})
+
+test('saida relativa usa o cwd no arquivo e no argv', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming' })
+  let request: { argv: readonly string[] } | undefined
+  installDelegationRun(on)
+  on('process.spawn', async function* (_$, e) {
+    request = e
+    yield { stream: 'stdout', text: 'started' }
+    return { value: { code: 0, signal: null } }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('ui.toast', () => ({ value: undefined }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+    saida: 'analise/codex-job4-cenario.log',
+  })
+  const delegation = JSON.parse(String(call.result)) as { saida: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  expect(delegation.saida).toBe('C:/outro/analise/codex-job4-cenario.log')
+  expect(request?.argv).toContain(delegation.saida)
+})
+
+test('resposta substancial vence capacidade', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
+  installDelegationRun(on, true)
+  on('process.spawn', async function* () {
+    yield { stream: 'stderr', text: 'Selected model is at capacity' }
+    return { value: { code: 1, signal: null } }
+  })
+  on('fs.exists', () => ({ value: true }))
+  on('fs.read', () => ({ value: 'resposta completa '.repeat(30) }))
+  on('ui.toast', () => ({ value: undefined }))
+  const call = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
+  const job = JSON.parse(String(call.result)) as { job_id: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  const status = await $.tool.call({ tool: 'mcp__codex-delegar__codex_job', job_id: job.job_id })
+  expect(status.result).toContain('"status":"ok"')
+  expect(status.result).not.toContain('modelo sem capacidade')
+})
+
+test('arquivo de saída já existente e inalterado não produz sucesso', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
+  let existsCalls = 0
+  installDelegationRun(on)
+  on('process.spawn', async function* () {
+    return { value: { code: 0, signal: null } }
+  })
+  // diretório, saída antes, leitura da resposta e saída depois existem; PERGUNTA.md não.
+  on('fs.exists', () => ({ value: [1, 3, 4, 6].includes(++existsCalls) }))
+  on('fs.read', () => ({ value: 'arquivo antigo '.repeat(30) }))
+  on('ui.toast', () => ({ value: undefined }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'teste',
+    cwd: 'C:/outro',
+    saida: 'resultado.md',
+  })
+  const job = JSON.parse(String(call.result)) as { job_id: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  const status = await $.tool.call({ tool: 'mcp__codex-delegar__codex_job', job_id: job.job_id })
+  expect(status.result).toContain('falhou')
+})
+
+test('dois jobs não podem compartilhar a mesma saída', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
+  installDelegationRun(on)
+  on('process.spawn', async function* () {
+    await new Promise(() => undefined)
+    return { value: { code: 0, signal: null } }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('ui.toast', () => ({ value: undefined }))
+  await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'um', cwd: 'C:/outro', saida: 'mesmo.md' })
+  const second = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'dois',
+    cwd: 'C:/outro',
+    saida: 'mesmo.md',
+  })
+  expect(second.result).toContain('saída já está em uso')
+})
+
+test('falha do pré-voo do hook de delegação volta como resultado controlado', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming' })
+  let spawned = false
+  on('process.run', () => processResult(1, '', 'Codex sem login'))
+  on('process.spawn', async function* () {
+    spawned = true
+    return { value: { code: 0, signal: null } }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+  const result = await $.tool.call({ tool: 'mcp__codex-delegar__delegar_codex', prompt: 'teste', cwd: 'C:/outro' })
+  expect(result.result).toContain('falhou')
+  expect(result.result).toContain('Codex sem login')
+  expect(spawned).toBe(false)
+})
+
+test('hooks observadores chamam next mesmo quando o estado falha', { options }, async ($, on) => {
+  let promptPassed = false
+  let toolPassed = false
+  on('state.set', () => { throw new Error('estado indisponível') })
+  on('prompt.submit', ($, e) => {
+    promptPassed = true
+    return { text: e.text }
+  })
+  on('tool.call', () => {
+    toolPassed = true
+    return { result: {}, text: '' }
+  })
+  await $.prompt.submit({ text: 'falha controlada', wait: false, origin: { kind: 'composer' } })
+  await $.tool.call({ tool: 'Read', file_path: 'arquivo.md' })
+  expect(promptPassed).toBe(true)
+  expect(toolPassed).toBe(true)
+})

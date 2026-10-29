@@ -1,14 +1,24 @@
+export type CodexEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
+
 export type CodexJobStatus = 'rodando' | 'ok' | 'falhou' | 'pergunta'
+
+export type FileSnapshot = {
+  existe: boolean
+  tamanho?: number
+  mtimeMs?: number
+}
 
 export type CodexJob = {
   id: string
   modelo: string
-  effort: 'low' | 'medium' | 'high'
+  effort: CodexEffort
   cwd: string
   saida: string
   status: CodexJobStatus
   startedAt: number
   perguntaExistia: boolean
+  perguntaAntes?: FileSnapshot
+  saidaAntes?: FileSnapshot
   finishedAt?: number
   motivo?: string
 }
@@ -16,10 +26,18 @@ export type CodexJob = {
 export type CodexQuota = {
   model?: string
   effort?: string
+  activeProfile?: string
   tokens?: number
   quotaPct?: number
-  windows: Array<{ janela: number; pct: number }>
-  contas: Array<{ perfil: string; email: string; plano: string; status: 'ok' | 'expirado'; tokens: number }>
+  windows: Array<{ janela: number; pct?: number; reseta_em?: number }>
+  contas: Array<{
+    perfil: string
+    email?: string | null
+    plano?: string | null
+    status: 'ok' | 'expirado' | 'sem_login' | 'erro'
+    tokens?: number
+    quotas?: Array<{ janela: number; pct?: number; reseta_em?: number }>
+  }>
   fetchedAt?: number
 }
 
