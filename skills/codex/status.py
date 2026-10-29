@@ -555,41 +555,11 @@ def jobs_ativos():
             continue
         if _subagente_handback_encerrado(linhas):
             continue
-        ultimo = ultimo_msg = None
-        for linha in reversed(linhas):
-            try:
-                evento = json.loads(linha)
-            except ValueError:
-                continue
-            if not isinstance(evento, dict):
-                continue
-            if ultimo is None:
-                ultimo = evento
-            if ultimo_msg is None and evento.get("type") in ("assistant", "user"):
-                ultimo_msg = evento
-            if ultimo is not None and ultimo_msg is not None:
-                break
+        ultimo, pendente = _subagente_ultimo(linhas)
         if not ultimo:
             continue
         ultimo_ts = _epoch(ultimo.get("timestamp"))
         idade = agora - ultimo_ts if ultimo_ts is not None else None
-        msg = ultimo_msg.get("message") if isinstance(ultimo_msg, dict) else None
-        blocos = msg.get("content") if isinstance(msg, dict) else None
-        blocos = blocos if isinstance(blocos, list) else []
-        # tool_use/tool_result (cliente OU server-side: "server_tool_use",
-        # "<nome>_tool_result", por isso substring) e thinking sempre
-        # continuam para outro bloco -- so texto sozinho pode ser fim de
-        # verdade. stop_reason="tool_use" e reforco (a API para so pra
-        # chamar ferramenta); stop_reason None NAO entra aqui -- medido em
-        # 241 transcripts encerrados, 27 terminam com texto e stop_reason
-        # None sem nunca mais escrever nada, entao None nao prova pendencia.
-        tipos = [b.get("type") for b in blocos
-                 if isinstance(b, dict) and isinstance(b.get("type"), str)]
-        pendente = any("tool_use" in t or "tool_result" in t or "thinking" in t
-                       for t in tipos)
-        if not pendente and isinstance(ultimo_msg, dict) and ultimo_msg.get("type") == "assistant":
-            stop_reason = msg.get("stop_reason") if isinstance(msg, dict) else None
-            pendente = stop_reason == "tool_use"
         if not ((idade is not None and 0 <= idade <= 90) or
                 (pendente and idade is not None and 0 <= idade < 30 * 60)):
             continue
@@ -619,7 +589,7 @@ def jobs_ativos():
                 inicio = mtime
         encontrados.append({
             "tipo": "claude",
-            "modelo": meta.get("model") if isinstance(meta.get("model"), str) else "—",
+            "modelo": _subagente_modelo(linhas) or "—",
             "projeto": (
                 meta.get("description") if isinstance(meta.get("description"), str)
                 else meta.get("agentType") if isinstance(meta.get("agentType"), str)
@@ -629,6 +599,56 @@ def jobs_ativos():
             "arquivo": os.path.basename(arq),
         })
     return encontrados
+
+
+def _subagente_ultimo(linhas):
+    """Ultimo evento do transcrito e se ele ainda espera continuacao (bloco pendente)."""
+    ultimo = ultimo_msg = None
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        if not isinstance(evento, dict):
+            continue
+        if ultimo is None:
+            ultimo = evento
+        if ultimo_msg is None and evento.get("type") in ("assistant", "user"):
+            ultimo_msg = evento
+        if ultimo is not None and ultimo_msg is not None:
+            break
+    msg = ultimo_msg.get("message") if isinstance(ultimo_msg, dict) else None
+    blocos = msg.get("content") if isinstance(msg, dict) else None
+    blocos = blocos if isinstance(blocos, list) else []
+    # tool_use/tool_result (cliente OU server-side: "server_tool_use",
+    # "<nome>_tool_result", por isso substring) e thinking sempre
+    # continuam para outro bloco -- so texto sozinho pode ser fim de
+    # verdade. stop_reason="tool_use" e reforco (a API para so pra
+    # chamar ferramenta); stop_reason None NAO entra aqui -- medido em
+    # 241 transcripts encerrados, 27 terminam com texto e stop_reason
+    # None sem nunca mais escrever nada, entao None nao prova pendencia.
+    tipos = [b.get("type") for b in blocos
+             if isinstance(b, dict) and isinstance(b.get("type"), str)]
+    pendente = any("tool_use" in t or "tool_result" in t or "thinking" in t
+                   for t in tipos)
+    if not pendente and isinstance(ultimo_msg, dict) and ultimo_msg.get("type") == "assistant":
+        stop_reason = msg.get("stop_reason") if isinstance(msg, dict) else None
+        pendente = stop_reason == "tool_use"
+    return ultimo, pendente
+
+
+def _subagente_modelo(linhas):
+    """Modelo do subagente: message.model da ultima resposta (o .meta.json nao tem "model")."""
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        mensagem = evento.get("message") if isinstance(evento, dict) else None
+        modelo = mensagem.get("model") if isinstance(mensagem, dict) else None
+        if evento.get("type") == "assistant" and isinstance(modelo, str) and modelo != "<synthetic>":
+            return modelo
+    return None
 
 
 def _subagente_terminou(linhas):
@@ -1178,6 +1198,10 @@ def selftest():
     for caminho, timestamp in ((claude_active, agora - 6), (claude_stopped, agora - 120)):
         with open(caminho, "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"timestamp": timestamp, "type": "user"}) + "\n")
+    # o modelo de verdade esta em message.model; o "model" do .meta.json abaixo nao existe na vida real
+    with open(claude_active, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"timestamp": agora - 5, "type": "assistant", "message": {
+            "model": "claude-opus-4-6", "content": [{"type": "tool_use", "name": "Bash"}]}}) + "\n")
     with open(os.path.splitext(claude_active)[0] + ".meta.json", "w", encoding="utf-8") as fh:
         json.dump({"agentType": "general-purpose", "description": "confere asfalto", "model": "opus"}, fh)
     with open(os.path.splitext(claude_stopped)[0] + ".meta.json", "w", encoding="utf-8") as fh:
@@ -1186,7 +1210,7 @@ def selftest():
     jobs = jobs_ativos()
     por_arquivo = {job["arquivo"]: job for job in jobs}
     assert por_arquivo["agent-active.jsonl"]["tipo"] == "claude", jobs
-    assert por_arquivo["agent-active.jsonl"]["modelo"] == "opus", jobs
+    assert por_arquivo["agent-active.jsonl"]["modelo"] == "claude-opus-4-6", jobs
     assert por_arquivo["agent-active.jsonl"]["projeto"] == "confere asfalto", jobs
     assert "agent-stopped.jsonl" not in por_arquivo, jobs
     assert all("tipo" in job for job in jobs), jobs
