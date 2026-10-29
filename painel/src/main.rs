@@ -37,7 +37,7 @@ use winapi::{
 // Override via PAINEL_TITULO para testes (evita confundir com painel do usuário)
 fn get_panel_title() -> String {
     env::var("PAINEL_TITULO")
-        .unwrap_or_else(|_| "CENTRO DE COMANDO // HERMES".to_string())
+        .unwrap_or_else(|_| "CENTRO DE COMANDO".to_string())
 }
 static SILKSCREEN: &[u8] = include_bytes!("../assets/Silkscreen-Regular.ttf");
 
