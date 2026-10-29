@@ -18,6 +18,7 @@ use std::{
 use eframe::egui;
 #[cfg(not(target_arch = "wasm32"))]
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+use serde::Deserialize;
 use serde_json::Value;
 
 #[cfg(windows)]
@@ -2695,6 +2696,257 @@ fn draw_wild_sprite(ui: &mut egui::Ui, texture: Option<egui::TextureId>, time: f
     }
 }
 
+/// Contrato `tarefas[]` do status.py --jobs (fixtures/tarefas.json). Tudo é Option com
+/// default: um status.py antigo, sem algum campo ou com null, não derruba o painel. Sem
+/// `tarefas` a seção RODANDO AGORA cai no formato antigo `jobs[]`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PainelTarefas {
+    tarefas: Option<Vec<Tarefa>>,
+    resumo: Option<Resumo>,
+    cotas: Option<Vec<Cota>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Tarefa {
+    nome: Option<String>,
+    worktree: Option<String>,
+    agentes: Option<Vec<Agente>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Agente {
+    tipo: Option<String>,
+    modelo: Option<String>,
+    effort: Option<String>,
+    papel: Option<String>,
+    segundos: Option<f64>,
+    estado: Option<String>,
+    progresso: Option<String>,
+    resultado: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Resumo {
+    rodando: Option<u64>,
+    #[serde(rename = "feitosHoje")]
+    feitos_hoje: Option<u64>,
+    voltaram: Option<u64>,
+    falharam: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Cota {
+    conta: Option<String>,
+    janela: Option<f64>,
+    pct: Option<f64>,
+    #[serde(rename = "resetaEm")]
+    reseta_em: Option<String>,
+}
+
+const SEM_TAREFA: &str = "Sem tarefa";
+
+/// `None` quando o JSON não traz `tarefas` (status.py antigo) ou não casa com o contrato.
+// ponytail: desserializa a cada frame; o JSON é pequeno. Mover para receive_latest se pesar.
+fn ler_tarefas(value: &Value) -> Option<PainelTarefas> {
+    serde_json::from_value::<PainelTarefas>(value.clone())
+        .ok()
+        .filter(|painel| painel.tarefas.is_some())
+}
+
+fn estado_cor(estado: &str) -> egui::Color32 {
+    match estado {
+        "rodando" => hp_ok(),
+        "concluido" => dim_color(),
+        "falhou" => hp_low(),
+        "pergunta" => egui::Color32::from_rgb(0x6F, 0xA8, 0xDC),
+        "travado" => hp_mid(),
+        _ => text_color(),
+    }
+}
+
+/// Último trecho do caminho do worktree: `C:/repos/centro-agentes` vira `centro-agentes`.
+fn worktree_curto(worktree: &str) -> &str {
+    worktree
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(worktree)
+}
+
+/// ISO 8601 (`2026-10-29T13:00:00-03:00`, `...Z`, com ou sem fração) para epoch em segundos.
+fn iso_para_epoch(texto: &str) -> Option<f64> {
+    let (data, resto) = texto.trim().split_once('T')?;
+    let mut partes = data.splitn(3, '-').map(|parte| parte.parse::<i64>().ok());
+    let (ano, mes, dia) = (partes.next()??, partes.next()??, partes.next()??);
+    let (relogio, fuso) = resto.split_at(resto.find(['+', '-', 'Z']).unwrap_or(resto.len()));
+    let mut campos = relogio.splitn(3, ':');
+    let hora: i64 = campos.next()?.parse().ok()?;
+    let minuto: i64 = campos.next()?.parse().ok()?;
+    let segundo: f64 = campos.next().unwrap_or("0").parse().ok()?;
+    let desvio = match fuso {
+        "" | "Z" => 0,
+        _ => {
+            let digitos: String = fuso[1..].chars().filter(char::is_ascii_digit).collect();
+            let horas: i64 = digitos.get(..2)?.parse().ok()?;
+            let minutos: i64 = digitos.get(2..4).unwrap_or("0").parse().ok()?;
+            let sinal = if fuso.starts_with('-') { -1 } else { 1 };
+            sinal * (horas * 3600 + minutos * 60)
+        }
+    };
+    // Dias desde 1970-01-01 (algoritmo days_from_civil de Howard Hinnant).
+    let ano_ajustado = if mes <= 2 { ano - 1 } else { ano };
+    let era = ano_ajustado.div_euclid(400);
+    let ano_da_era = ano_ajustado - era * 400;
+    let dia_do_ano = (153 * ((mes + 9) % 12) + 2) / 5 + dia - 1;
+    let dia_da_era = ano_da_era * 365 + ano_da_era / 4 - ano_da_era / 100 + dia_do_ano;
+    let dias = era * 146_097 + dia_da_era - 719_468;
+    Some((dias * 86_400 + hora * 3600 + minuto * 60 - desvio) as f64 + segundo)
+}
+
+/// Célula de largura fixa: trunca o texto e avança exatamente `width`, para as colunas
+/// alinharem entre linhas e a soma nunca passar de `content_width`.
+fn celula(ui: &mut egui::Ui, width: f32, text: egui::RichText) {
+    let width = width.max(0.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 20.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_width(width);
+            ui.add(egui::Label::new(text).truncate(true));
+        },
+    );
+}
+
+fn show_tarefas(ui: &mut egui::Ui, content_width: f32, painel: &PainelTarefas) {
+    let mut tarefas: Vec<&Tarefa> = painel.tarefas.iter().flatten().collect();
+    // sort estável: mantém a ordem do status.py e só empurra "Sem tarefa" para o fim.
+    tarefas.sort_by_key(|tarefa| tarefa.nome.as_deref() == Some(SEM_TAREFA));
+    let spacing = ui.spacing().item_spacing.x;
+    // 5 células, 4 gaps, e 8 pt de folga para arredondamento (mesma margem do column_widths).
+    let disponivel = content_width - spacing * 4.0 - 8.0;
+    // (mínimo, ideal) de modelo, papel, estado e tempo; o resumo leva o resto, com 100 de mínimo.
+    let fixas = [(140.0, 230.0), (110.0, 220.0), (80.0, 80.0), (48.0, 56.0)];
+    let minimo: f32 = fixas.iter().map(|(minimo, _)| minimo).sum::<f32>() + 100.0;
+    let ideal: f32 = fixas.iter().map(|(_, ideal)| ideal).sum::<f32>() + 100.0;
+    let larguras = (disponivel >= minimo).then(|| {
+        let escala = ((disponivel - minimo) / (ideal - minimo)).clamp(0.0, 1.0);
+        let fixas: Vec<f32> = fixas.iter().map(|(m, i)| m + (i - m) * escala).collect();
+        let resumo = disponivel - fixas.iter().sum::<f32>();
+        (fixas, resumo)
+    });
+
+    if tarefas.iter().all(|tarefa| tarefa.agentes.as_ref().is_none_or(Vec::is_empty)) {
+        dim_label(ui, content_width, "nenhuma delegação em andamento");
+    }
+    for tarefa in tarefas {
+        let agentes = tarefa.agentes.as_deref().unwrap_or_default();
+        if agentes.is_empty() {
+            continue;
+        }
+        let worktree = worktree_curto(tarefa.worktree.as_deref().unwrap_or(""));
+        let worktree_w = (text_width(worktree) + 8.0).min(content_width * 0.4);
+        ui.horizontal(|ui| {
+            celula(
+                ui,
+                content_width - worktree_w - spacing,
+                pixel_text(tarefa.nome.as_deref().unwrap_or(SEM_TAREFA), 11.0),
+            );
+            celula(ui, worktree_w, dim_text(worktree));
+        });
+        for agente in agentes {
+            let modelo = match (agente.modelo.as_deref(), agente.effort.as_deref()) {
+                (Some(modelo), Some(effort)) => format!("{modelo}/{effort}"),
+                (Some(modelo), None) => modelo.to_owned(),
+                _ => "—".to_owned(),
+            };
+            let tipo_modelo = format!(
+                "{} · {modelo}",
+                agente.tipo.as_deref().unwrap_or("?").to_uppercase()
+            );
+            let papel = agente.papel.as_deref().unwrap_or("—");
+            let estado = agente.estado.as_deref().unwrap_or("?");
+            let estado_texto = egui::RichText::new(estado.to_uppercase())
+                .font(egui::FontId::monospace(13.0))
+                .color(estado_cor(estado));
+            let tempo = format_duration(agente.segundos.unwrap_or(0.0));
+            let terminou = matches!(estado, "concluido" | "falhou");
+            let resumo = if terminou { agente.resultado.as_deref() } else { None }
+                .or(agente.progresso.as_deref())
+                .unwrap_or("");
+            match larguras.as_ref() {
+                Some((fixas, resumo_w)) => {
+                    ui.horizontal(|ui| {
+                        celula(ui, fixas[0], data_text(tipo_modelo));
+                        celula(ui, fixas[1], data_text(papel));
+                        celula(ui, fixas[2], estado_texto);
+                        celula(ui, fixas[3], data_text(tempo));
+                        celula(ui, *resumo_w, dim_text(resumo));
+                    });
+                }
+                None => {
+                    // Estreito demais para colunas: empilha em duas linhas truncadas.
+                    let estado_w = 80.0_f32.min(content_width * 0.4);
+                    ui.horizontal(|ui| {
+                        celula(ui, estado_w, estado_texto);
+                        celula(
+                            ui,
+                            content_width - estado_w - spacing,
+                            data_text(format!("{tipo_modelo} · {tempo}")),
+                        );
+                    });
+                    celula(ui, content_width, dim_text(format!("{papel} · {resumo}")));
+                }
+            }
+        }
+        stacked_divider(ui);
+    }
+
+    let resumo = painel.resumo.as_ref();
+    let contador = |campo: fn(&Resumo) -> Option<u64>| {
+        resumo.and_then(campo).map_or("—".to_owned(), |numero| numero.to_string())
+    };
+    ui.add_space(4.0);
+    celula(
+        ui,
+        content_width,
+        data_text(format!(
+            "RODANDO {} · FEITOS HOJE {} · VOLTARAM {} · FALHARAM {}",
+            contador(|r| r.rodando),
+            contador(|r| r.feitos_hoje),
+            contador(|r| r.voltaram),
+            contador(|r| r.falharam),
+        )),
+    );
+    for cota in painel.cotas.iter().flatten() {
+        let janela = cota.janela.map(window_label).unwrap_or_default();
+        let pct = cota.pct.map(normalized_percent);
+        let reset = cota.reseta_em.as_deref().and_then(iso_para_epoch).map(|epoch| {
+            match (format_reset_clock(epoch), format_reset_countdown(epoch)) {
+                (Some(relogio), Some(falta)) => format!(" · reseta {relogio} ({falta})"),
+                (None, Some(falta)) => format!(" · reseta em {falta}"),
+                _ => String::new(),
+            }
+        });
+        let texto = format!(
+            "{} {janela} {}{}",
+            cota.conta.as_deref().unwrap_or("?"),
+            pct.map_or("—".to_owned(), |pct| format!("{pct:.0}%")),
+            reset.unwrap_or_default()
+        );
+        let cor = pct.map_or(dim_color(), hp_color);
+        celula(
+            ui,
+            content_width,
+            egui::RichText::new(texto).font(egui::FontId::monospace(13.0)).color(cor),
+        );
+    }
+}
+
 fn show_running_jobs(
     ui: &mut egui::Ui,
     content_width: f32,
@@ -2716,6 +2968,10 @@ fn show_running_jobs(
             }
             Some(Ok(value)) => value,
         };
+        if let Some(painel) = ler_tarefas(value) {
+            show_tarefas(ui, content_width, &painel);
+            return;
+        }
 
         let jobs = value.get("jobs").and_then(Value::as_array);
         if jobs.is_none_or(Vec::is_empty) {
@@ -5040,8 +5296,9 @@ mod tests {
         action_error, antigravity_email_from_text, bob_offset, clear_action_error,
         column_widths, merge_poll_result, parse_codex_home_reg_output, read_config_scalar,
         saida_com_timeout, set_action_error, set_config_scalar, CODEX_ACTION_ERROR,
-        MAX_TRANSIENT_ERR_STREAK,
+        MAX_TRANSIENT_ERR_STREAK, iso_para_epoch, ler_tarefas, worktree_curto,
     };
+    use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
@@ -5221,5 +5478,53 @@ mod tests {
         assert_eq!(action_error(&CODEX_ACTION_ERROR).as_deref(), Some("falhou X"));
         clear_action_error(&CODEX_ACTION_ERROR);
         assert_eq!(action_error(&CODEX_ACTION_ERROR), None);
+    }
+
+    #[test]
+    fn fixture_tarefas_desserializa_no_struct_do_painel() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/tarefas.json")).unwrap();
+        let painel = ler_tarefas(&json).expect("fixture casa com o contrato");
+        let tarefas = painel.tarefas.as_ref().unwrap();
+        assert_eq!(tarefas.len(), 3);
+        let agentes: Vec<_> = tarefas.iter().flat_map(|t| t.agentes.iter().flatten()).collect();
+        assert_eq!(agentes.len(), 8);
+        let estados: HashSet<_> = agentes.iter().filter_map(|a| a.estado.as_deref()).collect();
+        assert_eq!(
+            estados,
+            HashSet::from(["rodando", "concluido", "falhou", "pergunta", "travado"])
+        );
+        // processo sem modelo/effort/tokens (null) não quebra.
+        assert!(agentes.iter().any(|a| a.tipo.as_deref() == Some("processo") && a.modelo.is_none()));
+        let resumo = painel.resumo.as_ref().unwrap();
+        assert_eq!(
+            (resumo.rodando, resumo.feitos_hoje, resumo.voltaram, resumo.falharam),
+            (Some(2), Some(3), Some(1), Some(1))
+        );
+        let cotas = painel.cotas.as_ref().unwrap();
+        assert_eq!(cotas.len(), 3);
+        assert_eq!(
+            cotas[0].reseta_em.as_deref().and_then(iso_para_epoch),
+            Some(1_793_289_600.0)
+        );
+        assert_eq!(worktree_curto(tarefas[0].worktree.as_deref().unwrap()), "centro-agentes");
+    }
+
+    #[test]
+    fn status_py_antigo_cai_no_formato_jobs() {
+        // Sem `tarefas`: a seção usa o jobs[] antigo.
+        assert!(ler_tarefas(&serde_json::json!({"jobs": []})).is_none());
+        // Campos ausentes ou null não derrubam.
+        let minimo = serde_json::json!({"tarefas": [{"agentes": [{}]}], "resumo": null});
+        let painel = ler_tarefas(&minimo).unwrap();
+        assert!(painel.resumo.is_none() && painel.cotas.is_none());
+    }
+
+    #[test]
+    fn iso_para_epoch_respeita_fuso_e_fracao() {
+        assert_eq!(iso_para_epoch("2026-10-29T16:00:00Z"), Some(1_793_289_600.0));
+        assert_eq!(iso_para_epoch("2026-10-29T13:00:00-0300"), Some(1_793_289_600.0));
+        assert_eq!(iso_para_epoch("2024-02-29T15:30:15.5+03:00"), Some(1_709_209_815.5));
+        assert_eq!(iso_para_epoch("lixo"), None);
     }
 }
