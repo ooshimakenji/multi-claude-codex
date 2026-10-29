@@ -14,7 +14,7 @@ Fontes (tudo local, tudo read-only):
 
 Uso:  python status.py            imprime estado + delta
       python status.py --line      uma linha, para statusline (leve, read-only)
-      python status.py --jobs      lista jobs ativos, sem varrer rollouts
+      python status.py --jobs      jobs ativos + tarefas[], sem varrer rollouts (cache de 2s)
       python status.py --json      snapshot para consumidores de maquina
       python status.py --reset     esquece o marco anterior
       python status.py --selftest  roda os asserts
@@ -25,6 +25,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -718,6 +719,339 @@ def _subagente_handback_encerrado(linhas):
     return False
 
 
+# --- tarefas[]: o contrato de fixtures/tarefas.json (painel e pane do mod) ---
+SILENCIO_S = 10 * 60      # sem evento novo ha mais que isso: travado (pendente) ou falhou
+TERMINADO_S = 2 * 3600    # terminados ficam ~2h na lista, com estado
+JOBS_TTL_S = 2            # o painel le a cada 2s e o pane a cada 3s: um escritor so, este script
+# O mod (e um "codex exec" direto com o mesmo cabecalho) abre o 1o prompt com isto.
+MARCADOR = re.compile(r"<!--\s*job:(\S+)\s+tarefa:(.*?)\s+papel:(.*?)\s*-->", re.S)
+# Convencao do Agent tool: description = "tarefa/papel: ..."
+DESCRICAO = re.compile(r"^\s*([^/:]+?)\s*/\s*([^:]+?)\s*:")
+PENDENTES_CODEX = ("function_call", "custom_tool_call", "local_shell_call")
+PROGRESSO = {
+    "rodando": "Rodando",
+    "concluido": "Concluído",
+    "falhou": "Sem resposta há mais de 10 minutos",
+    "pergunta": "Aguardando resposta em PERGUNTA.md",
+    "travado": "Sem nova saída há mais de 10 minutos",
+}
+
+
+def _iso(epoch):
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch).astimezone().isoformat(timespec="seconds")
+
+
+def _primeira_linha(texto):
+    """Resumo do resultado: so a 1a linha, no maximo 160 caracteres."""
+    if not isinstance(texto, str) or not texto.strip():
+        return None
+    return texto.strip().splitlines()[0][:160]
+
+
+def _tarefa_do_cwd(cwd):
+    """Fallback sem marcador: worktree (.claude/worktrees/<nome>) -> pasta -> "Sem tarefa"."""
+    if not cwd:
+        return "Sem tarefa", None
+    partes = os.path.normpath(cwd).split(os.sep)
+    for i in range(len(partes) - 2):
+        if partes[i] == ".claude" and partes[i + 1] == "worktrees":
+            return partes[i + 2], os.sep.join(partes[:i + 3])
+    return os.path.basename(os.path.normpath(cwd)) or "Sem tarefa", cwd
+
+
+def _pergunta(cwd, inicio):
+    """PERGUNTA.md no cwd mais novo que o inicio do job: o agente parou para perguntar."""
+    if not cwd or inicio is None:
+        return False
+    try:
+        return os.path.getmtime(os.path.join(cwd, "PERGUNTA.md")) > inicio
+    except OSError:
+        return False
+
+
+def _extraido(secao, arq, extrai):
+    """Reaproveita a extracao enquanto a assinatura (tamanho, mtime, prefixo) nao muda.
+
+    So guarda o que nao depende do relogio; o estado e calculado a cada leitura.
+    """
+    assinatura = list(_arquivo_assinatura(arq))
+    cache = _cache().setdefault(secao, {})
+    chave = os.path.abspath(arq)
+    registro = cache.get(chave)
+    if isinstance(registro, dict) and registro.get("assinatura") == assinatura:
+        return registro["dados"]
+    dados = extrai(arq)
+    cache[chave] = {"assinatura": assinatura, "dados": dados}
+    global _CACHE_DIRTY
+    _CACHE_DIRTY = True
+    return dados
+
+
+def _extrai_codex(arq):
+    """Cabecalho (meta, contexto, marcador) e rabo (ultimo evento, fim) do rollout.
+
+    Do prompt so sai o marcador; o texto nunca e guardado.
+    """
+    dados = {"inicio": None, "ultimo": None, "guardian": False, "id": None, "cwd": None,
+             "modelo": None, "effort": None, "marcador": None, "concluido": False,
+             "erro": None, "resultado": None, "pendente": False, "tokens": 0}
+    viu_prompt = False
+    for indice, evento in enumerate(_loads(arq)):
+        if indice >= 128 or (viu_prompt and dados["modelo"]):
+            break
+        if not isinstance(evento, dict):
+            continue
+        if dados["inicio"] is None:
+            dados["inicio"] = _epoch(evento.get("timestamp"))
+        payload = evento.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        if evento.get("type") == "session_meta":
+            fonte = payload.get("source")
+            dados["guardian"] = isinstance(fonte, dict) and "subagent" in fonte
+            dados["id"] = payload.get("id")
+            dados["cwd"] = payload.get("cwd") or dados["cwd"]
+        elif evento.get("type") == "turn_context":
+            dados["cwd"] = payload.get("cwd") or dados["cwd"]
+            dados["modelo"] = payload.get("model") or dados["modelo"]
+            dados["effort"] = payload.get("effort") or payload.get("reasoning_effort") or dados["effort"]
+        elif payload.get("type") == "user_message" and not viu_prompt:
+            viu_prompt = True
+            achado = MARCADOR.match(str(payload.get("message") or "").lstrip())
+            if achado:
+                dados["marcador"] = [parte.strip() for parte in achado.groups()]
+
+    linhas = tail(arq, 65536)
+    uso = _ultimo_token_count(linhas)
+    dados["tokens"] = uso.get("total_tokens", 0) if isinstance(uso, dict) else 0
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        if not isinstance(evento, dict):
+            continue
+        payload = evento.get("payload") or {}
+        payload = payload if isinstance(payload, dict) else {}
+        if dados["ultimo"] is None:
+            dados["ultimo"] = _epoch(evento.get("timestamp"))
+            dados["pendente"] = (evento.get("type") == "response_item" and
+                                 payload.get("type") in PENDENTES_CODEX)
+        # O 1o marco andando para tras decide: fim do turno, ou um turno novo em curso.
+        tipo = payload.get("type") or evento.get("type")
+        if tipo in ("task_complete", "turn_aborted"):
+            dados["concluido"] = True
+            erro = payload.get("error")
+            if tipo == "turn_aborted":
+                dados["erro"] = "interrompido"
+            elif erro:
+                dados["erro"] = (erro.get("codex_error_info") if isinstance(erro, dict) else None) or "erro"
+            dados["resultado"] = _primeira_linha(payload.get("last_agent_message"))
+            break
+        if tipo in ("task_started", "user_message"):
+            break
+    return dados
+
+
+def _extrai_claude(arq):
+    """Mesmo papel do _extrai_codex para o transcrito de um subagente."""
+    linhas = tail(arq, 65536)
+    ultimo, pendente = _subagente_ultimo(linhas)
+    dados = {"inicio": None, "ultimo": _epoch(ultimo.get("timestamp")) if ultimo else None,
+             "pendente": pendente, "cwd": None, "modelo": _subagente_modelo(linhas),
+             "terminou": _subagente_terminou(linhas) or _subagente_handback_encerrado(linhas),
+             "resultado": None}
+    for indice, evento in enumerate(_loads(arq)):
+        if indice >= 127 or (dados["inicio"] is not None and dados["cwd"]):
+            break
+        if not isinstance(evento, dict):
+            continue
+        if dados["inicio"] is None:
+            dados["inicio"] = _epoch(evento.get("timestamp"))
+        if isinstance(evento.get("cwd"), str):
+            dados["cwd"] = evento["cwd"]
+    for linha in reversed(linhas):
+        try:
+            evento = json.loads(linha)
+        except ValueError:
+            continue
+        mensagem = evento.get("message") if isinstance(evento, dict) else None
+        blocos = mensagem.get("content") if isinstance(mensagem, dict) else None
+        if evento.get("type") != "assistant" or not isinstance(blocos, list):
+            continue
+        textos = [b.get("text") for b in blocos if isinstance(b, dict) and b.get("type") == "text"]
+        if textos:
+            dados["resultado"] = _primeira_linha(textos[-1])
+            break
+    return dados
+
+
+def _estado(dados, agora):
+    """pergunta vence concluido: o agente escreve PERGUNTA.md e para."""
+    if _pergunta(dados.get("cwd"), dados.get("inicio")):
+        return "pergunta"
+    if dados.get("concluido"):
+        return "falhou" if dados.get("erro") else "concluido"
+    ultimo = dados.get("ultimo")
+    if ultimo is not None and agora - ultimo > SILENCIO_S:
+        return "travado" if dados.get("pendente") else "falhou"
+    return "rodando"
+
+
+def _agente(tipo, id_agente, dados, papel, conta, agora):
+    estado = _estado(dados, agora)
+    inicio = dados["inicio"] if dados["inicio"] is not None else dados["ultimo"]
+    fim = dados["ultimo"] if estado in ("concluido", "falhou") else None
+    progresso = PROGRESSO[estado]
+    if estado == "falhou" and dados.get("erro"):
+        progresso = "Falhou: {}".format(dados["erro"])
+    return {
+        "id": id_agente,
+        "tipo": tipo,
+        "modelo": dados.get("modelo"),
+        "effort": dados.get("effort"),
+        "papel": papel,
+        "inicio": _iso(inicio),
+        "fim": _iso(fim),
+        "segundos": int(max(0, (fim if fim is not None else agora) - inicio)) if inicio is not None else None,
+        "estado": estado,
+        "progresso": progresso,
+        "resultado": dados.get("resultado") if estado in ("concluido", "falhou") else None,
+        "veredito": None,
+        "tokens": dados.get("tokens"),
+        "cotaAprox": None,
+        "conta": conta,
+    }
+
+
+def _rollouts_hoje_ontem(home):
+    hoje = datetime.now().date()
+    for deslocamento in (0, 1):
+        dia = hoje - timedelta(days=deslocamento)
+        pasta = os.path.join(home, "sessions", "{:04d}".format(dia.year),
+                             "{:02d}".format(dia.month), "{:02d}".format(dia.day))
+        for arq in glob.glob(os.path.join(pasta, "*.jsonl")):
+            yield arq
+
+
+def tarefas_agora():
+    """tarefas[], resumo e cotas a partir de rollouts e subagentes de hoje/ontem.
+
+    A atividade e o ULTIMO TIMESTAMP DENTRO do arquivo, nunca o mtime: no NTFS o
+    mtime nao anda com o arquivo aberto. mtime so pre-filtra os subagentes.
+    """
+    global _CACHE_DIRTY
+    agora = time.time()
+    meia_noite = datetime.combine(datetime.now().date(), datetime.min.time()).timestamp()
+    linhas = []   # (tarefa, worktree, agente, ultimo evento)
+    cotas = []
+    vistos = {"tarefas_codex": set(), "tarefas_claude": set()}
+
+    for home in codex_profile_homes():
+        conta = os.path.basename(home)
+        quota_nova = None
+        for arq in _rollouts_hoje_ontem(home):
+            try:
+                dados = _extraido("tarefas_codex", arq, _extrai_codex)
+                quotas = _rollout_cached(arq).get("quotas")
+            except OSError:
+                continue
+            vistos["tarefas_codex"].add(os.path.abspath(arq))
+            if dados["guardian"] or dados["ultimo"] is None:
+                continue
+            if quotas and (quota_nova is None or dados["ultimo"] > quota_nova[0]):
+                quota_nova = (dados["ultimo"], quotas)
+            nome, worktree = _tarefa_do_cwd(dados["cwd"])
+            id_agente, papel = dados["id"] or os.path.basename(arq), None
+            if dados["marcador"]:
+                id_agente, nome, papel = dados["marcador"]
+            agente = _agente("codex", id_agente, dados, papel, conta, agora)
+            linhas.append((nome, worktree, agente, dados["ultimo"]))
+        for quota in (quota_nova[1] if quota_nova else []):
+            cotas.append({"conta": conta, "janela": quota.get("janela"), "pct": quota.get("pct"),
+                          "resetaEm": _iso(_epoch(quota.get("reseta_em")))})
+
+    corte = min(agora - TERMINADO_S, meia_noite)
+    for arq in glob.glob(os.path.join(CLAUDE_HOME, "projects", "*", "*", "subagents", "agent-*.jsonl")):
+        try:
+            if os.path.getmtime(arq) < corte:
+                continue
+            dados = dict(_extraido("tarefas_claude", arq, _extrai_claude))
+        except OSError:
+            continue
+        vistos["tarefas_claude"].add(os.path.abspath(arq))
+        if dados["ultimo"] is None:
+            continue
+        try:
+            with open(os.path.splitext(arq)[0] + ".meta.json", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        # Texto sozinho parado ha mais de 90s e fim de verdade (ver jobs_ativos).
+        dados["concluido"] = bool(meta.get("finished") or dados["terminou"] or (
+            not dados["pendente"] and agora - dados["ultimo"] > 90))
+        descricao = meta.get("description") if isinstance(meta.get("description"), str) else None
+        nome, worktree = _tarefa_do_cwd(dados["cwd"])
+        papel = descricao or (meta.get("agentType") if isinstance(meta.get("agentType"), str) else None)
+        achado = DESCRICAO.match(descricao or "")
+        if achado:
+            nome, papel = achado.group(1), achado.group(2)
+        agente = _agente("claude", os.path.splitext(os.path.basename(arq))[0], dados, papel,
+                         os.path.basename(CLAUDE_HOME), agora)
+        linhas.append((nome, worktree, agente, dados["ultimo"]))
+
+    # Rollout ou transcrito que saiu de hoje/ontem nao volta: o cache nao cresce sem fim.
+    for secao, chaves in vistos.items():
+        cache = _cache().setdefault(secao, {})
+        for chave in [c for c in cache if c not in chaves]:
+            del cache[chave]
+            _CACHE_DIRTY = True
+    _save_cache()
+
+    hoje = [agente for _, _, agente, ultimo in linhas if ultimo >= meia_noite]
+    resumo = {
+        "rodando": 0,
+        "feitosHoje": sum(1 for agente in hoje if agente["estado"] == "concluido"),
+        "voltaram": sum(1 for agente in hoje if (agente["veredito"] or {}).get("tipo") == "voltou"),
+        "falharam": sum(1 for agente in hoje if agente["estado"] == "falhou"),
+    }
+    grupos = {}
+    visiveis = [linha for linha in linhas if agora - linha[3] <= TERMINADO_S]
+    for nome, worktree, agente, _ in sorted(visiveis, key=lambda linha: linha[3], reverse=True):
+        grupos.setdefault((nome, worktree), []).append(agente)
+        resumo["rodando"] += agente["estado"] == "rodando"
+    tarefas = [{"nome": nome, "worktree": worktree, "agentes": agentes}
+               for (nome, worktree), agentes in grupos.items()]
+    return {"tarefas": tarefas, "resumo": resumo, "cotas": cotas}
+
+
+def _jobs_cache_path():
+    return os.path.join(os.path.dirname(MARK), "codex-status-jobs.json")
+
+
+def jobs_payload():
+    """Saida de --jobs, valendo por JOBS_TTL_S para os dois consumidores.
+
+    O painel e o pane do mod leem o mesmo arquivo; so este script grava nele.
+    """
+    caminho = _jobs_cache_path()
+    try:
+        with open(caminho, encoding="utf-8") as fh:
+            anterior = json.load(fh)
+        if 0 <= time.time() - anterior["ts"] < JOBS_TTL_S:
+            return anterior
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    saida = {"jobs": jobs_ativos()}
+    saida.update(tarefas_agora())
+    saida["ts"] = time.time()
+    _grava_atomico(caminho, saida)
+    return saida
+
+
 def claude_side():
     path = newest(os.path.join(CLAUDE_HOME, "projects", "**", "*.jsonl"))
     out = {"arquivo": os.path.basename(path) if path else None, "tokens": 0}
@@ -1324,7 +1658,8 @@ def selftest():
                               env=ambiente, capture_output=True, text=True,
                               check=True)
     json_saida = json.loads(processo.stdout)
-    assert set(json_saida) == {"codex", "claude", "free_tier", "jobs", "ts"}, json_saida
+    assert set(json_saida) == {"codex", "claude", "free_tier", "jobs", "ts",
+                               "tarefas", "resumo", "cotas"}, json_saida
     marca_depois = (open(MARK, "rb").read(), os.stat(MARK).st_mtime_ns)
     assert marca_depois == marca_antes, "--json alterou o marco"
 
@@ -1359,6 +1694,135 @@ def selftest():
     assert "rollout-b.jsonl" in por_arquivo_b, jobs_b
     assert por_arquivo_b["rollout-b.jsonl"]["perfil"] == ".codex-b", jobs_b
 
+    # --- tarefas[]: marcador, estados, ~2h de terminados e o contrato da fixture ---
+    t = tempfile.mkdtemp()
+    CODEX_HOME = CLAUDE_HOME = t
+    MARK = os.path.join(t, "mark.json")
+    pasta_t = os.path.join(t, "sessions", "{:04d}".format(hoje.year),
+                           "{:02d}".format(hoje.month), "{:02d}".format(hoje.day))
+    worktree_t = os.path.join(t, "repo", ".claude", "worktrees", "centro-x")
+    solto = os.path.join(t, "projx")
+    com_pergunta = os.path.join(t, "perguntador")
+    for pasta in (pasta_t, worktree_t, solto, com_pergunta):
+        os.makedirs(pasta)
+    agora_t = time.time()
+
+    def rollout(nome, cwd, eventos, inicio, prompt="briefing sem marcador"):
+        cabeca = [
+            {"timestamp": inicio, "type": "session_meta", "payload": {"id": "sess-" + nome, "cwd": cwd}},
+            {"timestamp": inicio, "type": "turn_context", "payload": {
+                "model": "gpt-5.6-terra", "effort": "high", "cwd": cwd}},
+            {"timestamp": inicio, "type": "event_msg", "payload": {"type": "user_message", "message": prompt}},
+        ]
+        with open(os.path.join(pasta_t, "rollout-{}.jsonl".format(nome)), "w", encoding="utf-8") as fh:
+            for evento in cabeca + eventos:
+                fh.write(json.dumps(evento) + "\n")
+
+    rollout("marcado", worktree_t, [
+        {"timestamp": agora_t - 60, "type": "event_msg", "payload": {
+            "type": "task_complete", "last_agent_message": "Feito: 3 commits\nsegunda linha"}}],
+        agora_t - 300, "<!-- job:J1 tarefa:Centro de comando papel:status.py -->\nO resto do briefing.")
+    rollout("pendente-15m", solto, [
+        {"timestamp": agora_t - 900, "type": "response_item", "payload": {
+            "type": "function_call", "name": "exec"}}], agora_t - 950)
+    rollout("silencio", solto, [
+        {"timestamp": agora_t - 900, "type": "response_item", "payload": {"type": "reasoning"}}],
+        agora_t - 950)
+    rollout("erro", solto, [
+        {"timestamp": agora_t - 30, "type": "event_msg", "payload": {
+            "type": "task_complete", "last_agent_message": None,
+            "error": {"codex_error_info": "usage_limit_exceeded"}}}], agora_t - 40)
+    rollout("pergunta", com_pergunta, [
+        {"timestamp": agora_t - 5, "type": "response_item", "payload": {"type": "reasoning"}}],
+        agora_t - 60)
+    with open(os.path.join(com_pergunta, "PERGUNTA.md"), "w", encoding="utf-8") as fh:
+        fh.write("posso apagar?")
+    rollout("rodando", None, [
+        {"timestamp": agora_t - 6, "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {"total_tokens": 77}},
+            "rate_limits": {"primary": {"used_percent": 4.0, "window_minutes": 300,
+                                        "resets_at": 1787759175}}}},
+        {"timestamp": agora_t - 5, "type": "response_item", "payload": {"type": "reasoning"}}],
+        agora_t - 20)
+    rollout("fim-1h", solto, [
+        {"timestamp": agora_t - 3600, "type": "event_msg", "payload": {"type": "task_complete"}}],
+        agora_t - 3700)
+    rollout("fim-3h", solto, [
+        {"timestamp": agora_t - 3 * 3600, "type": "event_msg", "payload": {"type": "task_complete"}}],
+        agora_t - 3 * 3600 - 100)
+
+    subagentes_t = os.path.join(t, "projects", "proj", "sessao", "subagents")
+    os.makedirs(subagentes_t)
+    with open(os.path.join(subagentes_t, "agent-rev.jsonl"), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"timestamp": agora_t - 30, "type": "user", "cwd": solto,
+                             "message": {"content": "briefing"}}) + "\n")
+        fh.write(json.dumps({"timestamp": agora_t - 5, "type": "assistant", "message": {
+            "model": "claude-sonnet-4-6", "content": [{"type": "tool_use", "name": "Read"}]}}) + "\n")
+    with open(os.path.join(subagentes_t, "agent-rev.meta.json"), "w", encoding="utf-8") as fh:
+        json.dump({"agentType": "general-purpose", "description": "Centro de comando/revisor: confere diff"}, fh)
+
+    saida_t = tarefas_agora()
+    agentes_t = {agente["id"]: (tarefa, agente) for tarefa in saida_t["tarefas"]
+                 for agente in tarefa["agentes"]}
+    tarefa, agente = agentes_t["J1"]
+    assert tarefa["nome"] == "Centro de comando" and agente["papel"] == "status.py", agentes_t["J1"]
+    assert tarefa["worktree"] == worktree_t, tarefa
+    assert agente["estado"] == "concluido" and agente["resultado"] == "Feito: 3 commits", agente
+    assert agente["modelo"] == "gpt-5.6-terra" and agente["effort"] == "high" and agente["fim"], agente
+    assert agentes_t["sess-pendente-15m"][1]["estado"] == "travado", agentes_t["sess-pendente-15m"]
+    assert agentes_t["sess-pendente-15m"][0]["nome"] == "projx", agentes_t["sess-pendente-15m"]
+    assert agentes_t["sess-silencio"][1]["estado"] == "falhou", agentes_t["sess-silencio"]
+    assert agentes_t["sess-erro"][1]["estado"] == "falhou", agentes_t["sess-erro"]
+    assert "usage_limit_exceeded" in agentes_t["sess-erro"][1]["progresso"], agentes_t["sess-erro"]
+    assert agentes_t["sess-pergunta"][1]["estado"] == "pergunta", agentes_t["sess-pergunta"]
+    assert agentes_t["sess-rodando"][1]["estado"] == "rodando", agentes_t["sess-rodando"]
+    assert agentes_t["sess-rodando"][0]["nome"] == "Sem tarefa", agentes_t["sess-rodando"]
+    assert "sess-fim-1h" in agentes_t and "sess-fim-3h" not in agentes_t, sorted(agentes_t)
+    tarefa, agente = agentes_t["agent-rev"]
+    # REGRESSAO: o modelo vem de message.model; o .meta.json nao tem "model" e dava sempre "—"
+    assert agente["tipo"] == "claude" and agente["modelo"] == "claude-sonnet-4-6", agente
+    assert tarefa["nome"] == "Centro de comando" and agente["papel"] == "revisor", agentes_t["agent-rev"]
+    assert agente["estado"] == "rodando", agente
+    assert saida_t["resumo"]["rodando"] == 2, saida_t["resumo"]
+    assert agentes_t["sess-rodando"][1]["tokens"] == 77, agentes_t["sess-rodando"]
+    assert saida_t["cotas"] == [{"conta": os.path.basename(t), "janela": 300, "pct": 4.0,
+                                 "resetaEm": _iso(1787759175)}], saida_t["cotas"]
+
+    # --jobs: o 2o pedido dentro do TTL devolve o mesmo arquivo; nada de .tmp.<pid> sobrando.
+    primeiro_jobs = jobs_payload()
+    assert jobs_payload()["ts"] == primeiro_jobs["ts"], "o cache de 2s nao foi usado"
+    assert not [nome for nome in os.listdir(t) if ".tmp" in nome], os.listdir(t)
+
+    # --json contra o contrato de fixtures/tarefas.json (chaves, tipos e estados aceitos).
+    processo = subprocess.run([sys.executable, __file__, "--json"],
+                              env=dict(os.environ, CODEX_HOME=t, CLAUDE_CONFIG_DIR=t),
+                              capture_output=True, text=True, check=True)
+    json_saida = json.loads(processo.stdout)
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fixtures",
+                           "tarefas.json"), encoding="utf-8") as fh:
+        fixture = json.load(fh)
+    assert json_saida["tarefas"], json_saida
+    assert set(json_saida["resumo"]) == set(fixture["resumo"]), json_saida["resumo"]
+    assert all(isinstance(v, int) for v in json_saida["resumo"].values()), json_saida["resumo"]
+    chaves_agente = set(fixture["tarefas"][0]["agentes"][0])
+    for tarefa in json_saida["tarefas"]:
+        assert set(tarefa) == set(fixture["tarefas"][0]), tarefa
+        assert isinstance(tarefa["nome"], str) and isinstance(tarefa["agentes"], list), tarefa
+        for agente in tarefa["agentes"]:
+            assert set(agente) == chaves_agente, agente
+            assert agente["tipo"] in ("codex", "claude", "gemini", "processo"), agente
+            assert agente["estado"] in ("rodando", "concluido", "falhou", "pergunta", "travado"), agente
+            assert isinstance(agente["inicio"], str) and isinstance(agente["progresso"], str), agente
+            assert agente["fim"] is None or isinstance(agente["fim"], str), agente
+            for chave in ("segundos", "tokens", "cotaAprox"):
+                assert agente[chave] is None or isinstance(agente[chave], (int, float)), agente
+            for chave in ("modelo", "effort", "papel", "conta", "resultado"):
+                assert agente[chave] is None or isinstance(agente[chave], str), agente
+            datetime.fromisoformat(agente["inicio"])
+    for cota in json_saida["cotas"]:
+        assert set(cota) == set(fixture["cotas"][0]), cota
+        assert cota["resetaEm"] is None or datetime.fromisoformat(cota["resetaEm"]), cota
+
     assert humano(999) == "999" and humano(20455411) == "20.5M", humano(20455411)
     print("selftest ok")
 
@@ -1379,11 +1843,11 @@ if __name__ == "__main__":
             pass
     elif "--json" in sys.argv:
         now = snapshot()
-        now["jobs"] = jobs_ativos()
+        now.update(jobs_payload())
         now["ts"] = time.time()
         print(json.dumps(now))
     elif "--jobs" in sys.argv:
-        print(json.dumps({"jobs": jobs_ativos()}))
+        print(json.dumps(jobs_payload()))
     elif "--selftest" in sys.argv:
         selftest()
     elif "--reset" in sys.argv:
