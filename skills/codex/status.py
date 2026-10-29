@@ -105,20 +105,25 @@ def _save_cache():
     global _CACHE_DIRTY
     if not _CACHE_DIRTY:
         return
-    cache = _cache()
-    caminho = _cache_path()
-    temporario = caminho + ".tmp"
+    if _grava_atomico(_cache_path(), _cache()):
+        _CACHE_DIRTY = False
+
+
+def _grava_atomico(caminho, dados):
+    """Grava em .tmp.<pid> e troca por rename: dois processos juntos nao pisam no temporario um do outro."""
+    temporario = "{}.tmp.{}".format(caminho, os.getpid())
     try:
         os.makedirs(os.path.dirname(caminho), exist_ok=True)
         with open(temporario, "w", encoding="utf-8") as fh:
-            json.dump(cache, fh, separators=(",", ":"))
+            json.dump(dados, fh, separators=(",", ":"))
         os.replace(temporario, caminho)
-        _CACHE_DIRTY = False
+        return True
     except OSError:
         try:
             os.remove(temporario)
         except OSError:
             pass
+        return False
 
 
 def _arquivo_assinatura(path):
