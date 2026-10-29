@@ -447,7 +447,11 @@ test('delegar_codex prefixa o prompt com tarefa e papel', { options }, async ($,
 
 test('pane agrupa a fixture tarefas.json por tarefa', { options }, async ($, on) => {
   mock.env(on, { USERPROFILE: 'C:/Users/test' })
-  on('fs.read', () => ({ value: JSON.stringify({ ...fixture, ts: Date.now() / 1000 }) }))
+  const lidos: string[] = []
+  on('fs.read', ($, e) => {
+    lidos.push(e.path)
+    return { value: JSON.stringify({ ...fixture, ts: Date.now() / 1000 }) }
+  })
   on('process.run', () => {
     throw new Error('cache fresco não deve chamar o status.py')
   })
@@ -476,6 +480,7 @@ test('pane agrupa a fixture tarefas.json por tarefa', { options }, async ($, on)
   await new Promise(resolve => setTimeout(resolve, 25))
   const tree = await render()
   expect(fixture.tarefas).toHaveLength(3)
+  expect(lidos).toContain('C:/Users/test/.claude/codex-status-jobs.json')
   expect(tree).toContain('CENTRO DE COMANDO')
   expect(tree).not.toContain('HERMES')
   for (const tarefa of fixture.tarefas) expect(tree).toContain(tarefa.nome)
