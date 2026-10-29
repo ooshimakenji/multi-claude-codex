@@ -2678,6 +2678,15 @@ fn codex_job_running(status: Option<&Result<Value, String>>) -> bool {
         .and_then(|value| value.get("jobs"))
         .and_then(Value::as_array)
         .is_some_and(|jobs| jobs.iter().any(|job| job_type_label(job) == "CODEX"))
+        // O contrato tarefas[] pode vir sem jobs[]: vale um codex rodando em qualquer tarefa.
+        || status
+            .and_then(|result| result.as_ref().ok())
+            .and_then(ler_tarefas)
+            .is_some_and(|painel| {
+                painel.tarefas.iter().flatten().flat_map(|t| t.agentes.iter().flatten()).any(|a| {
+                    a.tipo.as_deref() == Some("codex") && a.estado.as_deref() == Some("rodando")
+                })
+            })
 }
 
 fn draw_wild_sprite(ui: &mut egui::Ui, texture: Option<egui::TextureId>, time: f64, phase: f64) {
