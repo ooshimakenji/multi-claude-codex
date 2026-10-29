@@ -1,13 +1,15 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 declare function setTimeout(callback: (...args: any[]) => void, ms: number): unknown
+import fixture from './tarefas.fixture'
 import {
   fnv1a64,
   formatQuotaWindows,
+  formatReset,
   cacheIsFresh,
+  jobMarker,
   jobsPollingInterval,
   mergeCache,
-  mergeSessionJobs,
   mergePokeConfig,
   parseStatusSnapshot,
   selectQuotaAccount,
@@ -76,33 +78,6 @@ test('job polling is adaptive and trainer uses the compact sprite by default', {
   expect(trainerSpriteKey(30)).toBe('treinador-g')
 })
 
-test('session agents include only active agents and use the matched job duration', { options }, () => {
-  const jobs = [
-    { tipo: 'claude' as const, modelo: 'opus', projeto: 'old', segundos: 4, arquivo: 'session-abc-agent-1.jsonl' },
-    { tipo: 'claude' as const, modelo: 'opus', projeto: 'other', segundos: 5, arquivo: 'session-abc-agent-2.jsonl' },
-  ]
-  const merged = mergeSessionJobs(jobs, [
-    { id: 'agent-1', description: 'first', type: 'Explore', status: 'waiting' as const },
-  ], 'session-abc')
-  expect(merged[0]?.agentStatus).toBe('waiting')
-  expect(merged[0]?.segundos).toBe(4)
-  expect(merged.filter(job => job.arquivo === 'session-abc-agent-1.jsonl')).toHaveLength(1)
-  expect(merged[1]?.arquivo).toBe('session-abc-agent-2.jsonl')
-})
-
-test('completed agents and their matched status jobs are not shown', { options }, () => {
-  const merged = mergeSessionJobs([
-    { tipo: 'claude' as const, modelo: 'opus', projeto: 'done', segundos: 9, arquivo: 'session-abc-agent-done.jsonl' },
-    { tipo: 'claude' as const, modelo: 'opus', projeto: 'live', segundos: 7, arquivo: 'session-abc-agent-live.jsonl' },
-  ], [
-    { id: 'agent-done', description: 'done', type: 'Explore', status: 'completed' as const },
-    { id: 'agent-live', description: 'live', type: 'Explore', status: 'running' as const },
-  ], 'session-abc')
-  expect(merged.some(job => job.agentId === 'agent-done')).toBe(false)
-  expect(merged.some(job => job.arquivo.includes('agent-done'))).toBe(false)
-  expect(merged.find(job => job.agentId === 'agent-live')?.segundos).toBe(7)
-})
-
 test('poke toggle preserves unrelated config keys', { options }, () => {
   expect(JSON.parse(mergePokeConfig({ tema: 'escuro', modo_poke: false }, true))).toEqual({
     tema: 'escuro',
@@ -137,7 +112,7 @@ test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { opti
   expect(delegation.saida).toBe('C:/Temp/codex-delegar-' + delegation.job_id + '.md')
   expect(request?.argv).toContain('--approve-for-me')
   expect(request?.argv).toContain('--skip-git-repo-check')
-  expect(request?.input).toBe('linha 1\nlinha 2')
+  expect(request?.input).toBe(`<!-- job:${delegation.job_id} -->\nlinha 1\nlinha 2`)
 })
 
 test('exit 0 sem arquivo de saída deixa o job falhou', { options }, async ($, on) => {
@@ -431,4 +406,86 @@ test('hooks observadores chamam next mesmo quando o estado falha', { options }, 
   await $.tool.call({ tool: 'Read', file_path: 'arquivo.md' })
   expect(promptPassed).toBe(true)
   expect(toolPassed).toBe(true)
+})
+
+test('marcador do job leva tarefa e papel numa linha só', { options }, () => {
+  expect(jobMarker('1-0', 'Presença · turma', 'escrita')).toBe('<!-- job:1-0 tarefa:Presença · turma papel:escrita -->')
+  expect(jobMarker('1-0', undefined, 'revisao')).toBe('<!-- job:1-0 papel:revisao -->')
+  expect(jobMarker('1-0', '  ', 'leitura')).toBe('<!-- job:1-0 papel:leitura -->')
+  expect(jobMarker('1-0')).toBe('<!-- job:1-0 -->')
+})
+
+test('marcador sanitiza quebra de linha, comentário e papel inválido', { options }, () => {
+  const marker = jobMarker('1-0', 'linha 1\r\n\tlinha 2 --> <!-- x papel:falso', 'outro')
+  expect(marker).toBe('<!-- job:1-0 tarefa:linha 1 linha 2 x papel=falso -->')
+  expect(marker.includes('\n')).toBe(false)
+  expect(marker.match(/-->/g)?.length).toBe(1)
+  expect(jobMarker('1-0', 'x'.repeat(300)).length).toBeLessThan(160)
+})
+
+test('delegar_codex prefixa o prompt com tarefa e papel', { options }, async ($, on) => {
+  mock.env(on, { APPDATA: 'C:/Users/test/AppData/Roaming', TEMP: 'C:/Temp' })
+  let request: { input?: string } | undefined
+  installDelegationRun(on)
+  on('process.spawn', async function* (_$, e) {
+    request = e
+    return { value: { code: 0, signal: null } }
+  })
+  on('fs.exists', () => ({ value: false }))
+  on('ui.toast', () => ({ value: undefined }))
+  const call = await $.tool.call({
+    tool: 'mcp__codex-delegar__delegar_codex',
+    prompt: 'corpo',
+    cwd: 'C:/outro',
+    tarefa: 'Centro de comando',
+    papel: 'escrita',
+  })
+  const delegation = JSON.parse(String(call.result)) as { job_id: string }
+  await new Promise(resolve => setTimeout(resolve, 25))
+  expect(request?.input).toBe(`<!-- job:${delegation.job_id} tarefa:Centro de comando papel:escrita -->\ncorpo`)
+})
+
+test('pane agrupa a fixture tarefas.json por tarefa', { options }, async ($, on) => {
+  mock.env(on, { USERPROFILE: 'C:/Users/test' })
+  on('fs.read', () => ({ value: JSON.stringify({ ...fixture, ts: Date.now() / 1000 }) }))
+  on('process.run', () => {
+    throw new Error('cache fresco não deve chamar o status.py')
+  })
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const render = async () => JSON.stringify(await $.ui.render({
+    surface: 'terminal',
+    component: 'Pane',
+    requestId: 'codex',
+    props: {
+      title: 'Codex',
+      isFocused: false,
+      bodyColumns: 200,
+      placement: 'inline',
+      scroll: { offset: 0, bodyRows: 40 },
+      view: {},
+    },
+  }))
+  // /codex lê o cache do status.py em background; o render só desenha o estado.
+  await $.command.run({
+    command: 'codex',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 200 },
+  })
+  await new Promise(resolve => setTimeout(resolve, 25))
+  const tree = await render()
+  expect(fixture.tarefas).toHaveLength(3)
+  expect(tree).toContain('CENTRO DE COMANDO')
+  expect(tree).not.toContain('HERMES')
+  for (const tarefa of fixture.tarefas) expect(tree).toContain(tarefa.nome)
+  expect(tree).toContain('Sem tarefa')
+  const agentes = fixture.tarefas.flatMap(tarefa => tarefa.agentes)
+  expect(agentes).toHaveLength(8)
+  for (const agente of agentes) expect(tree).toContain(`${agente.tipo} · `)
+  for (const agente of agentes) expect(tree).toContain(agente.papel)
+  expect(tree).toContain('codex · 5.6-luna/medium · ler dados de presença · rodando · 14:02')
+  expect(tree).toContain('Regra validada para 3 turmas')
+  expect(tree).toContain('rodando 2 · feitos hoje 3 · voltaram 1 · falharam 1')
+  expect(tree).toContain(`.codex 5h 3% (reseta ${formatReset('2026-10-29T13:00:00-03:00', Date.now())})`)
 })

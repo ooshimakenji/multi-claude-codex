@@ -1,14 +1,16 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderInput } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, RenderInput } from 'claude-code'
 
 import type {
   ClaudeAccount,
   CodexJob,
   CodexQuota,
   DashboardData,
-  DashboardJob,
   FileSnapshot,
   RasterSprite,
+  TarefaAgente,
+  TarefaCota,
+  TarefasJson,
 } from '../types'
 
 const PANE = 'codex'
@@ -21,7 +23,8 @@ const suggestionTurn = atom({ plugin: 'codex-delegar', key: 'suggestionTurn' } a
 const suggestionCount = atom({ plugin: 'codex-delegar', key: 'suggestionCount' } as const, 0)
 const dashboard = atom({ plugin: 'codex-delegar', key: 'dashboard' } as const, {
   claude: [],
-  running: [],
+  tarefas: [],
+  cotas: [],
   poke: true,
   map: {},
   wild: [],
@@ -29,12 +32,34 @@ const dashboard = atom({ plugin: 'codex-delegar', key: 'dashboard' } as const, {
   errors: [],
 } as DashboardData)
 
+const PAPEIS = ['escrita', 'revisao', 'leitura', 'correcao', 'apoio'] as const
+type Papel = typeof PAPEIS[number]
+
 type DelegarInput = {
   prompt: string
   modelo?: string
   effort?: CodexJob['effort']
   cwd?: string
   saida?: string
+  tarefa?: string
+  papel?: Papel
+}
+
+// Uma linha só: sem quebra, sem fechar o comentário e sem um " papel:" que o status.py leria como o campo seguinte.
+const markerValue = (value: string): string => value
+  .replace(/<!--|-->/g, ' ')
+  .replace(/\s+/g, ' ')
+  .replace(/ papel:/g, ' papel=')
+  .trim()
+  .slice(0, 120)
+
+// Cabeçalho que o status.py casa com o rollout: <!-- job:<ID> tarefa:<tarefa> papel:<papel> -->
+export const jobMarker = (id: string, tarefa?: string, papel?: string): string => {
+  const fields = [`job:${markerValue(id).replace(/ /g, '-')}`]
+  const task = tarefa === undefined ? '' : markerValue(tarefa)
+  if (task) fields.push(`tarefa:${task}`)
+  if (PAPEIS.includes(papel as Papel)) fields.push(`papel:${papel}`)
+  return `<!-- ${fields.join(' ')} -->`
 }
 
 type QuotaJson = {
@@ -81,6 +106,7 @@ type RuntimePaths = {
   poke: string
   cswap: string
   sharedCache: string
+  jobsCache: string
   codex: string
 }
 
@@ -101,6 +127,7 @@ const runtimePaths = async ($: EngineInterface): Promise<RuntimePaths> => {
     poke: (await $.env.get('POKE_CACHE')) ?? `${claudeConfig}/poke-cache`,
     cswap: (await $.env.get('CSWAP_EXE')) ?? `${home}/.local/bin/cswap.exe`,
     sharedCache: (await $.env.get('CODEX_DELEGAR_CACHE')) ?? `${claudeConfig}/codex-delegar-cache.json`,
+    jobsCache: `${claudeConfig}/codex-status-jobs.json`,
     codex: (await $.env.get('CODEX_CLI')) ?? `${appData}/npm/codex.cmd`,
   }
 }
@@ -109,24 +136,14 @@ const activeCodexProfile = async ($: EngineInterface): Promise<string> => pathWi
   (await $.env.get('CODEX_HOME')) ?? `${(await $.env.get('USERPROFILE')) ?? WINDOWS_HOME_FALLBACK}/.codex`,
 ).split(/[\\/]/).pop() ?? '.codex'
 
-type JobsJson = { jobs?: DashboardJob[] }
 type CacheEntry<T> = { ts: number; data: T }
 type SharedCache = { cswap?: CacheEntry<unknown>; status?: CacheEntry<unknown> }
-type SessionAgent = {
-  id: string
-  description: string
-  type: string
-  status: 'pending' | 'running' | 'waiting' | 'idle' | 'completed' | 'failed' | 'killed'
-  name?: string
-}
-
-const activeAgentStatuses = new Set<SessionAgent['status']>(['pending', 'running', 'waiting'])
-
 const emptyDashboard = (): DashboardData => ({
   claude: [],
   codexFiveHour: undefined,
   codexSevenDay: undefined,
-  running: [],
+  tarefas: [],
+  cotas: [],
   poke: true,
   map: {},
   wild: [],
@@ -205,37 +222,9 @@ export const usageColor = (pct: number | undefined): 'success' | 'warning' | 'er
 const usageOf = (account: ClaudeAccount | undefined, window: 'fiveHour' | 'sevenDay') =>
   account?.usage?.[window] ?? account?.lastGoodUsage?.[window]
 
-const compactClock = (clock: string | undefined): string | undefined => {
-  if (!clock) return undefined
-  const match = clock.match(/^([A-Z][a-z]{2}) (\d{1,2}) (\d{2}:\d{2})$/)
-  if (!match) return clock
-  const months: Record<string, string> = {
-    Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06',
-    Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12',
-  }
-  return `${(match[2] ?? '').padStart(2, '0')}/${months[match[1] ?? ''] ?? match[1] ?? ''} ${match[3] ?? ''}`
-}
-
 const percent = (value: number | undefined): string => value === undefined ? '—' : `${Math.round(value)}%`
 
-const bar = (value: number | undefined): string => {
-  const filled = value === undefined ? 0 : Math.round(Math.max(0, Math.min(100, value)) / 10)
-  return `${'█'.repeat(filled)}${'░'.repeat(10 - filled)}`
-}
-
 const modelLabel = (model: string): string => model.replace(/^gpt-/, '')
-
-const jobSeconds = (job: CodexJob, now: number): number => duration(job, now)
-
-const localJobs = (list: CodexJob[], now: number): DashboardJob[] => list
-  .filter(job => job.status === 'rodando')
-  .map(job => ({
-    tipo: 'codex',
-    modelo: job.modelo,
-    projeto: job.cwd.split(/[\\/]/).pop() ?? job.cwd,
-    segundos: jobSeconds(job, now),
-    arquivo: job.saida,
-  }))
 
 const readSprite = async ($: EngineInterface, path: string): Promise<RasterSprite | undefined> => {
   return await readJson<RasterSprite>($, path)
@@ -247,43 +236,17 @@ export const selectQuotaAccount = (currentQuota: CodexQuota): CodexQuota['contas
     ?? currentQuota.contas.find(item => item.status === 'ok')
     ?? currentQuota.contas[0]
 
-export const formatQuotaWindows = (currentQuota: CodexQuota): string => currentQuota.windows.map(item => {
-  const label = item.janela === 300
-    ? '5h'
-    : item.janela === 10080
-      ? '7d'
-      : item.janela === 43200
-        ? '30d'
-        : `${item.janela}min`
-  return `${label} ${item.pct === undefined ? '—' : `${item.pct}%`}`
-}).join(' | ') || 'cota indisponível'
+const windowLabel = (janela: number): string => janela === 300
+  ? '5h'
+  : janela === 10080
+    ? '7d'
+    : janela === 43200
+      ? '30d'
+      : `${janela}min`
 
-export const mergeSessionJobs = (
-  source: DashboardJob[],
-  agents: SessionAgent[],
-  sessionId: string,
-): DashboardJob[] => {
-  const sessionJobs = source.filter(job => job.tipo === 'claude' && job.arquivo.includes(sessionId))
-  const matched = new Set<string>()
-  const sessionRows = agents.filter(agent => activeAgentStatuses.has(agent.status)).map(agent => {
-    const job = sessionJobs.find(item => item.arquivo.includes(agent.id))
-    if (job) {
-      matched.add(job.arquivo)
-      return { ...job, agentId: agent.id, agentStatus: agent.status, projeto: agent.name ?? agent.description }
-    }
-    return {
-      tipo: 'claude' as const,
-      modelo: agent.type,
-      projeto: agent.name ?? agent.description,
-      arquivo: `agent:${agent.id}`,
-      agentId: agent.id,
-      agentStatus: agent.status,
-    }
-  })
-  const terminatedMatches = new Set(sessionJobs.filter(job => agents.some(agent =>
-    job.arquivo.includes(agent.id) && !activeAgentStatuses.has(agent.status))).map(job => job.arquivo))
-  return [...sessionRows, ...source.filter(job => !matched.has(job.arquivo) && !terminatedMatches.has(job.arquivo))]
-}
+export const formatQuotaWindows = (currentQuota: CodexQuota): string => currentQuota.windows.map(item => {
+  return `${windowLabel(item.janela)} ${item.pct === undefined ? '—' : `${item.pct}%`}`
+}).join(' | ') || 'cota indisponível'
 
 const duration = (job: CodexJob, now: number): number =>
   Math.max(0, Math.round(((job.finishedAt ?? now) - job.startedAt) / 1000))
@@ -506,11 +469,6 @@ export const trainerSpriteKey = (bodyRows: number): 'treinador-p' | 'treinador-g
 
 export const jobsPollingInterval = (panePlaced: boolean): number => panePlaced ? 3000 : 15000
 
-const jobsForSession = async (
-  $: EngineInterface,
-  source: DashboardJob[],
-): Promise<DashboardJob[]> => mergeSessionJobs(source, await $.agent.list() as SessionAgent[], await $.session.id())
-
 const loadSprites = async (
   $: EngineInterface,
   accounts: ClaudeAccount[],
@@ -580,22 +538,6 @@ const refreshDashboard = async ($: EngineInterface, repoPath: string): Promise<v
   }
 
   try {
-    const result = await $.process.run([
-      'python',
-      `${repoPath.replace(/[\\/]$/, '')}/skills/codex/status.py`,
-      '--jobs',
-    ], { cwd: repoPath, timeoutMs: 30000 })
-    if (result.exitCode !== 0) throw new Error(result.stderr || `jobs exit ${result.exitCode}`)
-    const parsed = JSON.parse(result.stdout) as JobsJson
-    const session = await jobsForSession($, parsed.jobs ?? [])
-    const local = localJobs(await read($, jobs), Date.now())
-    const all = [...session, ...local]
-    next.running = all.filter((job, index, list) => list.findIndex(item => item.arquivo === job.arquivo) === index)
-  } catch (error) {
-    errors.push(`jobs: ${shortError(error)}`)
-  }
-
-  try {
     next.poke = await readPokeMode($, paths.config)
     const map = await readJson<DashboardData['map']>($, `${paths.poke}/mapa.json`)
     const wild = await readJson<Array<{ numero: number; nome: string } | number>>($, `${paths.poke}/selvagens.json`)
@@ -608,30 +550,41 @@ const refreshDashboard = async ($: EngineInterface, repoPath: string): Promise<v
     errors.push(`sprites: ${shortError(error)}`)
   }
 
-  next.errors = errors
   next.updatedAt = Date.now()
-  await update($, dashboard, () => next)
-  const summary = abovePromptText(next)
-  $.ui.status(summary)
+  const saved = await update($, dashboard, state => ({
+    ...next,
+    tarefas: state.tarefas,
+    resumo: state.resumo,
+    cotas: state.cotas,
+    errors: [...errors, ...state.errors.filter(error => error.startsWith('jobs:'))],
+  }))
+  $.ui.status(abovePromptText(saved))
 }
 
-const refreshJobs = async ($: EngineInterface, repoPath: string): Promise<void> => {
-  const current = await read($, dashboard)
+const TAREFAS_STALE_MS = 5000
+
+// O status.py é o único escritor do cache; aqui só se lê. Cache velho ou ausente pede um --jobs, que o regrava.
+const loadTarefas = async ($: EngineInterface, repoPath: string): Promise<TarefasJson> => {
+  const paths = await runtimePaths($)
+  const cached = await readJson<TarefasJson>($, paths.jobsCache)
+  if (cached?.ts !== undefined && Date.now() - cached.ts * 1000 < TAREFAS_STALE_MS) return cached
+  const result = await $.process.run([
+    'python',
+    `${pathWithoutTrailingSlash(repoPath)}/skills/codex/status.py`,
+    '--jobs',
+  ], { cwd: repoPath, timeoutMs: 30000 })
+  if (result.exitCode !== 0) throw new Error(result.stderr || `jobs exit ${result.exitCode}`)
+  return JSON.parse(result.stdout) as TarefasJson
+}
+
+const refreshTarefas = async ($: EngineInterface, repoPath: string): Promise<void> => {
   try {
-    const result = await $.process.run([
-      'python',
-      `${repoPath.replace(/[\\/]$/, '')}/skills/codex/status.py`,
-      '--jobs',
-    ], { cwd: repoPath, timeoutMs: 30000 })
-    if (result.exitCode !== 0) throw new Error(result.stderr || `jobs exit ${result.exitCode}`)
-    const parsed = JSON.parse(result.stdout) as JobsJson
-    const session = await jobsForSession($, parsed.jobs ?? [])
-    const local = localJobs(await read($, jobs), Date.now())
-    const all = [...session, ...local]
-    const running = all.filter((job, index, list) => list.findIndex(item => item.arquivo === job.arquivo) === index)
+    const parsed = await loadTarefas($, repoPath)
     await update($, dashboard, state => ({
       ...state,
-      running,
+      tarefas: parsed.tarefas ?? [],
+      resumo: parsed.resumo,
+      cotas: parsed.cotas ?? [],
       errors: state.errors.filter(error => !error.startsWith('jobs:')),
     }))
   } catch (error) {
@@ -651,11 +604,14 @@ const abovePromptText = (data: DashboardData): string => {
   const claude = data.claude.find(account => account.active) ?? data.claude[0]
   const claudeFive = usageOf(claude, 'fiveHour')?.pct
   const claudeSeven = usageOf(claude, 'sevenDay')?.pct
-  const first = data.running[0]
+  const running = data.tarefas.flatMap(tarefa => tarefa.agentes).filter(agente => agente.estado === 'rodando')
+  const first = running[0]
+  const count = data.resumo?.rodando ?? running.length
   const label = data.poke
     ? wildName(data, first)
-    : first?.modelo
-  const job = first ? `${data.running.length} job(s) (${label ?? '—'}${first.segundos === undefined ? '' : ` ${formatDuration(first.segundos)}`})` : '0 job(s)'
+    : first?.modelo ?? first?.tipo
+  const seconds = first?.segundos === null || first?.segundos === undefined ? '' : ` ${formatDuration(first.segundos)}`
+  const job = first ? `${count} job(s) (${label ?? '—'}${seconds})` : `${count} job(s)`
   return [
     `claude ${percent(claudeFive)}·${percent(claudeSeven)}`,
     `codex ${percent(data.codexFiveHour)}·${percent(data.codexSevenDay)}`,
@@ -663,205 +619,93 @@ const abovePromptText = (data: DashboardData): string => {
   ].join('  ')
 }
 
-const formatDuration = (seconds: number): string =>
-  `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`
+const pad2 = (value: number): string => value.toString().padStart(2, '0')
 
-const wildName = (data: DashboardData, job: DashboardJob | undefined): string | undefined => {
-  if (!job || data.wild.length === 0) return undefined
-  const wild = data.wild[Number(fnv1a64(job.arquivo) % BigInt(data.wild.length))]
+const formatDuration = (seconds: number): string => seconds >= 3600
+  ? `${Math.floor(seconds / 3600)}h${pad2(Math.floor(seconds / 60) % 60)}`
+  : `${pad2(Math.floor(seconds / 60))}:${pad2(seconds % 60)}`
+
+const wildName = (data: DashboardData, agente: TarefaAgente | undefined): string | undefined => {
+  if (!agente || data.wild.length === 0) return undefined
+  const wild = data.wild[Number(fnv1a64(agente.id) % BigInt(data.wild.length))]
   return wild?.nome
 }
 
 const truncate = (text: string, columns: number): string =>
   columns <= 0 ? '' : text.length <= columns ? text : text.slice(0, Math.max(0, columns - 1)) + '…'
 
-const accountName = (email: string): string => email.split('@')[0] || email
+const estadoColor = (estado: TarefaAgente['estado']): 'success' | 'warning' | 'error' | 'subtle' =>
+  estado === 'falhou'
+    ? 'error'
+    : estado === 'pergunta' || estado === 'travado'
+      ? 'warning'
+      : estado === 'rodando'
+        ? 'success'
+        : 'subtle'
 
-const accountSpecies = (data: DashboardData, provider: 'claude' | 'codex', email: string): string | undefined =>
-  data.map[`${provider}:${email}`]?.nome
-
-const sprite = (
-  data: DashboardData,
-  provider: 'claude' | 'codex',
-  email: string,
-  pose: string,
-  key: string,
-  terminal: boolean,
-  Raster: any,
-) => {
-  const cells = data.sprites[`${provider}:${email}:${pose}`]
-  if (!terminal || !cells) return null
-  return <Raster key={key} columns={cells.cols} rows={cells.rows} cells={cells.cells} />
+// tipo · modelo/effort · papel · estado · tempo · progresso (ou o resumo, quando terminou)
+const agentLine = (agente: TarefaAgente): string => {
+  const terminou = agente.estado === 'concluido' || agente.estado === 'falhou'
+  return [
+    agente.tipo,
+    agente.modelo ? `${modelLabel(agente.modelo)}/${agente.effort ?? '—'}` : '—',
+    agente.papel ?? '—',
+    agente.estado,
+    agente.segundos === null ? '—' : formatDuration(agente.segundos),
+    (terminou ? agente.resultado : null) ?? agente.progresso ?? '—',
+  ].join(' · ')
 }
 
-const trainerSprite = (data: DashboardData, Raster: any, terminal: boolean, bodyRows: number) => {
-  const cells = data.sprites[trainerSpriteKey(bodyRows)]
-  if (!terminal || !cells) return null
-  return <Raster key="trainer-sprite" columns={cells.cols} rows={cells.rows} cells={cells.cells} />
+export const formatReset = (iso: string | null, now: number): string => {
+  const date = iso ? new Date(iso) : undefined
+  if (!date || Number.isNaN(date.getTime())) return '—'
+  const clock = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  return new Date(now).toDateString() === date.toDateString()
+    ? clock
+    : `${pad2(date.getDate())}/${pad2(date.getMonth() + 1)} ${clock}`
 }
 
-const quotaCell = (
-  account: ClaudeAccount,
-  window: 'fiveHour' | 'sevenDay',
-  width: number,
-) => {
-  const value = usageOf(account, window)
-  const age = account.usage?.[window] ? undefined : account.lastGoodAgeSeconds
-  const ageText = age === undefined ? '' : ` ${Math.max(1, Math.round(age / 60))}m`
-  const details = `${percent(value?.pct)}${ageText}`
-  const countdown = value?.countdown ?? '—'
-  const clock = compactClock(value?.clock)
-  const suffix = width > 35 ? ` ${countdown}${width > 48 ? ` ${clock ?? ''}` : ''}` : ''
-  return `${bar(value?.pct)} ${details}${suffix}`
-}
-
-const renderClaudeAccount = (
-  Text: any,
-  Box: any,
-  Raster: any,
-  data: DashboardData,
-  account: ClaudeAccount,
-  columns: number,
-  terminal: boolean,
-) => {
-  const five = usageOf(account, 'fiveHour')?.pct
-  const seven = usageOf(account, 'sevenDay')?.pct
-  const fainted = [five, seven].some(value => (value ?? 0) >= 100)
-  const species = accountSpecies(data, 'claude', account.email)
-  const label = data.poke && species ? `${species} · ${account.email}` : account.email
-  const marks = account.usageStatus === 'relogin_required'
-    ? ' relogar'
-    : fainted
-      ? ' desmaiou'
-      : ''
-  return (
-    <Box key={`claude-${account.email}`} flexDirection="row" gap={1}>
-      {sprite(
-        data,
-        'claude',
-        account.email,
-        account.active ? 'costas-g' : 'front-p',
-        `claude-sprite-${account.email}`,
-        terminal,
-        Raster,
-      )}
-      <Text dimColor={fainted}>
-        {account.active ? '● ' : '○ '}{truncate(label, Math.max(12, columns - 42))}{marks}
-      </Text>
-      <Text color={usageColor(five)}>{quotaCell(account, 'fiveHour', columns)}</Text>
-      <Text color={usageColor(seven)}>{quotaCell(account, 'sevenDay', columns)}</Text>
-    </Box>
-  )
+const quotaLines = (cotas: TarefaCota[], now: number): string[] => {
+  const contas = [...new Set(cotas.map(cota => cota.conta))]
+  return contas.map(conta => `${conta} ${cotas
+    .filter(cota => cota.conta === conta)
+    .map(cota => `${windowLabel(cota.janela)} ${percent(cota.pct ?? undefined)}`
+      + ` (reseta ${formatReset(cota.resetaEm, now)})`)
+    .join(' · ')}`)
 }
 
 const renderDashboardPane = async (
   $: EngineInterface,
   e: RenderInput<'Pane'>,
-): Promise<unknown> => {
-  const { Box, Text, Button, Raster } = $.ui.resolve(e)
+): Promise<RenderElement> => {
+  const { Box, Text } = $.ui.resolve(e)
   const data = await read($, dashboard)
-  const currentQuota = await read($, quota)
-  const list = await read($, jobs)
-  const terminal = e.surface === 'terminal'
   const now = Date.now()
-  const activeClaude = data.claude.find(account => account.active) ?? data.claude[0]
-  const codex = selectQuotaAccount(currentQuota)
-  const running = data.running
-  const current = list.find(job => job.status === 'rodando')
-  const currentLabel = current
-    ? `${current.cwd.split(/[\\/]/).pop() ?? current.cwd} · ${formatDuration(duration(current, now))}`
-    : 'aguardando delegação'
-  const codexModel = modelLabel(currentQuota.model ?? current?.modelo ?? '—')
-  const codexEffort = currentQuota.effort ?? current?.effort ?? '—'
-  const pokeButton = (
-    <Button key="poke" hotkey="p" plain onPress={async () => setPokeMode($, !data.poke)}>
-      {data.poke ? 'p: sóbrio' : 'p: Pokémon'}
-    </Button>
-  )
-  const errors = data.errors.map(error => <Text key={error} color="error">{error}</Text>)
-  if (data.poke) {
-    const wildRows = running.map(job => (
-      <Text key={`wild-${job.arquivo}`}>
-        {wildName(data, job) ?? 'selvagem'} selvagem · {job.projeto}{job.segundos === undefined ? '' : ` · ${formatDuration(job.segundos)}`}
-      </Text>
-    ))
-    return (
-      <Box flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between">
-          <Text color="success">CENTRO DE COMANDO // HERMES</Text>
-          {pokeButton}
-        </Box>
-        <Box flexDirection="row" gap={1}>
-          {activeClaude
-            ? sprite(data, 'claude', activeClaude.email, 'costas-g', 'active-claude', terminal, Raster)
-            : null}
-          {trainerSprite(data, Raster, terminal, e.props.scroll.bodyRows)}
-          <Text color="claude">
-            CLAUDE · {accountName(activeClaude?.email ?? '—')} · HP{' '}
-            {percent(activeClaude
-              ? 100 - (usageOf(activeClaude, 'fiveHour')?.pct ?? 0)
-              : undefined)}
-          </Text>
-        </Box>
-        <Text color="subtle">delegação atual · {currentLabel}</Text>
-        <Box flexDirection="row" gap={1}>
-          {codex?.email ? sprite(data, 'codex', codex.email, 'front-g', 'active-codex', terminal, Raster) : null}
-          <Text color="success">CODEX · {accountName(codex?.email ?? '—')} · {codexModel}/{codexEffort}</Text>
-        </Box>
-        <Text color="subtle">RODANDO AGORA</Text>
-        {wildRows.length > 0 ? wildRows : <Text dimColor>nenhuma delegação em andamento</Text>}
-        <Text color="subtle">CLAUDE</Text>
-        {data.claude.map(account => renderClaudeAccount(
-          Text,
-          Box,
-          Raster,
-          data,
-          account,
-          e.props.bodyColumns,
-          terminal,
-        ))}
-        <Text color="subtle">CODEX</Text>
-        <Text>
-          {codex
-            ? `${accountName(codex.email ?? '—')} · ${codex.plano} · ${codexModel}/${codexEffort}`
-            : 'carregando…'}
+  const columns = e.props.bodyColumns
+  const resumo = data.resumo
+  const groups = data.tarefas.map(tarefa => (
+    <Box key={`tarefa-${tarefa.nome}`} flexDirection="column">
+      <Text color="claude">{truncate(tarefa.nome, columns)}</Text>
+      {tarefa.agentes.map(agente => (
+        <Text key={`agente-${agente.id}`} color={estadoColor(agente.estado)}>
+          {truncate(`  ${agentLine(agente)}`, columns)}
         </Text>
-        {errors}
-      </Box>
-    )
-  }
+      ))}
+    </Box>
+  ))
+  const summary = resumo
+    ? `rodando ${resumo.rodando} · feitos hoje ${resumo.feitosHoje} · voltaram ${resumo.voltaram}`
+      + ` · falharam ${resumo.falharam}`
+    : 'resumo indisponível'
   return (
     <Box flexDirection="column">
-      <Box flexDirection="row" justifyContent="space-between"><Text color="success">AGORA</Text>{pokeButton}</Box>
-      <Box flexDirection="row" gap={2}>
-        <Text color="claude">CLAUDE · {accountName(activeClaude?.email ?? '—')}</Text>
-        <Text color="subtle">{currentLabel}</Text>
-        <Text color="success">CODEX · {accountName(codex?.email ?? '—')} · {codexModel}/{codexEffort}</Text>
-      </Box>
-      <Text color="subtle">RODANDO AGORA</Text>
-      {running.length > 0 ? running.map(job => (
-        <Text key={`job-${job.arquivo}`}>
-          {job.agentStatus ? `${job.agentStatus} ` : ''}
-          {job.tipo.toUpperCase()} · {modelLabel(job.modelo)} | {job.projeto}{job.segundos === undefined ? '' : ` | ${formatDuration(job.segundos)}`}
-        </Text>
-      )) : <Text dimColor>nenhuma delegação em andamento</Text>}
-      <Text color="subtle">CLAUDE</Text>
-      {data.claude.map(account => renderClaudeAccount(
-        Text,
-        Box,
-        Raster,
-        data,
-        account,
-        e.props.bodyColumns,
-        terminal,
+      <Text color="success">CENTRO DE COMANDO</Text>
+      {groups.length > 0 ? groups : <Text dimColor>nenhuma tarefa nas últimas 2 h</Text>}
+      <Text color="subtle">{truncate(summary, columns)}</Text>
+      {quotaLines(data.cotas, now).map(line => (
+        <Text key={`cota-${line}`} color="subtle">{truncate(line, columns)}</Text>
       ))}
-      <Text color="subtle">CODEX</Text>
-      <Text>
-        {codex
-          ? `${accountName(codex.email ?? '—')} · ${codex.plano} · ${codexModel} · ${codexEffort}`
-          : 'carregando…'}
-      </Text>
-      {errors}
+      {data.errors.map(error => <Text key={error} color="error">{truncate(error, columns)}</Text>)}
     </Box>
   )
 }
@@ -872,7 +716,6 @@ export const register: Register = (on, options) => {
   let lastSuggestedTurn = 0
   let currentTurn = 0
   let lastJobsPoll = 0
-  let refreshPaneOnRender = false
   const filesThisTurn = new Set<string>()
 
   on('session.start', async ($, e, next) => {
@@ -889,6 +732,8 @@ export const register: Register = (on, options) => {
           effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], default: 'medium' },
           cwd: { type: 'string' },
           saida: { type: 'string' },
+          tarefa: { type: 'string' },
+          papel: { type: 'string', enum: [...PAPEIS] },
         },
         required: ['prompt'],
       },
@@ -915,7 +760,7 @@ export const register: Register = (on, options) => {
       const interval = jobsPollingInterval(placed)
       if (now - lastJobsPoll < interval) return
       lastJobsPoll = now
-      void refreshJobs($, String(options.repoPath))
+      void refreshTarefas($, String(options.repoPath))
     })
     return next(e)
   })
@@ -952,7 +797,8 @@ export const register: Register = (on, options) => {
       }
       await update($, jobs, list => trimJobHistory([...list, job]))
       const isGitRepo = await isGitRepository($, cwd, sessionCwd)
-      void startJob($, job, input.prompt, isGitRepo, paths.codex)
+      const prompt = `${jobMarker(id, input.tarefa, input.papel)}\n${input.prompt}`
+      void startJob($, job, prompt, isGitRepo, paths.codex)
 
       const result = { job_id: id, saida, mensagem: 'O resultado chega depois, em background.' }
       return { result: JSON.stringify(result) }
@@ -1027,19 +873,14 @@ export const register: Register = (on, options) => {
       await setPokeMode($, !current.poke)
       return { text: `Modo Pokémon ${!current.poke ? 'ligado' : 'desligado'}.` }
     }
-    refreshPaneOnRender = true
+    // O render é puro e não grava estado: a recarga sai daqui, do comando que abre o pane.
+    lastJobsPoll = Date.now()
+    void refreshTarefas($, String(options.repoPath))
     await $.ui.open({ id: PANE, title: 'Codex', rows: 12 })
     return { text: 'Painel do Codex aberto.' }
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    if (refreshPaneOnRender) {
-      refreshPaneOnRender = false
-      lastJobsPoll = Date.now()
-      void refreshJobs($, String(options.repoPath))
-    }
-    return renderDashboardPane($, e)
-  })
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => renderDashboardPane($, e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || e.props.maxRows < 1) return next(e)
