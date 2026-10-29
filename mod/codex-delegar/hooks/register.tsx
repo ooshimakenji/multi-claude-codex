@@ -178,18 +178,15 @@ const modelLabel = (model: string): string => model.replace(/^gpt-/, '')
 
 const jobSeconds = (job: CodexJob, now: number): number => duration(job, now)
 
-const dashboardJobOf = (job: CodexJob, now: number): DashboardJob => ({
-  tipo: 'codex',
-  modelo: job.modelo,
-  effort: job.effort,
-  projeto: job.cwd.split(/[\\/]/).pop() ?? job.cwd,
-  segundos: jobSeconds(job, now),
-  arquivo: job.saida,
-})
-
 const localJobs = (list: CodexJob[], now: number): DashboardJob[] => list
   .filter(job => job.status === 'rodando')
-  .map(job => dashboardJobOf(job, now))
+  .map(job => ({
+    tipo: 'codex',
+    modelo: job.modelo,
+    projeto: job.cwd.split(/[\\/]/).pop() ?? job.cwd,
+    segundos: jobSeconds(job, now),
+    arquivo: job.saida,
+  }))
 
 const readSprite = async ($: Parameters<typeof read>[0], path: string): Promise<RasterSprite | undefined> => {
   return await readJson<RasterSprite>($, path)
@@ -256,14 +253,6 @@ const readOutput = async ($: Parameters<typeof read>[0], path: string): Promise<
   return await $.fs.read(path)
 }
 
-const alternativeModel = (model: string): string =>
-  /terra$/.test(model) ? 'gpt-5.6-luna' : 'gpt-5.6-terra'
-
-const resolveOutputPath = (cwd: string, output: string): string =>
-  /^(?:[A-Za-z]:[\\/]|[\\/])/.test(output)
-    ? output
-    : `${cwd.replace(/[\\/]$/, '')}/${output.replace(/^[\\/]+/, '')}`
-
 const finishJob = async (
   $: Parameters<typeof read>[0],
   job: CodexJob,
@@ -279,14 +268,14 @@ const finishJob = async (
   let status: CodexJob['status'] = 'falhou'
   let motivo = tail(diagnostics || output || `exit code ${exitCode}`)
 
-  if (answer !== undefined && answer.length > 200) {
-    status = 'ok'
-    motivo = ''
-  } else if (`${output}\n${diagnostics}`.includes('Selected model is at capacity')) {
-    motivo = `modelo sem capacidade, relançar em ${alternativeModel(job.modelo)}`
+  if (`${output}\n${diagnostics}`.includes('Selected model is at capacity')) {
+    motivo = 'modelo sem capacidade, relançar em gpt-5.6-terra'
   } else if (!job.perguntaExistia && hasQuestion) {
     status = 'pergunta'
     motivo = question
+  } else if (answer !== undefined && answer.length > 200) {
+    status = 'ok'
+    motivo = ''
   }
 
   await updateJob($, job.id, current => ({
@@ -294,10 +283,6 @@ const finishJob = async (
     status,
     finishedAt: now,
     motivo: motivo || undefined,
-  }))
-  await update($, dashboard, current => ({
-    ...current,
-    running: current.running.filter(item => item.arquivo !== job.saida),
   }))
   $.ui.toast(`${status} ${job.saida}`)
 }
@@ -551,15 +536,11 @@ const abovePromptText = (data: DashboardData): string => {
   const claude = data.claude.find(account => account.active) ?? data.claude[0]
   const claudeFive = usageOf(claude ?? {}, 'fiveHour')?.pct
   const claudeSeven = usageOf(claude ?? {}, 'sevenDay')?.pct
-  const jobDetail = (job: DashboardJob): string => {
-    const effort = job.effort === undefined ? '' : ` ${job.effort}`
-    const seconds = job.segundos === undefined ? '' : ` ${formatDuration(job.segundos)}`
-    return `${modelLabel(job.modelo)}${effort}${seconds}`
-  }
-  const jobDetails = data.running.map(jobDetail)
-  const job = data.running.length > 0
-    ? `${data.running.length} rodando (${jobDetails.join(', ')})`
-    : '0 rodando'
+  const first = data.running[0]
+  const label = data.poke
+    ? wildName(data, first)
+    : first?.modelo
+  const job = first ? `${data.running.length} job(s) (${label ?? '—'}${first.segundos === undefined ? '' : ` ${formatDuration(first.segundos)}`})` : '0 job(s)'
   return [
     `claude ${percent(claudeFive)}·${percent(claudeSeven)}`,
     `codex ${percent(data.codexFiveHour)}·${percent(data.codexSevenDay)}`,
@@ -777,7 +758,6 @@ export const register: Register = (on, options) => {
   let currentTurn = 0
   let lastJobsPoll = 0
   let refreshPaneOnRender = false
-  let paneOpenedForDelegation = false
   const filesThisTurn = new Set<string>()
 
   on('session.start', async ($, e, next) => {
@@ -831,7 +811,7 @@ export const register: Register = (on, options) => {
     const modelo = input.modelo ?? 'gpt-5.6-luna'
     const effort = input.effort ?? 'medium'
     const id = `${Date.now()}-${nextJob++}`
-    const saida = resolveOutputPath(cwd, input.saida ?? await createOutputPath($, id))
+    const saida = input.saida ?? await createOutputPath($, id)
     const perguntaPath = `${cwd}/PERGUNTA.md`
     const perguntaExistia = await $.fs.exists(perguntaPath)
     const job: CodexJob = {
@@ -845,17 +825,6 @@ export const register: Register = (on, options) => {
       perguntaExistia,
     }
     await update($, jobs, list => [...list, job])
-    await update($, dashboard, current => ({
-      ...current,
-      running: [
-        ...current.running.filter(item => item.arquivo !== job.saida),
-        dashboardJobOf(job, Date.now()),
-      ],
-    }))
-    if (!paneOpenedForDelegation) {
-      await $.ui.open({ id: PANE, title: 'Codex', rows: 12 })
-      paneOpenedForDelegation = true
-    }
     const isGitRepo = await isGitRepository($, cwd, sessionCwd)
     void startJob($, job, input.prompt, isGitRepo)
 
