@@ -449,7 +449,7 @@ test('pane agrupa a fixture tarefas.json por tarefa', { options }, async ($, on)
   mock.env(on, { USERPROFILE: 'C:/Users/test' })
   const lidos: string[] = []
   on('fs.read', ($, e) => {
-    lidos.push(e.path)
+    lidos.push(e.path.replace(/\\/g, '/'))
     return { value: JSON.stringify({ ...fixture, ts: Date.now() / 1000 }) }
   })
   on('process.run', () => {
