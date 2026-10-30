@@ -5371,12 +5371,12 @@ mod tests {
         let at_min = column_widths(min + gaps, gaps, &cols).expect("cabem no minimo");
         let at_ideal = column_widths(ideal + gaps, gaps, &cols).expect("cabem no ideal");
         let intermediate = column_widths(7.5 + gaps, gaps, &cols).expect("cabem no intermediario");
-        let at_extra = column_widths(15.0 + gaps, gaps, &cols).expect("cabe com espaço extra");
+        let at_extra = column_widths(25.0 + gaps, gaps, &cols).expect("cabe com espaço extra");
 
         assert!((at_min.iter().sum::<f32>() - min).abs() < f32::EPSILON);
         assert!((at_ideal.iter().sum::<f32>() - ideal).abs() < f32::EPSILON);
-        // Com espaço extra acima do ideal, a primeira coluna recebe o leftover
-        assert!((at_extra.iter().sum::<f32>() - 15.0).abs() < f32::EPSILON);
+        // Com espaço extra acima do ideal, a primeira coluna recebe o leftover menos 8px de margem
+        assert!((at_extra.iter().sum::<f32>() - (25.0 - 8.0)).abs() < f32::EPSILON);
         assert!(column_widths(min + gaps - 1.0, gaps, &cols).is_none());
         assert!(intermediate.iter().sum::<f32>() <= 7.5 + f32::EPSILON);
     }
