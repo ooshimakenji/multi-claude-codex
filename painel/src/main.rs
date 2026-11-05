@@ -32,7 +32,7 @@ use winapi::{
         timezoneapi::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         winuser::{
             CreateIcon, ReleaseCapture, SendMessageW, ICON_BIG, ICON_SMALL, WM_NCLBUTTONDOWN,
-            WM_SETICON,
+            WM_SETICON, SPI_GETWORKAREA, SystemParametersInfoW,
         },
     },
 };
@@ -5238,6 +5238,30 @@ fn format_number(number: f64) -> String {
     }
 }
 
+#[cfg(windows)]
+fn initial_work_area_viewport() -> Option<([f32; 2], [f32; 2])> {
+    let mut work_area = std::mem::MaybeUninit::<winapi::shared::windef::RECT>::uninit();
+    let success = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            work_area.as_mut_ptr().cast(),
+            0,
+        ) != 0
+    };
+    if !success {
+        return None;
+    }
+
+    let work_area = unsafe { work_area.assume_init() };
+    let width = (work_area.right - work_area.left) as f32;
+    let height = ((work_area.bottom - work_area.top) as f32).min(INITIAL_INNER_HEIGHT);
+    (width > 0.0 && height > 0.0).then_some((
+        [width, height],
+        [work_area.left as f32, work_area.top as f32],
+    ))
+}
+
 fn main() -> eframe::Result<()> {
     let hook_anterior = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -5291,9 +5315,16 @@ fn main() -> eframe::Result<()> {
     if env::var("PAINEL_PANIC_TESTE").as_deref() == Ok("1") {
         panic!("teste de panic.log");
     }
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([INITIAL_INNER_WIDTH, INITIAL_INNER_HEIGHT]);
+    #[cfg(windows)]
+    if let Some((inner_size, position)) = initial_work_area_viewport() {
+        viewport = viewport
+            .with_inner_size(inner_size)
+            .with_position(position);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([INITIAL_INNER_WIDTH, INITIAL_INNER_HEIGHT])
+        viewport: viewport
             .with_min_inner_size([MIN_INNER_WIDTH, MIN_INNER_HEIGHT])
             .with_resizable(true)
             .with_decorations(false)
