@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -1115,6 +1117,12 @@ fn action_error(slot: &Mutex<Option<String>>) -> Option<String> {
 /// sem isso o filho herdaria o console do painel e uma leitura acidental
 /// travaria pra sempre em vez de fechar na hora.
 fn saida_com_timeout(cmd: &mut Command, limite: Duration) -> Result<Output, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
