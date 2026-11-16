@@ -12,6 +12,7 @@ import {
   mergeCache,
   mergePokeConfig,
   parseStatusSnapshot,
+  resolveCodexHome,
   selectQuotaAccount,
   spriteNumber,
   trainerSpriteKey,
@@ -83,6 +84,50 @@ test('poke toggle preserves unrelated config keys', { options }, () => {
     tema: 'escuro',
     modo_poke: true,
   })
+})
+
+test('resolveCodexHome usa CODEX_HOME quando Orca não o sobrescreve', { options }, async () => {
+  const values = { CODEX_HOME: 'C:/Users/test/.codex-b' }
+  const engine = { env: { get: async (name: keyof typeof values) => values[name] } } as any
+  expect(await resolveCodexHome(engine)).toBe('C:/Users/test/.codex-b')
+})
+
+test('resolveCodexHome usa CODEX_HOME do registro quando Orca o sobrescreve', { options }, async () => {
+  const values = {
+    CODEX_HOME: 'C:/Users/test/.codex-b',
+    ORCA_CODEX_HOME: 'c:\\users\\test/.CODEX-B\\',
+  }
+  const child = {
+    result: Promise.resolve({ code: 0, signal: null }),
+    async *[Symbol.asyncIterator]() {
+      yield { stream: 'stdout', text: '    CODEX_HOME    REG_EXPAND_SZ    C:\\Users\\test\\.codex-b\r\n' }
+    },
+  }
+  const engine = {
+    env: { get: async (name: keyof typeof values) => values[name] },
+    process: { spawn: (request: { argv: readonly string[] }) => {
+      expect(request.argv).toEqual(['reg', 'query', 'HKCU\\Environment', '/v', 'CODEX_HOME'])
+      return child
+    } },
+  } as any
+  expect(await resolveCodexHome(engine)).toBe('C:\\Users\\test\\.codex-b')
+})
+
+test('resolveCodexHome cai no perfil padrão quando reg query falha', { options }, async () => {
+  const values = {
+    CODEX_HOME: 'C:/Users/test/.codex-b',
+    ORCA_CODEX_HOME: 'C:/Users/test/.codex-b',
+    USERPROFILE: 'C:/Users/test',
+  }
+  const child = {
+    result: Promise.resolve({ code: 1, signal: null }),
+    async *[Symbol.asyncIterator]() {},
+  }
+  const engine = {
+    env: { get: async (name: keyof typeof values) => values[name] },
+    process: { spawn: () => child },
+  } as any
+  expect(await resolveCodexHome(engine)).toBe('C:/Users/test/.codex')
 })
 
 test('delegar_codex monta argv, stdin e skip-git-repo-check fora de git', { options }, async ($, on) => {

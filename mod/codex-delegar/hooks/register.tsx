@@ -112,6 +112,33 @@ type RuntimePaths = {
 
 const pathWithoutTrailingSlash = (value: string): string => value.replace(/[\\/]$/, '')
 
+const samePath = (left: string, right: string): boolean =>
+  pathWithoutTrailingSlash(left).replace(/\\/g, '/').toLowerCase()
+  === pathWithoutTrailingSlash(right).replace(/\\/g, '/').toLowerCase()
+
+export const resolveCodexHome = async ($: EngineInterface): Promise<string | undefined> => {
+  const codexHome = await $.env.get('CODEX_HOME')
+  const orcaCodexHome = await $.env.get('ORCA_CODEX_HOME')
+  if (orcaCodexHome !== undefined && codexHome !== undefined && samePath(orcaCodexHome, codexHome)) {
+    try {
+      const child = $.process.spawn({ argv: ['reg', 'query', 'HKCU\\Environment', '/v', 'CODEX_HOME'] })
+      let stdout = ''
+      for await (const chunk of child) {
+        if (chunk.stream === 'stdout') stdout += chunk.text
+      }
+      const result = await child.result
+      const match = result.code === 0
+        ? stdout.match(/^\s*CODEX_HOME\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/im)
+        : undefined
+      if (match?.[1]) return match[1]
+    } catch {
+      // The user profile fallback below preserves the default Codex location.
+    }
+    return `${(await $.env.get('USERPROFILE')) ?? WINDOWS_HOME_FALLBACK}/.codex`
+  }
+  return codexHome
+}
+
 const runtimePaths = async ($: EngineInterface): Promise<RuntimePaths> => {
   const home = pathWithoutTrailingSlash(
     (await $.env.get('USERPROFILE'))
@@ -133,7 +160,7 @@ const runtimePaths = async ($: EngineInterface): Promise<RuntimePaths> => {
 }
 
 const activeCodexProfile = async ($: EngineInterface): Promise<string> => pathWithoutTrailingSlash(
-  (await $.env.get('CODEX_HOME')) ?? `${(await $.env.get('USERPROFILE')) ?? WINDOWS_HOME_FALLBACK}/.codex`,
+  (await resolveCodexHome($)) ?? `${(await $.env.get('USERPROFILE')) ?? WINDOWS_HOME_FALLBACK}/.codex`,
 ).split(/[\\/]/).pop() ?? '.codex'
 
 type CacheEntry<T> = { ts: number; data: T }
@@ -382,7 +409,13 @@ const startJob = async (
   argv.push('-C', job.cwd, '-o', job.saida, '-')
 
   try {
-    const child = $.process.spawn({ argv, cwd: job.cwd, input: prompt })
+    const codexHome = await resolveCodexHome($)
+    const child = $.process.spawn({
+      argv,
+      cwd: job.cwd,
+      input: prompt,
+      ...(codexHome === undefined ? {} : { env: { CODEX_HOME: codexHome } }),
+    })
     let stdout = ''
     let stderr = ''
 
