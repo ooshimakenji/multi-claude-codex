@@ -278,7 +278,7 @@ struct PanelApp {
     cswap: Option<Result<Value, String>>,
     status_err_streak: u32,
     cswap_err_streak: u32,
-    confirmar_troca_org: Option<(i64, Instant)>,
+    confirmar_troca_org: Option<(i64, &'static str, Instant)>,
     fixacao: Option<Value>,
     codex_last_used_profile: Option<String>,
     codex_active_profile: Option<String>,
@@ -1307,6 +1307,16 @@ fn email_esta_fixado(fixacao: Option<&Value>, email: &str) -> bool {
         .is_some_and(|fixed_email| fixed_email.eq_ignore_ascii_case(email))
 }
 
+fn tipo_fixacao(fixacao: Option<&Value>) -> &'static str {
+    match fixacao
+        .and_then(|value| value.get("tipo"))
+        .and_then(Value::as_str)
+    {
+        Some("final") => "final",
+        _ => "temporario",
+    }
+}
+
 fn run_cswap_number(executable: &Path, action: &str, number: i64) -> bool {
     // So SETA erro aqui, nunca limpa: fix_claude_account (unico chamador)
     // roda varios run_cswap_number numa acao so (enable* + switch + disable*),
@@ -1337,7 +1347,7 @@ fn run_cswap_number(executable: &Path, action: &str, number: i64) -> bool {
     }
 }
 
-fn write_fixacao(path: &Path, email: &str, numbers: &[i64]) -> bool {
+fn write_fixacao(path: &Path, email: &str, numbers: &[i64], tipo: &str) -> bool {
     let Some(directory) = path.parent() else {
         return false;
     };
@@ -1353,6 +1363,7 @@ fn write_fixacao(path: &Path, email: &str, numbers: &[i64]) -> bool {
         "desde": desde,
         "desabilitou": numbers,
         "ultimo_pct": null,
+        "tipo": tipo,
     })
     .to_string()
         + "\n";
@@ -1367,7 +1378,26 @@ fn write_fixacao(path: &Path, email: &str, numbers: &[i64]) -> bool {
     true
 }
 
-fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTarget>) {
+fn liberar_fixacao(executable: &Path, state_path: &Path) {
+    if state_path.is_file() {
+        if let Some(fixacao) = read_json_file(state_path) {
+            if let Some(numbers) = fixacao.get("desabilitou").and_then(Value::as_array) {
+                for number in numbers.iter().filter_map(Value::as_i64) {
+                    run_cswap_number(executable, "enable", number);
+                }
+            }
+        }
+        let _ = fs::remove_file(state_path);
+    }
+}
+
+fn fix_claude_account(
+    number: i64,
+    email: String,
+    accounts: Vec<ClaudeAccountTarget>,
+    tipo: &'static str,
+    ja_ativa: bool,
+) {
     // Limpa no INICIO da acao (nao a cada chamada que der certo): assim um
     // erro de uma etapa anterior (ex.: falhou desabilitar a conta 2) sobrevive
     // ate o fim mesmo que uma etapa posterior (ex.: desabilitar a conta 4)
@@ -1386,22 +1416,13 @@ fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTar
     };
     let state_path = directory.join("cswap-fixada.json");
 
-    if state_path.is_file() {
-        if let Some(fixacao) = read_json_file(&state_path) {
-            if let Some(numbers) = fixacao.get("desabilitou").and_then(Value::as_array) {
-                for number in numbers.iter().filter_map(Value::as_i64) {
-                    run_cswap_number(&executable, "enable", number);
-                }
-            }
-        }
-        let _ = fs::remove_file(&state_path);
-    }
+    liberar_fixacao(&executable, &state_path);
 
     // "switch" segue exatamente o mesmo padrao de run_cswap_number (mesmos
     // args, mesma mensagem de erro "cswap switch {number}: ..."), entao
     // reusa a funcao em vez de duplicar o match -- e ja sai com timeout e
     // erro visivel na UI de graca.
-    if !run_cswap_number(&executable, "switch", number) {
+    if !ja_ativa && !run_cswap_number(&executable, "switch", number) {
         return;
     }
 
@@ -1414,7 +1435,7 @@ fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTar
         })
         .map(|account| account.number)
         .collect::<Vec<_>>();
-    if !write_fixacao(&state_path, &email, &numbers) {
+    if !write_fixacao(&state_path, &email, &numbers, tipo) {
         set_action_error(
             &CLAUDE_ACTION_ERROR,
             "cswap fixação: não foi possível gravar o estado".to_owned(),
@@ -1424,6 +1445,22 @@ fn fix_claude_account(number: i64, email: String, accounts: Vec<ClaudeAccountTar
     for number in numbers {
         run_cswap_number(&executable, "disable", number);
     }
+}
+
+fn soltar_fixacao() {
+    clear_action_error(&CLAUDE_ACTION_ERROR);
+    let Some(executable) = cswap_executable() else {
+        set_action_error(&CLAUDE_ACTION_ERROR, "cswap não encontrado".to_owned());
+        return;
+    };
+    let Some(directory) = claude_config_dir() else {
+        set_action_error(
+            &CLAUDE_ACTION_ERROR,
+            "diretório de config do Claude não encontrado".to_owned(),
+        );
+        return;
+    };
+    liberar_fixacao(&executable, &directory.join("cswap-fixada.json"));
 }
 
 fn read_http_response(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -3127,20 +3164,24 @@ fn show_running_jobs(
 
 fn decidir_clique_usar(
     outra_org: bool,
-    pendente: Option<(i64, Instant)>,
+    pendente: Option<(i64, &'static str, Instant)>,
     number: i64,
+    tipo: &'static str,
     agora: Instant,
-) -> (bool, Option<(i64, Instant)>) {
+) -> (bool, Option<(i64, &'static str, Instant)>) {
     if !outra_org {
         return (true, pendente);
     }
-    if let Some((numero, pedido)) = pendente {
-        if numero == number && agora.saturating_duration_since(pedido) < Duration::from_secs(8) {
+    if let Some((numero, tipo_pendente, pedido)) = pendente {
+        if numero == number
+            && tipo_pendente == tipo
+            && agora.saturating_duration_since(pedido) < Duration::from_secs(8)
+        {
             return (true, None);
         }
     }
     // Exige dois cliques para proteger sessões abertas em outra organização.
-    (false, Some((number, agora)))
+    (false, Some((number, tipo, agora)))
 }
 
 fn show_claude(
@@ -3148,7 +3189,7 @@ fn show_claude(
     content_width: f32,
     cswap: Option<&Result<Value, String>>,
     fixacao: Option<&Value>,
-    confirmar_troca_org: &mut Option<(i64, Instant)>,
+    confirmar_troca_org: &mut Option<(i64, &'static str, Instant)>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -3281,6 +3322,7 @@ fn show_claude(
                         .unwrap_or("")
                         .to_owned();
                     let fixada = email_esta_fixado(fixacao, &email);
+                    let tipo_atual = tipo_fixacao(fixacao);
                     let em_espera = disabled && fixacao_tem_numero(fixacao, number);
                     let outra_org = account
                         .get("organizationUuid")
@@ -3370,19 +3412,22 @@ fn show_claude(
                                         } else {
                                             0.0
                                         };
-                                        let can_use = !active
+                                        let can_use = !fixada
                                             && number.is_some()
                                             && (!disabled || em_espera);
                                         let confirmar = number.is_some_and(|number| {
                                             outra_org
-                                                && confirmar_troca_org.is_some_and(|(pendente, pedido)| {
+                                                && confirmar_troca_org.is_some_and(|(pendente, _, pedido)| {
                                                     pendente == number
                                                         && pedido.elapsed() < Duration::from_secs(8)
                                                 })
                                         });
-                                        let usar_texto = if confirmar { "confirmar" } else { "usar" };
                                         let usar_width = if can_use {
-                                            text_width(usar_texto) + ui.spacing().item_spacing.x
+                                            text_width("confirmar") * 2.0 + ui.spacing().item_spacing.x * 2.0
+                                        } else if fixada {
+                                            text_width("soltar")
+                                                + text_width(if tipo_atual == "final" { "temp" } else { "fixar" })
+                                                + ui.spacing().item_spacing.x * 2.0
                                         } else {
                                             0.0
                                         };
@@ -3392,7 +3437,8 @@ fn show_claude(
                                             0.0
                                         };
                                         let fixada_width = if fixada {
-                                            text_width("fixada") + ui.spacing().item_spacing.x
+                                            text_width(if tipo_atual == "final" { "fixada" } else { "temporária" })
+                                                + ui.spacing().item_spacing.x
                                         } else {
                                             0.0
                                         };
@@ -3432,40 +3478,86 @@ fn show_claude(
                                         }
                                         if fixada {
                                             ui.add_sized(
-                                                [text_width("fixada"), 20.0],
-                                                egui::Label::new(dim_text("fixada")).truncate(true),
+                                                [text_width(if tipo_atual == "final" { "fixada" } else { "temporária" }), 20.0],
+                                                egui::Label::new(dim_text(if tipo_atual == "final" { "fixada" } else { "temporária" })).truncate(true),
                                             );
                                         }
                                         if can_use {
                                             if let Some(number) = number {
-                                                let hover = if confirmar {
-                                                    "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
-                                                } else if outra_org {
-                                                    "fixar esta conta até 100% · as outras ficam em espera · outra organização"
-                                                } else {
-                                                    "fixar esta conta até 100% · as outras ficam em espera"
-                                                };
-                                                if ui
-                                                    .add(egui::Button::new(pixel_text(usar_texto, 9.0)))
-                                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                    .on_hover_text(hover)
-                                                    .clicked()
-                                                {
-                                                    let (trocar, novo_estado) = decidir_clique_usar(
-                                                        outra_org,
-                                                        *confirmar_troca_org,
-                                                        number,
-                                                        Instant::now(),
-                                                    );
-                                                    *confirmar_troca_org = novo_estado;
-                                                    if trocar {
-                                                        let email = email.clone();
-                                                        let accounts = accounts_for_fixation.clone();
-                                                        thread::spawn(move || {
-                                                            fix_claude_account(number, email, accounts);
-                                                        });
+                                                for tipo in ["final", "temporario"] {
+                                                    let confirmar_tipo = confirmar
+                                                        && confirmar_troca_org
+                                                            .is_some_and(|(_, pendente, _)| pendente == tipo);
+                                                    let texto = if confirmar_tipo {
+                                                        "confirmar"
+                                                    } else if tipo == "final" {
+                                                        "fixar"
+                                                    } else {
+                                                        "temp"
+                                                    };
+                                                    let hover = if confirmar_tipo {
+                                                        "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
+                                                    } else if tipo == "final" {
+                                                        "fixar até a conta estourar (100% em 5h ou na semana) · as outras ficam em espera"
+                                                    } else {
+                                                        "fixar até a janela de 5h virar · as outras ficam em espera"
+                                                    };
+                                                    if ui
+                                                        .add(egui::Button::new(pixel_text(texto, 9.0)))
+                                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                        .on_hover_text(hover)
+                                                        .clicked()
+                                                    {
+                                                        let (trocar, novo_estado) = decidir_clique_usar(
+                                                            outra_org,
+                                                            *confirmar_troca_org,
+                                                            number,
+                                                            tipo,
+                                                            Instant::now(),
+                                                        );
+                                                        *confirmar_troca_org = novo_estado;
+                                                        if trocar {
+                                                            let email = email.clone();
+                                                            let accounts = accounts_for_fixation.clone();
+                                                            thread::spawn(move || {
+                                                                fix_claude_account(number, email, accounts, tipo, active);
+                                                            });
+                                                        }
                                                     }
-                                                 }
+                                                }
+                                            }
+                                        } else if fixada {
+                                            if ui
+                                                .add(egui::Button::new(pixel_text("soltar", 9.0)))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("solta a fixação e devolve ao rodízio · reativa as outras contas")
+                                                .clicked()
+                                            {
+                                                thread::spawn(soltar_fixacao);
+                                            }
+                                            let outro_tipo = if tipo_atual == "final" {
+                                                "temporario"
+                                            } else {
+                                                "final"
+                                            };
+                                            let outro_texto = if outro_tipo == "final" { "fixar" } else { "temp" };
+                                            if ui
+                                                .add(egui::Button::new(pixel_text(outro_texto, 9.0)))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(if outro_tipo == "final" {
+                                                    "fixar até a conta estourar (100% em 5h ou na semana) · as outras ficam em espera"
+                                                } else {
+                                                    "fixar até a janela de 5h virar · as outras ficam em espera"
+                                                })
+                                                .clicked()
+                                            {
+                                                if let Some(number) = number {
+                                                    let email = email.clone();
+                                                    let accounts = accounts_for_fixation.clone();
+                                                    thread::spawn(move || {
+                                                        fix_claude_account(number, email, accounts, outro_tipo, active);
+                                                    });
+                                                }
                                             }
                                         }
                                     });
@@ -3580,7 +3672,7 @@ fn render_claude_account_stacked(
     poke_mode: bool,
     fixacao: Option<&Value>,
     accounts_for_fixation: Vec<ClaudeAccountTarget>,
-    confirmar_troca_org: &mut Option<(i64, Instant)>,
+    confirmar_troca_org: &mut Option<(i64, &'static str, Instant)>,
     organizacao_ativa: Option<&str>,
 ) {
     let five_hour = usage_percent(account, "fiveHour");
@@ -3609,6 +3701,7 @@ fn render_claude_account_stacked(
         .unwrap_or("")
         .to_owned();
     let fixada = email_esta_fixado(fixacao, &email);
+    let tipo_atual = tipo_fixacao(fixacao);
     let em_espera = disabled && fixacao_tem_numero(fixacao, number);
     let outra_org = account
         .get("organizationUuid")
@@ -3684,39 +3777,59 @@ fn render_claude_account_stacked(
             ui.label(dim_text("ativa"));
         }
         if fixada {
-            ui.label(dim_text("fixada"));
+            ui.label(dim_text(if tipo_atual == "final" { "fixada" } else { "temporária" }));
         }
-        if !active && number.is_some() && (!disabled || em_espera) {
+        if number.is_some() && (!disabled || em_espera) {
             if let Some(number) = number {
-                let confirmar = outra_org
-                    && confirmar_troca_org.is_some_and(|(pendente, pedido)| {
-                        pendente == number && pedido.elapsed() < Duration::from_secs(8)
-                    });
-                let texto = if confirmar { "confirmar" } else { "usar" };
-                let hover = if confirmar {
-                    "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
-                } else if outra_org {
-                    "fixar esta conta até 100% · as outras ficam em espera · outra organização"
+                if !fixada {
+                    for tipo in ["final", "temporario"] {
+                        let confirmar = outra_org && confirmar_troca_org.is_some_and(|(pendente, pendente_tipo, pedido)| {
+                            pendente == number && pendente_tipo == tipo && pedido.elapsed() < Duration::from_secs(8)
+                        });
+                        let texto = if confirmar { "confirmar" } else if tipo == "final" { "fixar" } else { "temp" };
+                        let hover = if confirmar {
+                            "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
+                        } else if tipo == "final" {
+                            "fixar até a conta estourar (100% em 5h ou na semana) · as outras ficam em espera"
+                        } else {
+                            "fixar até a janela de 5h virar · as outras ficam em espera"
+                        };
+                        if ui.add(egui::Button::new(pixel_text(texto, 9.0)))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            let (trocar, novo_estado) = decidir_clique_usar(outra_org, *confirmar_troca_org, number, tipo, Instant::now());
+                            *confirmar_troca_org = novo_estado;
+                            if trocar {
+                                let email = email.clone();
+                                let accounts = accounts_for_fixation.clone();
+                                thread::spawn(move || fix_claude_account(number, email, accounts, tipo, active));
+                            }
+                        }
+                    }
                 } else {
-                    "fixar esta conta até 100% · as outras ficam em espera"
-                };
-                if ui
-                    .add(egui::Button::new(pixel_text(texto, 9.0)))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(hover)
-                    .clicked()
-                {
-                    let (trocar, novo_estado) = decidir_clique_usar(
-                        outra_org,
-                        *confirmar_troca_org,
-                        number,
-                        Instant::now(),
-                    );
-                    *confirmar_troca_org = novo_estado;
-                    if trocar {
+                    if ui.add(egui::Button::new(pixel_text("soltar", 9.0)))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("solta a fixação e devolve ao rodízio · reativa as outras contas")
+                        .clicked()
+                    {
+                        thread::spawn(soltar_fixacao);
+                    }
+                    let outro_tipo = if tipo_atual == "final" { "temporario" } else { "final" };
+                    let outro_texto = if outro_tipo == "final" { "fixar" } else { "temp" };
+                    if ui.add(egui::Button::new(pixel_text(outro_texto, 9.0)))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(if outro_tipo == "final" {
+                            "fixar até a conta estourar (100% em 5h ou na semana) · as outras ficam em espera"
+                        } else {
+                            "fixar até a janela de 5h virar · as outras ficam em espera"
+                        })
+                        .clicked()
+                    {
                         let email = email.clone();
                         let accounts = accounts_for_fixation.clone();
-                        thread::spawn(move || fix_claude_account(number, email, accounts));
+                        thread::spawn(move || fix_claude_account(number, email, accounts, outro_tipo, active));
                     }
                 }
             }
@@ -5430,6 +5543,7 @@ mod tests {
     use super::{
         action_error, antigravity_email_from_text, bob_offset, clear_action_error,
         column_widths, decidir_clique_usar, merge_poll_result, parse_codex_home_reg_output, read_config_scalar,
+        tipo_fixacao,
         saida_com_timeout, set_action_error, set_config_scalar, CODEX_ACTION_ERROR,
         MAX_TRANSIENT_ERR_STREAK, iso_para_epoch, ler_tarefas, worktree_curto,
     };
@@ -5441,16 +5555,17 @@ mod tests {
     #[test]
     fn decidir_clique_usar_protege_troca_de_organizacao() {
         let agora = Instant::now();
-        assert_eq!(decidir_clique_usar(false, None, 1, agora), (true, None));
+        assert_eq!(decidir_clique_usar(false, None, 1, "final", agora), (true, None));
         assert_eq!(
-            decidir_clique_usar(true, None, 1, agora),
-            (false, Some((1, agora)))
+            decidir_clique_usar(true, None, 1, "final", agora),
+            (false, Some((1, "final", agora)))
         );
         assert_eq!(
             decidir_clique_usar(
                 true,
-                Some((1, agora - Duration::from_secs(1))),
+                Some((1, "final", agora - Duration::from_secs(1))),
                 1,
+                "final",
                 agora,
             ),
             (true, None)
@@ -5458,8 +5573,9 @@ mod tests {
         assert_eq!(
             decidir_clique_usar(
                 true,
-                Some((2, agora - Duration::from_secs(1))),
+                Some((1, "final", agora - Duration::from_secs(1))),
                 1,
+                "temporario",
                 agora,
             )
             .0,
@@ -5468,13 +5584,33 @@ mod tests {
         assert_eq!(
             decidir_clique_usar(
                 true,
-                Some((1, agora - Duration::from_secs(8))),
+                Some((2, "final", agora - Duration::from_secs(1))),
                 1,
+                "final",
                 agora,
             )
             .0,
             false
         );
+        assert_eq!(
+            decidir_clique_usar(
+                true,
+                Some((1, "final", agora - Duration::from_secs(8))),
+                1,
+                "final",
+                agora,
+            )
+            .0,
+            false
+        );
+    }
+
+    #[test]
+    fn tipo_fixacao_padroniza_ausente_e_rejeita_valor_desconhecido() {
+        assert_eq!(tipo_fixacao(None), "temporario");
+        assert_eq!(tipo_fixacao(Some(&serde_json::json!({}))), "temporario");
+        assert_eq!(tipo_fixacao(Some(&serde_json::json!({"tipo": "final"}))), "final");
+        assert_eq!(tipo_fixacao(Some(&serde_json::json!({"tipo": "outro"}))), "temporario");
     }
 
     #[test]
