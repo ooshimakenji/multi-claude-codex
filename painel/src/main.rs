@@ -278,6 +278,7 @@ struct PanelApp {
     cswap: Option<Result<Value, String>>,
     status_err_streak: u32,
     cswap_err_streak: u32,
+    confirmar_troca_org: Option<(i64, Instant)>,
     fixacao: Option<Value>,
     codex_last_used_profile: Option<String>,
     codex_active_profile: Option<String>,
@@ -539,6 +540,7 @@ impl PanelApp {
             cswap: None,
             status_err_streak: 0,
             cswap_err_streak: 0,
+            confirmar_troca_org: None,
             fixacao: None,
             codex_last_used_profile: None,
             codex_active_profile: None,
@@ -728,6 +730,7 @@ impl eframe::App for PanelApp {
                         content_width,
                         self.cswap.as_ref(),
                         self.fixacao.as_ref(),
+                        &mut self.confirmar_troca_org,
                         &mut self.pokemon,
                         context,
                         self.poke_mode,
@@ -3122,11 +3125,30 @@ fn show_running_jobs(
     });
 }
 
+fn decidir_clique_usar(
+    outra_org: bool,
+    pendente: Option<(i64, Instant)>,
+    number: i64,
+    agora: Instant,
+) -> (bool, Option<(i64, Instant)>) {
+    if !outra_org {
+        return (true, pendente);
+    }
+    if let Some((numero, pedido)) = pendente {
+        if numero == number && agora.saturating_duration_since(pedido) < Duration::from_secs(8) {
+            return (true, None);
+        }
+    }
+    // Exige dois cliques para proteger sessões abertas em outra organização.
+    (false, Some((number, agora)))
+}
+
 fn show_claude(
     ui: &mut egui::Ui,
     content_width: f32,
     cswap: Option<&Result<Value, String>>,
     fixacao: Option<&Value>,
+    confirmar_troca_org: &mut Option<(i64, Instant)>,
     pokemon: &mut PokemonCache,
     context: &egui::Context,
     poke_mode: bool,
@@ -3153,6 +3175,14 @@ fn show_claude(
                 return;
             }
         };
+        let organizacao_ativa = accounts.iter().find_map(|account| {
+            account
+                .get("active")
+                .and_then(Value::as_bool)
+                .filter(|active| *active)
+                .and_then(|_| account.get("organizationUuid"))
+                .and_then(Value::as_str)
+        });
         let accounts_for_fixation = accounts
             .iter()
             .filter_map(|account| {
@@ -3252,6 +3282,11 @@ fn show_claude(
                         .to_owned();
                     let fixada = email_esta_fixado(fixacao, &email);
                     let em_espera = disabled && fixacao_tem_numero(fixacao, number);
+                    let outra_org = account
+                        .get("organizationUuid")
+                        .and_then(Value::as_str)
+                        .zip(organizacao_ativa)
+                        .is_some_and(|(organizacao, ativa)| organizacao != ativa);
                     let fainted = [five_hour, seven_day]
                         .into_iter()
                         .flatten()
@@ -3338,8 +3373,16 @@ fn show_claude(
                                         let can_use = !active
                                             && number.is_some()
                                             && (!disabled || em_espera);
+                                        let confirmar = number.is_some_and(|number| {
+                                            outra_org
+                                                && confirmar_troca_org.is_some_and(|(pendente, pedido)| {
+                                                    pendente == number
+                                                        && pedido.elapsed() < Duration::from_secs(8)
+                                                })
+                                        });
+                                        let usar_texto = if confirmar { "confirmar" } else { "usar" };
                                         let usar_width = if can_use {
-                                            text_width("usar") + ui.spacing().item_spacing.x
+                                            text_width(usar_texto) + ui.spacing().item_spacing.x
                                         } else {
                                             0.0
                                         };
@@ -3395,19 +3438,33 @@ fn show_claude(
                                         }
                                         if can_use {
                                             if let Some(number) = number {
+                                                let hover = if confirmar {
+                                                    "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
+                                                } else if outra_org {
+                                                    "fixar esta conta até 100% · as outras ficam em espera · outra organização"
+                                                } else {
+                                                    "fixar esta conta até 100% · as outras ficam em espera"
+                                                };
                                                 if ui
-                                                    .add(egui::Button::new(pixel_text("usar", 9.0)))
+                                                    .add(egui::Button::new(pixel_text(usar_texto, 9.0)))
                                                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                    .on_hover_text(
-                                                        "fixar esta conta até 100% · as outras ficam em espera",
-                                                    )
+                                                    .on_hover_text(hover)
                                                     .clicked()
                                                 {
-                                                    let email = email.clone();
-                                                    let accounts = accounts_for_fixation.clone();
-                                                    thread::spawn(move || {
-                                                        fix_claude_account(number, email, accounts);
-                                                    });
+                                                    let (trocar, novo_estado) = decidir_clique_usar(
+                                                        outra_org,
+                                                        *confirmar_troca_org,
+                                                        number,
+                                                        Instant::now(),
+                                                    );
+                                                    *confirmar_troca_org = novo_estado;
+                                                    if trocar {
+                                                        let email = email.clone();
+                                                        let accounts = accounts_for_fixation.clone();
+                                                        thread::spawn(move || {
+                                                            fix_claude_account(number, email, accounts);
+                                                        });
+                                                    }
                                                  }
                                             }
                                         }
@@ -3459,6 +3516,8 @@ fn show_claude(
                         poke_mode,
                         fixacao,
                         accounts_for_fixation.clone(),
+                        confirmar_troca_org,
+                        organizacao_ativa,
                     );
                     if index + 1 < accounts.len() {
                         stacked_divider(ui);
@@ -3521,6 +3580,8 @@ fn render_claude_account_stacked(
     poke_mode: bool,
     fixacao: Option<&Value>,
     accounts_for_fixation: Vec<ClaudeAccountTarget>,
+    confirmar_troca_org: &mut Option<(i64, Instant)>,
+    organizacao_ativa: Option<&str>,
 ) {
     let five_hour = usage_percent(account, "fiveHour");
     let seven_day = usage_percent(account, "sevenDay");
@@ -3549,6 +3610,11 @@ fn render_claude_account_stacked(
         .to_owned();
     let fixada = email_esta_fixado(fixacao, &email);
     let em_espera = disabled && fixacao_tem_numero(fixacao, number);
+    let outra_org = account
+        .get("organizationUuid")
+        .and_then(Value::as_str)
+        .zip(organizacao_ativa)
+        .is_some_and(|(organizacao, ativa)| organizacao != ativa);
     let fainted = [five_hour, seven_day]
         .into_iter()
         .flatten()
@@ -3622,15 +3688,36 @@ fn render_claude_account_stacked(
         }
         if !active && number.is_some() && (!disabled || em_espera) {
             if let Some(number) = number {
+                let confirmar = outra_org
+                    && confirmar_troca_org.is_some_and(|(pendente, pedido)| {
+                        pendente == number && pedido.elapsed() < Duration::from_secs(8)
+                    });
+                let texto = if confirmar { "confirmar" } else { "usar" };
+                let hover = if confirmar {
+                    "outra organização: sessões abertas perdem o raciocínio guardado · clique de novo para trocar"
+                } else if outra_org {
+                    "fixar esta conta até 100% · as outras ficam em espera · outra organização"
+                } else {
+                    "fixar esta conta até 100% · as outras ficam em espera"
+                };
                 if ui
-                    .add(egui::Button::new(pixel_text("usar", 9.0)))
+                    .add(egui::Button::new(pixel_text(texto, 9.0)))
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("fixar esta conta até 100% · as outras ficam em espera")
+                    .on_hover_text(hover)
                     .clicked()
                 {
-                    let email = email.clone();
-                    let accounts = accounts_for_fixation.clone();
-                    thread::spawn(move || fix_claude_account(number, email, accounts));
+                    let (trocar, novo_estado) = decidir_clique_usar(
+                        outra_org,
+                        *confirmar_troca_org,
+                        number,
+                        Instant::now(),
+                    );
+                    *confirmar_troca_org = novo_estado;
+                    if trocar {
+                        let email = email.clone();
+                        let accounts = accounts_for_fixation.clone();
+                        thread::spawn(move || fix_claude_account(number, email, accounts));
+                    }
                 }
             }
         }
@@ -5342,7 +5429,7 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::{
         action_error, antigravity_email_from_text, bob_offset, clear_action_error,
-        column_widths, merge_poll_result, parse_codex_home_reg_output, read_config_scalar,
+        column_widths, decidir_clique_usar, merge_poll_result, parse_codex_home_reg_output, read_config_scalar,
         saida_com_timeout, set_action_error, set_config_scalar, CODEX_ACTION_ERROR,
         MAX_TRANSIENT_ERR_STREAK, iso_para_epoch, ler_tarefas, worktree_curto,
     };
@@ -5350,6 +5437,45 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const SAMPLE: &str = "model = \"gpt-5.6-sol\"\r\nmodel_reasoning_effort = \"ultra\"\r\n\r\n[projects.'x']\r\ntrust_level = \"trusted\"\r\nmodel = \"gpt-5.6-luna\"\r\n";
+
+    #[test]
+    fn decidir_clique_usar_protege_troca_de_organizacao() {
+        let agora = Instant::now();
+        assert_eq!(decidir_clique_usar(false, None, 1, agora), (true, None));
+        assert_eq!(
+            decidir_clique_usar(true, None, 1, agora),
+            (false, Some((1, agora)))
+        );
+        assert_eq!(
+            decidir_clique_usar(
+                true,
+                Some((1, agora - Duration::from_secs(1))),
+                1,
+                agora,
+            ),
+            (true, None)
+        );
+        assert_eq!(
+            decidir_clique_usar(
+                true,
+                Some((2, agora - Duration::from_secs(1))),
+                1,
+                agora,
+            )
+            .0,
+            false
+        );
+        assert_eq!(
+            decidir_clique_usar(
+                true,
+                Some((1, agora - Duration::from_secs(8))),
+                1,
+                agora,
+            )
+            .0,
+            false
+        );
+    }
 
     #[test]
     fn extrai_a_ultima_conta_do_log_antigravity() {
